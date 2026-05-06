@@ -40,7 +40,6 @@ def _llm(temperature: float = 0.0) -> ChatOpenAI:
 
 
 def _extract_text(content: Any) -> str:
-    """Safely extract a plain string from a message content (handles Studio block lists)."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -55,7 +54,6 @@ def _extract_text(content: Any) -> str:
 
 
 def _try_parse_json(text: str) -> dict | None:
-    """Try to extract a JSON object from text. Returns None if not found."""
     start = text.find("{")
     end = text.rfind("}") + 1
     if start == -1 or end == 0:
@@ -67,7 +65,6 @@ def _try_parse_json(text: str) -> dict | None:
 
 
 def _get_available_tables() -> str:
-    """Query DuckDB for all user-loaded tables and return a summary string."""
     conn = get_connection()
     try:
         rows = conn.execute(
@@ -91,6 +88,11 @@ def _get_available_tables() -> str:
         return f"(Could not read schema catalog: {exc})"
 
 
+def _next_pending_step(plan: list[PlanStep]) -> PlanStep | None:
+    """Return the first pending step, or None."""
+    return next((s for s in plan if s.status == "pending"), None)
+
+
 _LOAD_PATTERNS = [
     re.compile(
         r"load\s+(?:file\s+)?at\s+(?P<path>\S+)\s+as\s+(?P<dataset>\w+)",
@@ -112,7 +114,6 @@ _LOAD_PATTERNS = [
 
 
 def _detect_load_intent(text: str) -> dict | None:
-    """Return {path, dataset} if the message is clearly a file-load request, else None."""
     for pattern in _LOAD_PATTERNS:
         m = pattern.search(text)
         if m:
@@ -132,7 +133,6 @@ def _detect_load_intent(text: str) -> dict | None:
 def orchestrator(state: AnalyticsState) -> dict:
     """Classify user intent: load / analytics / chitchat / synthesise."""
 
-    # Always read from the latest HumanMessage so each turn is independent
     current_query = ""
     for msg in reversed(state.messages):
         if isinstance(msg, HumanMessage):
@@ -141,8 +141,6 @@ def orchestrator(state: AnalyticsState) -> dict:
 
     tables_context = _get_available_tables()
 
-    # ── Reset ALL stale fields at the top of every new turn ─────────────────
-    # None is used for optional fields so LangGraph sees a real value change.
     base_reset: dict = {
         "user_query": current_query,
         "final_answer": "",
@@ -153,7 +151,7 @@ def orchestrator(state: AnalyticsState) -> dict:
         "last_query_metadata": {},
         "verification_verdict": "",
         "verification_feedback": "",
-        "load_file_path": None,    # None = not a load turn
+        "load_file_path": None,
         "load_file_dataset": None,
         "error": "",
     }
@@ -172,12 +170,12 @@ def orchestrator(state: AnalyticsState) -> dict:
         parsed = _try_parse_json(response.content) or {}
         final = parsed.get("final_answer", response.content)
         return {
-            **base_reset,         # clears plan so next turn starts fresh
+            **base_reset,
             "final_answer": final,
             "messages": [AIMessage(content=final)],
         }
 
-    # ── Fast-path: regex load detection (bypasses LLM entirely) ────────────
+    # ── Fast-path: regex load detection ──────────────────────────────────
     load_match = _detect_load_intent(current_query)
     if load_match:
         return {
@@ -199,7 +197,7 @@ Classify the user message into exactly ONE intent and respond with matching JSON
    Always use the correct table name from the available tables above.
 
 2. CHITCHAT – greeting, small talk, or off-topic:
-   {{"intent": "chitchat", "final_answer": "<friendly reply mentioning available tables and how to load files>"}}
+   {{"intent": "chitchat", "final_answer": "<friendly reply>"}}
 
 Rules:
 - Output ONLY the JSON. No markdown, no explanation.
@@ -207,7 +205,6 @@ Rules:
 - Keep plans minimal (1-2 steps).
 """
 
-    # ── LLM classification (analytics vs chitchat only) ──────────────────
     llm = _llm().bind_tools(ORCHESTRATOR_TOOLS)
     response = llm.invoke(
         [SystemMessage(content=ORCHESTRATOR_SYSTEM),
@@ -218,11 +215,7 @@ Rules:
 
     if parsed is None:
         reply = response.content or "Hi! Ask a data question or say: load file at <path> as <name>."
-        return {
-            **base_reset,
-            "final_answer": reply,
-            "messages": [AIMessage(content=reply)],
-        }
+        return {**base_reset, "final_answer": reply, "messages": [AIMessage(content=reply)]}
 
     intent = parsed.get("intent", "chitchat")
 
@@ -230,13 +223,8 @@ Rules:
         plan = [PlanStep(**step) for step in parsed.get("plan", [])]
         return {**base_reset, "plan": plan}
 
-    # chitchat
     reply = parsed.get("final_answer", "Hi! Ask a data question or load a file.")
-    return {
-        **base_reset,
-        "final_answer": reply,
-        "messages": [AIMessage(content=reply)],
-    }
+    return {**base_reset, "final_answer": reply, "messages": [AIMessage(content=reply)]}
 
 
 # ---------------------------------------------------------------------------
@@ -244,35 +232,23 @@ Rules:
 # ---------------------------------------------------------------------------
 
 def load_file_node(state: AnalyticsState) -> dict:
-    """Load a file into DuckDB using the path and dataset name set by orchestrator."""
     path = state.load_file_path
     dataset = state.load_file_dataset
 
     if not path:
         reply = "I couldn't find a file path. Please say: load file at <path> as <name>."
-        return {
-            "final_answer": reply,
-            "messages": [AIMessage(content=reply)],
-            "load_file_path": None,
-            "load_file_dataset": None,
-        }
+        return {"final_answer": reply, "messages": [AIMessage(content=reply)],
+                "load_file_path": None, "load_file_dataset": None}
 
     if not dataset:
         dataset = Path(path).stem.replace(" ", "_").replace("-", "_").lower()
 
     result = load_file.invoke({"path": path, "dataset_name": dataset})
-
-    if result.startswith("ERROR"):
-        reply = f"❌ Failed to load file: {result}"
-    else:
-        reply = f"✅ {result}\n\nYou can now ask questions about the `{dataset}` table!"
-
-    return {
-        "final_answer": reply,
-        "messages": [AIMessage(content=reply)],
-        "load_file_path": None,
-        "load_file_dataset": None,
-    }
+    reply = f"❌ Failed to load file: {result}" if result.startswith("ERROR") else (
+        f"✅ {result}\n\nYou can now ask questions about the `{dataset}` table!"
+    )
+    return {"final_answer": reply, "messages": [AIMessage(content=reply)],
+            "load_file_path": None, "load_file_dataset": None}
 
 
 # ---------------------------------------------------------------------------
@@ -280,9 +256,12 @@ def load_file_node(state: AnalyticsState) -> dict:
 # ---------------------------------------------------------------------------
 
 def profiler(state: AnalyticsState) -> dict:
-    llm = _llm().bind_tools(PROFILER_TOOLS)
-    step = state.current_step
+    # Resolve step directly from plan — never trust state.current_step
+    step = _next_pending_step(state.plan)
+    if step is None:
+        return {"current_step": None}
 
+    llm = _llm().bind_tools(PROFILER_TOOLS)
     response = llm.invoke([
         SystemMessage(content=PROFILER_SYSTEM),
         HumanMessage(content=f"Profiling task: {step.description}\nUser question: {state.user_query}"),
@@ -302,8 +281,15 @@ def profiler(state: AnalyticsState) -> dict:
 # ---------------------------------------------------------------------------
 
 def sql_writer(state: AnalyticsState) -> dict:
+    # Resolve step directly from plan — never trust state.current_step
+    step = _next_pending_step(state.plan)
+    if step is None:
+        # Verifier retry: re-use the last step that was "running"
+        step = next((s for s in state.plan if s.status == "running"), None)
+    if step is None:
+        return {"last_sql": "", "error": "No pending step found for sql_writer."}
+
     llm = _llm().bind_tools(SQL_WRITER_TOOLS)
-    step = state.current_step
 
     profiling_notes = "\n".join(
         f"- {s.description}: {s.result}"
@@ -330,7 +316,7 @@ def sql_writer(state: AnalyticsState) -> dict:
         if s.id == step.id else s
         for s in state.plan
     ]
-    return {"last_sql": sql, "plan": updated_plan, "verification_feedback": ""}
+    return {"last_sql": sql, "plan": updated_plan, "verification_feedback": "", "current_step": step}
 
 
 # ---------------------------------------------------------------------------
@@ -345,12 +331,8 @@ def execute_sql(state: AnalyticsState) -> dict:
             if state.current_step and s.id == state.current_step.id else s
             for s in state.plan
         ]
-        return {
-            "last_query_result": result,
-            "last_query_metadata": {},
-            "plan": updated_plan,
-            "error": result,
-        }
+        return {"last_query_result": result, "last_query_metadata": {},
+                "plan": updated_plan, "error": result}
     parsed = json.loads(result)
     return {
         "last_query_result": json.dumps(parsed.get("rows", []), default=str),
