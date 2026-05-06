@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+from pathlib import Path
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -89,6 +91,45 @@ def _get_available_tables() -> str:
         return f"(Could not read schema catalog: {exc})"
 
 
+# Regex patterns that reliably signal a file-load request — checked BEFORE the LLM
+_LOAD_PATTERNS = [
+    # "load file at path/to/file.xlsx as tablename"
+    re.compile(
+        r"load\s+(?:file\s+)?at\s+(?P<path>\S+)\s+as\s+(?P<dataset>\w+)",
+        re.IGNORECASE,
+    ),
+    # "import path/to/file.xlsx as tablename"
+    re.compile(
+        r"import\s+(?P<path>\S+)\s+as\s+(?P<dataset>\w+)",
+        re.IGNORECASE,
+    ),
+    # "load path/to/file.xlsx as tablename"
+    re.compile(
+        r"load\s+(?P<path>\S+\.(?:xlsx|xls|csv|parquet))\s+as\s+(?P<dataset>\w+)",
+        re.IGNORECASE,
+    ),
+    # "load path/to/file.xlsx"  (no explicit table name)
+    re.compile(
+        r"load\s+(?:file\s+)?(?P<path>\S+\.(?:xlsx|xls|csv|parquet))",
+        re.IGNORECASE,
+    ),
+]
+
+
+def _detect_load_intent(text: str) -> dict | None:
+    """Return {path, dataset} if the message is clearly a file-load request, else None."""
+    for pattern in _LOAD_PATTERNS:
+        m = pattern.search(text)
+        if m:
+            path = m.group("path")
+            try:
+                dataset = m.group("dataset")
+            except IndexError:
+                dataset = Path(path).stem.replace(" ", "_").replace("-", "_").lower()
+            return {"path": path, "dataset": dataset}
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Node: orchestrator
 # ---------------------------------------------------------------------------
@@ -106,24 +147,30 @@ def orchestrator(state: AnalyticsState) -> dict:
 
     tables_context = _get_available_tables()
 
+    # ── Fast-path: regex load detection (no LLM needed) ──────────────────────
+    load_match = _detect_load_intent(user_query)
+    if load_match:
+        return {
+            "user_query": user_query,
+            "load_file_path": load_match["path"],
+            "load_file_dataset": load_match["dataset"],
+            "final_answer": "",
+        }
+
     ORCHESTRATOR_SYSTEM = f"""You are the Orchestrator of a DuckDB analytics agent.
 
 Available tables in DuckDB:
 {tables_context}
 
-Classify the user message into exactly ONE of these intents and respond with the matching JSON:
+Classify the user message into exactly ONE intent and respond with matching JSON:
 
-1. LOAD FILE – user wants to load / import a file into DuckDB:
-   {{"intent": "load", "path": "<file path>", "dataset": "<table name to use>"}}
-   Rules: infer the table name from the filename if the user didn’t specify one.
-
-2. ANALYTICS – user asks a data or SQL question:
+1. ANALYTICS – data or SQL question:
    {{"intent": "analytics", "plan": [{{"id": 1, "type": "sql", "description": "..."}}]}}
    Step types: "profile" (explore column) or "sql" (SELECT query).
-   Always reference the correct table name from the available tables above.
+   Always use the correct table name from the available tables above.
 
-3. CHITCHAT – greeting, small talk, or off-topic:
-   {{"intent": "chitchat", "final_answer": "<friendly reply mentioning available tables>"}}
+2. CHITCHAT – greeting, small talk, or off-topic:
+   {{"intent": "chitchat", "final_answer": "<friendly reply mentioning available tables and that you can load files with: load file at <path> as <name>>"}}
 
 Rules:
 - Output ONLY the JSON. No markdown, no explanation.
@@ -153,7 +200,7 @@ Rules:
             "messages": [AIMessage(content=final)],
         }
 
-    # ---- Classify user intent ----
+    # ---- LLM classification (analytics vs chitchat) ----
     llm = _llm().bind_tools(ORCHESTRATOR_TOOLS)
     response = llm.invoke(
         [SystemMessage(content=ORCHESTRATOR_SYSTEM),
@@ -162,9 +209,8 @@ Rules:
 
     parsed = _try_parse_json(response.content)
 
-    # No JSON at all – treat as chitchat
     if parsed is None:
-        reply = response.content or "Hi! I’m a DuckDB analytics agent. Ask me a data question or say \"load file at <path> as <name>\"."
+        reply = response.content or "Hi! I'm a DuckDB analytics agent. Ask me a data question or say \"load file at <path> as <name>\"."
         return {
             "final_answer": reply,
             "user_query": user_query,
@@ -173,21 +219,12 @@ Rules:
 
     intent = parsed.get("intent", "chitchat")
 
-    if intent == "load":
-        # Hand off to load_file_node via state fields
-        return {
-            "user_query": user_query,
-            "load_file_path": parsed.get("path", ""),
-            "load_file_dataset": parsed.get("dataset", ""),
-            "final_answer": "",  # clear so routing works
-        }
-
     if intent == "analytics":
         plan = [PlanStep(**step) for step in parsed.get("plan", [])]
         return {"user_query": user_query, "plan": plan, "final_answer": ""}
 
     # chitchat / fallback
-    reply = parsed.get("final_answer", "Hi! Ask me a data question or load a file.")
+    reply = parsed.get("final_answer", "Hi! Ask me a data question or load a file with: load file at <path> as <name>.")
     return {
         "final_answer": reply,
         "user_query": user_query,
@@ -205,7 +242,7 @@ def load_file_node(state: AnalyticsState) -> dict:
     dataset = state.load_file_dataset
 
     if not path:
-        reply = "I couldn’t find a file path in your message. Please say something like: \"load file at data/sales.xlsx as sales\"."
+        reply = "I couldn't find a file path in your message. Please say: \"load file at <path> as <name>\"."
         return {
             "final_answer": reply,
             "messages": [AIMessage(content=reply)],
@@ -214,8 +251,6 @@ def load_file_node(state: AnalyticsState) -> dict:
         }
 
     if not dataset:
-        # Infer dataset name from filename
-        from pathlib import Path
         dataset = Path(path).stem.replace(" ", "_").replace("-", "_").lower()
 
     result = load_file.invoke({"path": path, "dataset_name": dataset})
