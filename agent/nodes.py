@@ -40,9 +40,8 @@ def _extract_text(content: Any) -> str:
     """Safely extract a plain string from a message content.
 
     LangGraph Studio sends content as a list of block dicts:
-        [{'type': 'text', 'text': 'What do you understand?'}]
+        [{'type': 'text', 'text': 'Hello!'}]
     Plain LLM responses send content as a str.
-    This helper handles both.
     """
     if isinstance(content, str):
         return content
@@ -57,13 +56,45 @@ def _extract_text(content: Any) -> str:
     return str(content)
 
 
-def _parse_json_from_response(text: str) -> dict:
-    """Extract the first JSON object from an LLM text response."""
+def _try_parse_json(text: str) -> dict | None:
+    """Try to extract a JSON object from text. Returns None if not found."""
     start = text.find("{")
     end = text.rfind("}") + 1
     if start == -1 or end == 0:
+        return None
+    try:
+        return json.loads(text[start:end])
+    except json.JSONDecodeError:
+        return None
+
+
+def _parse_json_from_response(text: str) -> dict:
+    """Extract the first JSON object from an LLM text response (raises on failure)."""
+    result = _try_parse_json(text)
+    if result is None:
         raise ValueError(f"No JSON found in response: {text[:200]}")
-    return json.loads(text[start:end])
+    return result
+
+
+ORCHESTRATOR_SYSTEM_WITH_CHITCHAT = """
+You are the Orchestrator of a DuckDB analytics agent.
+
+If the user's message is a greeting, small talk, or NOT a data/analytics question
+(e.g. "hi", "hello", "how are you", "what can you do"), respond ONLY with:
+{"final_answer": "<friendly reply explaining you are a DuckDB analytics agent>"}
+
+Otherwise, for any data or analytics question, create a minimal execution plan:
+{"plan": [{"id": 1, "type": "sql", "description": "..."}]}
+
+Step types:
+- "profile" → explore a column's data distribution
+- "sql"     → generate a DuckDB SELECT query
+
+Rules:
+- Never generate Python code.
+- Keep plans minimal: profile only when column semantics are ambiguous.
+- When re-planning after a failure, include the verifier's feedback in the new step description.
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -72,9 +103,8 @@ def _parse_json_from_response(text: str) -> dict:
 
 def orchestrator(state: AnalyticsState) -> dict:
     """Plan the query or synthesise the final answer when all steps are done."""
-    llm = _llm().bind_tools(ORCHESTRATOR_TOOLS)
 
-    # Resolve user_query from state or latest HumanMessage (handles Studio blocks)
+    # Resolve user_query (handles Studio content-block lists)
     user_query = state.user_query
     if not user_query:
         for msg in reversed(state.messages):
@@ -82,7 +112,7 @@ def orchestrator(state: AnalyticsState) -> dict:
                 user_query = _extract_text(msg.content)
                 break
 
-    # If all plan steps are done, synthesise the final answer
+    # ---- Synthesis: all steps finished, compose final answer ----
     if state.plan and all(s.status in ("done", "failed") for s in state.plan):
         synthesis_prompt = (
             f"User question: {user_query}\n\n"
@@ -93,25 +123,49 @@ def orchestrator(state: AnalyticsState) -> dict:
             'Output JSON: {"final_answer": "..."}'
         )
         response = _llm().invoke(
-            [SystemMessage(content=ORCHESTRATOR_SYSTEM), HumanMessage(content=synthesis_prompt)]
+            [SystemMessage(content=ORCHESTRATOR_SYSTEM_WITH_CHITCHAT),
+             HumanMessage(content=synthesis_prompt)]
         )
-        parsed = _parse_json_from_response(response.content)
+        parsed = _try_parse_json(response.content) or {}
         final = parsed.get("final_answer", response.content)
         return {
             "final_answer": final,
             "messages": [AIMessage(content=final)],
         }
 
-    # Build the execution plan
+    # ---- Planning: build execution plan (or reply to chitchat) ----
     plan_prompt = (
-        f"User question: {user_query}\n\n"
-        "Create a minimal execution plan as JSON. "
-        'Format: {"plan": [{"id": 1, "type": "sql", "description": "..."}]}'
+        f"User message: {user_query}\n\n"
+        "If this is a data/analytics question, output a JSON plan. "
+        "If it is chitchat or a greeting, output a friendly JSON final_answer."
     )
+    llm = _llm().bind_tools(ORCHESTRATOR_TOOLS)
     response = llm.invoke(
-        [SystemMessage(content=ORCHESTRATOR_SYSTEM), HumanMessage(content=plan_prompt)]
+        [SystemMessage(content=ORCHESTRATOR_SYSTEM_WITH_CHITCHAT),
+         HumanMessage(content=plan_prompt)]
     )
-    parsed = _parse_json_from_response(response.content)
+
+    parsed = _try_parse_json(response.content)
+
+    # LLM returned no JSON at all (pure conversational reply)
+    if parsed is None:
+        reply = response.content or "Hi! I'm a DuckDB analytics agent. Ask me a data question!"
+        return {
+            "final_answer": reply,
+            "user_query": user_query,
+            "messages": [AIMessage(content=reply)],
+        }
+
+    # LLM returned a final_answer directly (chitchat detected)
+    if "final_answer" in parsed:
+        reply = parsed["final_answer"]
+        return {
+            "final_answer": reply,
+            "user_query": user_query,
+            "messages": [AIMessage(content=reply)],
+        }
+
+    # Normal analytics plan
     plan = [PlanStep(**step) for step in parsed.get("plan", [])]
     return {"user_query": user_query, "plan": plan}
 
@@ -165,7 +219,7 @@ def sql_writer(state: AnalyticsState) -> dict:
     response = llm.invoke(
         [SystemMessage(content=SQL_WRITER_SYSTEM), HumanMessage(content=prompt)]
     )
-    parsed = _parse_json_from_response(response.content)
+    parsed = _try_parse_json(response.content) or {}
     sql = parsed.get("sql", "")
 
     updated_plan = [
@@ -223,7 +277,7 @@ def verifier(state: AnalyticsState) -> dict:
     response = llm.invoke(
         [SystemMessage(content=VERIFIER_SYSTEM), HumanMessage(content=prompt)]
     )
-    parsed = _parse_json_from_response(response.content)
+    parsed = _try_parse_json(response.content) or {"verdict": "pass", "feedback": ""}
     verdict = parsed.get("verdict", "pass")
     feedback = parsed.get("feedback", "")
     corrected_sql = parsed.get("corrected_sql", "")
