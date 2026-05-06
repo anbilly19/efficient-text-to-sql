@@ -55,14 +55,31 @@ def _extract_text(content: Any) -> str:
 
 
 def _try_parse_json(text: str) -> dict | None:
-    start = text.find("{")
-    end = text.rfind("}") + 1
-    if start == -1 or end == 0:
+    """Extract the LAST top-level JSON object from text (avoids grabbing row data)."""
+    if not isinstance(text, str):
         return None
-    try:
-        return json.loads(text[start:end])
-    except json.JSONDecodeError:
-        return None
+    # Find all {...} spans and return the last valid one that looks like a control object
+    best = None
+    depth = 0
+    start = None
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                candidate = text[start:i + 1]
+                try:
+                    parsed = json.loads(candidate)
+                    # Prefer objects that have control keys over raw data rows
+                    if isinstance(parsed, dict):
+                        best = parsed
+                except json.JSONDecodeError:
+                    pass
+                start = None
+    return best
 
 
 def _get_available_tables() -> str:
@@ -152,16 +169,33 @@ def _extract_table_from_plan(plan: list[PlanStep], user_query: str) -> str:
             return ""
         if len(tables) == 1:
             return tables[0]
-        # Try to match table name mentioned in query or plan descriptions
         query_lower = user_query.lower()
         for step in plan:
             query_lower += " " + step.description.lower()
         for t in tables:
             if t.lower() in query_lower:
                 return t
-        return tables[0]  # fallback to first
+        return tables[0]
     except Exception:
         return ""
+
+
+def _rows_to_markdown(rows_json: str) -> str:
+    """Convert a JSON rows string into a readable markdown table."""
+    try:
+        rows = json.loads(rows_json)
+        if not rows:
+            return "No rows returned."
+        headers = list(rows[0].keys())
+        header_row = " | ".join(headers)
+        sep_row = " | ".join(["---"] * len(headers))
+        data_rows = "\n".join(
+            " | ".join(str(row.get(h, "")) for h in headers)
+            for row in rows
+        )
+        return f"{header_row}\n{sep_row}\n{data_rows}"
+    except Exception:
+        return rows_json
 
 
 # ---------------------------------------------------------------------------
@@ -196,17 +230,32 @@ def orchestrator(state: AnalyticsState) -> dict:
 
     # ── Synthesis: all plan steps completed ──────────────────────────────
     if state.plan and all(s.status in ("done", "failed") for s in state.plan):
+        row_count = state.last_query_metadata.get("row_count", "?")
+        table_preview = _rows_to_markdown(state.last_query_result)
+
         synthesis_prompt = (
             f"User question: {state.user_query}\n\n"
-            f"Query result (first 50 rows): {state.last_query_result}\n\n"
+            f"SQL executed: {state.last_sql}\n\n"
+            f"Row count: {row_count}\n\n"
+            f"Query results:\n{table_preview}\n\n"
             f"Verification verdict: {state.verification_verdict}\n"
             f"Verification feedback: {state.verification_feedback}\n\n"
-            "Synthesise a clear, concise final answer for the user. "
-            'Output JSON: {"final_answer": "..."}'
+            "Write a clear, concise answer for the user. "
+            "If the result is a table of rows, present them as a formatted markdown table. "
+            "If it is a single value or ranking, describe it in plain English. "
+            'Output ONLY this JSON (no extra keys): {"final_answer": "<your answer as a plain string>"}'
         )
         response = _llm().invoke([HumanMessage(content=synthesis_prompt)])
-        parsed = _try_parse_json(response.content) or {}
-        final = parsed.get("final_answer", response.content)
+        raw = _extract_text(response.content)
+
+        # Safely extract final_answer — always ensure it's a str
+        parsed = _try_parse_json(raw) or {}
+        final = parsed.get("final_answer")
+        if final is None or not isinstance(final, str):
+            # LLM didn't wrap in JSON — use raw response or fallback to table
+            final = raw if isinstance(raw, str) and raw.strip() else table_preview
+        final = str(final).strip()
+
         return {
             **base_reset,
             "final_answer": final,
@@ -253,7 +302,7 @@ Rules:
 
     if parsed is None:
         reply = response.content or "Hi! Ask a data question or say: load file at <path> as <name>."
-        return {**base_reset, "final_answer": reply, "messages": [AIMessage(content=reply)]}
+        return {**base_reset, "final_answer": str(reply), "messages": [AIMessage(content=str(reply))]}
 
     intent = parsed.get("intent", "chitchat")
 
@@ -261,7 +310,7 @@ Rules:
         plan = [PlanStep(**step) for step in parsed.get("plan", [])]
         return {**base_reset, "plan": plan}
 
-    reply = parsed.get("final_answer", "Hi! Ask a data question or load a file.")
+    reply = str(parsed.get("final_answer", "Hi! Ask a data question or load a file."))
     return {**base_reset, "final_answer": reply, "messages": [AIMessage(content=reply)]}
 
 
@@ -318,14 +367,13 @@ def profiler(state: AnalyticsState) -> dict:
 # ---------------------------------------------------------------------------
 
 def sql_writer(state: AnalyticsState) -> dict:
-    # Resolve step directly from plan
     step = _next_pending_step(state.plan)
     if step is None:
         step = next((s for s in state.plan if s.status == "running"), None)
     if step is None:
         return {"last_sql": "", "error": "No pending step found for sql_writer."}
 
-    # ── Always inject real schema into the prompt ─────────────────────────────
+    # ── Always inject real schema into the prompt ─────────────────────────
     table_name = _extract_table_from_plan(state.plan, state.user_query)
     schema_context = _get_schema_for_table(table_name) if table_name else "(No tables loaded)"
 
@@ -403,7 +451,7 @@ def verifier(state: AnalyticsState) -> dict:
     )
     parsed = _try_parse_json(response.content) or {"verdict": "pass", "feedback": ""}
     verdict = parsed.get("verdict", "pass")
-    feedback = parsed.get("feedback", "")
+    feedback = str(parsed.get("feedback", ""))
     corrected_sql = parsed.get("corrected_sql", "")
 
     new_status = "done" if verdict in ("pass", "warning") else "failed"
@@ -414,11 +462,11 @@ def verifier(state: AnalyticsState) -> dict:
     ]
 
     updates: dict = {
-        "verification_verdict": verdict,
+        "verification_verdict": str(verdict),
         "verification_feedback": feedback,
         "plan": updated_plan,
         "current_step": None,
     }
     if corrected_sql:
-        updates["last_sql"] = corrected_sql
+        updates["last_sql"] = str(corrected_sql)
     return updates
