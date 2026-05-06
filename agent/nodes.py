@@ -123,7 +123,6 @@ def _get_schema_for_table(table_name: str) -> str:
 
 
 def _get_varchar_date_columns(table_name: str) -> set[str]:
-    """Return set of column names that are VARCHAR but store date-like values."""
     if not table_name:
         return set()
     conn = get_connection()
@@ -184,13 +183,10 @@ def _get_date_cast_warnings(table_name: str) -> str:
 
 
 def _sanitize_sql(sql: str, table_name: str) -> str:
-    """Post-process LLM SQL: fix stray quotes + enforce TRY_CAST on VARCHAR date cols."""
     if not sql:
         return sql
-    # Fix stray double-quotes around identifiers
     sql = re.sub(r'"(\w+)""', r'"\1"', sql)
     sql = re.sub(r'""(\w+)"', r'"\1"', sql)
-    # Rewrite date functions on VARCHAR date columns
     for col in _get_varchar_date_columns(table_name):
         col_pattern = rf'(?:"?\w+"?\.)?"?{re.escape(col)}"?'
         sql = re.sub(
@@ -262,6 +258,9 @@ def _extract_table_from_plan(plan: list[PlanStep], user_query: str) -> str:
 
 
 def _rows_to_markdown(rows_json: str) -> str:
+    """Convert JSON rows string to markdown table. Returns raw string on any error."""
+    if not rows_json or rows_json.startswith("ERROR"):
+        return rows_json or "No result."
     try:
         rows = json.loads(rows_json)
         if not rows:
@@ -307,33 +306,48 @@ def orchestrator(state: AnalyticsState) -> dict:
         "error": "",
     }
 
-    # Synthesis: all plan steps completed (done or failed)
+    # ── Synthesis: fire when ALL steps are done or failed ──────────────────
     if state.plan and all(s.status in ("done", "failed") for s in state.plan):
-        row_count = state.last_query_metadata.get("row_count", "?")
-        table_preview = _rows_to_markdown(state.last_query_result)
-        synthesis_prompt = (
-            f"User question: {state.user_query}\n\n"
-            f"SQL executed: {state.last_sql}\n\n"
-            f"Row count: {row_count}\n\n"
-            f"Query results:\n{table_preview}\n\n"
-            "Write a clear, concise answer for the user. "
-            "If the result is a table, present it as markdown. "
-            "If it is a single value, describe it in plain English. "
-            'Output ONLY this JSON: {"final_answer": "<your answer>"}'
-        )
-        response = _llm().invoke([HumanMessage(content=synthesis_prompt)])
-        raw = _extract_text(response.content)
-        parsed = _try_parse_json(raw) or {}
-        final = parsed.get("final_answer")
-        if final is None or not isinstance(final, str):
-            final = raw if isinstance(raw, str) and raw.strip() else table_preview
+        all_failed = all(s.status == "failed" for s in state.plan)
+
+        if all_failed:
+            # Graceful error: tell the user what went wrong without re-planning
+            err = state.error or "The query could not be executed."
+            # Strip raw DuckDB noise for readability
+            short_err = err.replace("ERROR: ", "").strip()
+            final = (
+                f"I wasn't able to answer that question due to a SQL error:\n\n"
+                f"```\n{short_err}\n```\n\n"
+                f"Could you rephrase, or check that the column names are correct?"
+            )
+        else:
+            row_count = state.last_query_metadata.get("row_count", "?")
+            table_preview = _rows_to_markdown(state.last_query_result)
+            synthesis_prompt = (
+                f"User question: {state.user_query}\n\n"
+                f"SQL executed: {state.last_sql}\n\n"
+                f"Row count: {row_count}\n\n"
+                f"Query results:\n{table_preview}\n\n"
+                "Write a clear, concise answer for the user. "
+                "If the result is a table, present it as markdown. "
+                "If it is a single value, describe it in plain English. "
+                'Output ONLY this JSON: {"final_answer": "<your answer>"}'
+            )
+            response = _llm().invoke([HumanMessage(content=synthesis_prompt)])
+            raw = _extract_text(response.content)
+            parsed = _try_parse_json(raw) or {}
+            final_val = parsed.get("final_answer")
+            if final_val is None or not isinstance(final_val, str):
+                final_val = raw if isinstance(raw, str) and raw.strip() else table_preview
+            final = str(final_val).strip()
+
         return {
             **base_reset,
-            "final_answer": str(final).strip(),
-            "messages": [AIMessage(content=str(final).strip())],
+            "final_answer": final,
+            "messages": [AIMessage(content=final)],
         }
 
-    # Fast-path: regex load detection
+    # ── Fast-path: regex load detection ───────────────────────────────────
     load_match = _detect_load_intent(current_query)
     if load_match:
         return {
@@ -342,6 +356,7 @@ def orchestrator(state: AnalyticsState) -> dict:
             "load_file_dataset": load_match["dataset"],
         }
 
+    # ── LLM planning ──────────────────────────────────────────────────────
     ORCHESTRATOR_SYSTEM = f"""You are the Orchestrator of a DuckDB analytics agent.
 
 Available tables in DuckDB:
@@ -484,7 +499,6 @@ def sql_writer(state: AnalyticsState) -> dict:
 def execute_sql(state: AnalyticsState) -> dict:
     result = run_sql.invoke({"query": state.last_sql})
 
-    # Mark the current step done/failed regardless of verifier
     def _updated_plan(status: str, msg: str = "") -> list[PlanStep]:
         return [
             s.model_copy(update={"status": status, "result": msg})
@@ -493,10 +507,12 @@ def execute_sql(state: AnalyticsState) -> dict:
         ]
 
     if result.startswith("ERROR"):
+        # Mark as "pending" (not "failed") so verifier can attempt a fix/retry
+        # Verifier sees the error via last_query_result and can issue corrected_sql
         return {
             "last_query_result": result,
             "last_query_metadata": {},
-            "plan": _updated_plan("failed", result),
+            "plan": _updated_plan("pending", result),
             "error": result,
         }
 
@@ -504,32 +520,45 @@ def execute_sql(state: AnalyticsState) -> dict:
     return {
         "last_query_result": json.dumps(parsed.get("rows", []), default=str),
         "last_query_metadata": parsed.get("metadata", {}),
-        # Mark done here so orchestrator synthesis triggers even without verifier
         "plan": _updated_plan("done"),
         "error": "",
     }
 
 
 # ---------------------------------------------------------------------------
-# Node: verifier — NO tools; increments retry_count
+# Node: verifier — handles both success verification and SQL error recovery
 # ---------------------------------------------------------------------------
 
 def verifier(state: AnalyticsState) -> dict:
     step = state.current_step
+    is_error = state.last_query_result.startswith("ERROR") if state.last_query_result else False
     row_count = state.last_query_metadata.get("row_count", "unknown")
     table_preview = _rows_to_markdown(state.last_query_result)
-    prompt = (
-        f"Sub-task: {step.description if step else 'unknown'}\n"
-        f"SQL executed:\n{state.last_sql}\n\n"
-        f"Row count: {row_count}\n"
-        f"First rows:\n{table_preview[:1500]}\n\n"
-        "Verify whether the SQL correctly answers the sub-task.\n"
-        "- Correct and returns data → verdict=pass\n"
-        "- Clear bug (wrong column, bad filter) → verdict=fail with corrected_sql\n"
-        "- Plausible but uncertain → verdict=warning (treated as pass)\n"
-        "- Do NOT call any tools.\n"
-        'Output ONLY: {"verdict": "pass|fail|warning", "feedback": "...", "corrected_sql": "(only if fail)"}'
-    )
+
+    if is_error:
+        # Error recovery mode: ask LLM to fix the SQL
+        prompt = (
+            f"Sub-task: {step.description if step else 'unknown'}\n"
+            f"SQL that failed:\n{state.last_sql}\n\n"
+            f"DuckDB error:\n{state.last_query_result}\n\n"
+            f"Schema hint: {_get_schema_for_table(_get_most_recent_table())}\n\n"
+            "The SQL produced an error. Provide a corrected SQL query.\n"
+            'Output ONLY: {"verdict": "fail", "feedback": "<what was wrong>", "corrected_sql": "<fixed SQL>"}'
+        )
+    else:
+        prompt = (
+            f"Sub-task: {step.description if step else 'unknown'}\n"
+            f"SQL executed:\n{state.last_sql}\n\n"
+            f"Row count: {row_count}\n"
+            f"First rows:\n{table_preview[:1500]}\n\n"
+            "Verify whether the SQL correctly answers the sub-task.\n"
+            "- Correct and returns data → verdict=pass\n"
+            "- Clear bug (wrong column, bad filter) → verdict=fail with corrected_sql\n"
+            "- Plausible but uncertain → verdict=warning (treated as pass)\n"
+            "- Do NOT call any tools.\n"
+            'Output ONLY: {"verdict": "pass|fail|warning", "feedback": "...", "corrected_sql": "(only if fail)"}'
+        )
+
     response = _llm().invoke(
         [SystemMessage(content=VERIFIER_SYSTEM), HumanMessage(content=prompt)]
     )
@@ -538,7 +567,7 @@ def verifier(state: AnalyticsState) -> dict:
     feedback = str(parsed.get("feedback", ""))
     corrected_sql = parsed.get("corrected_sql", "")
 
-    new_status = "done" if verdict in ("pass", "warning") else "pending"  # pending = retry
+    new_status = "done" if verdict in ("pass", "warning") else "pending"
     updated_plan = [
         s.model_copy(update={"status": new_status, "result": feedback})
         if step and s.id == step.id else s for s in state.plan
@@ -548,7 +577,7 @@ def verifier(state: AnalyticsState) -> dict:
         "verification_feedback": feedback,
         "plan": updated_plan,
         "current_step": None,
-        "retry_count": state.retry_count + 1,  # always increment
+        "retry_count": state.retry_count + 1,
     }
     if corrected_sql and verdict == "fail":
         updates["last_sql"] = str(corrected_sql)
