@@ -1,14 +1,13 @@
 """LangGraph StateGraph assembly.
 
-Intent routing:
-  load      → load_file_node → END
-  analytics → profiler | sql_writer → execute_sql → verifier → [next step | orchestrator synthesis] → END
-  chitchat  → END
+Routing (simplified):
+  load       -> load_file_node -> END
+  chitchat   -> END
+  analytics  -> sql_writer -> execute_sql -> orchestrator (synthesis) -> END
+               profiler -> sql_writer -> execute_sql -> verifier -> orchestrator -> END
 
-Verifier NEVER calls tools — it reasons on state data only.
-Multi-step plans advance directly: verifier → next pending step (no orchestrator mid-plan).
-Orchestrator re-entered ONLY for final synthesis.
-Hard cap: after MAX_RETRIES consecutive verifier fails, force step to done and continue.
+Verifier is ONLY used when a profile step precedes the sql step.
+For plain single-step SQL questions, execute_sql goes straight to orchestrator.
 """
 from __future__ import annotations
 
@@ -26,19 +25,9 @@ from agent.nodes import (
 )
 from agent.state import AnalyticsState, PlanStep
 
-MAX_RETRIES = 2
-
-
-# ---------------------------------------------------------------------------
-# Router helpers
-# ---------------------------------------------------------------------------
 
 def _next_pending_step(state: AnalyticsState) -> PlanStep | None:
     return next((s for s in state.plan if s.status == "pending"), None)
-
-
-def _all_steps_done(state: AnalyticsState) -> bool:
-    return bool(state.plan) and all(s.status in ("done", "failed") for s in state.plan)
 
 
 def route_after_orchestrator(
@@ -49,38 +38,33 @@ def route_after_orchestrator(
     step = _next_pending_step(state)
     if step is not None:
         return "profiler" if step.type == "profile" else "sql_writer"
-    if state.final_answer:
-        return END
     return END
+
+
+def route_after_execute(
+    state: AnalyticsState,
+) -> Literal["verifier", "orchestrator"]:
+    """Skip verifier for simple single-sql plans; only verify when profiling preceded."""
+    has_profile_step = any(s.type == "profile" for s in state.plan)
+    next_step = _next_pending_step(state)
+    # Use verifier only if there was profiling OR more steps remain
+    if has_profile_step or next_step is not None:
+        return "verifier"
+    return "orchestrator"
 
 
 def route_after_verifier(
     state: AnalyticsState,
-) -> Literal["orchestrator", "profiler", "sql_writer"]:
-    """Advance plan without re-entering orchestrator mid-plan.
-
-    - fail + retries remaining  → sql_writer (retry)
-    - fail + retries exhausted  → mark step done, fall through
-    - more pending steps        → directly to profiler/sql_writer
-    - all steps done            → orchestrator (synthesis)
-    """
-    if state.verification_verdict == "fail":
-        if state.retry_count < MAX_RETRIES:
-            return "sql_writer"
-        # Retries exhausted — treat current step as done and advance
-        # (step was already marked failed in verifier node; just move on)
-
+) -> Literal["orchestrator", "sql_writer"]:
+    if state.verification_verdict == "fail" and state.retry_count < 2:
+        return "sql_writer"
     next_step = _next_pending_step(state)
     if next_step is not None:
-        return "profiler" if next_step.type == "profile" else "sql_writer"
-
+        return "sql_writer"
     return "orchestrator"
 
 
 # ---------------------------------------------------------------------------
-# Graph construction
-# ---------------------------------------------------------------------------
-
 builder = StateGraph(AnalyticsState)
 
 builder.add_node("orchestrator",   orchestrator)
@@ -95,27 +79,24 @@ builder.add_edge(START, "orchestrator")
 builder.add_conditional_edges(
     "orchestrator",
     route_after_orchestrator,
-    {
-        "load_file_node": "load_file_node",
-        "profiler":       "profiler",
-        "sql_writer":     "sql_writer",
-        END:              END,
-    },
+    {"load_file_node": "load_file_node", "profiler": "profiler",
+     "sql_writer": "sql_writer", END: END},
 )
 
 builder.add_edge("load_file_node", END)
 builder.add_edge("profiler",       "sql_writer")
 builder.add_edge("sql_writer",     "execute_sql")
-builder.add_edge("execute_sql",    "verifier")
+
+builder.add_conditional_edges(
+    "execute_sql",
+    route_after_execute,
+    {"verifier": "verifier", "orchestrator": "orchestrator"},
+)
 
 builder.add_conditional_edges(
     "verifier",
     route_after_verifier,
-    {
-        "orchestrator": "orchestrator",
-        "profiler":     "profiler",
-        "sql_writer":   "sql_writer",
-    },
+    {"orchestrator": "orchestrator", "sql_writer": "sql_writer"},
 )
 
 graph = builder.compile()
