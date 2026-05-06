@@ -91,24 +91,19 @@ def _get_available_tables() -> str:
         return f"(Could not read schema catalog: {exc})"
 
 
-# Regex patterns that reliably signal a file-load request — checked BEFORE the LLM
 _LOAD_PATTERNS = [
-    # "load file at path/to/file.xlsx as tablename"
     re.compile(
         r"load\s+(?:file\s+)?at\s+(?P<path>\S+)\s+as\s+(?P<dataset>\w+)",
         re.IGNORECASE,
     ),
-    # "import path/to/file.xlsx as tablename"
     re.compile(
         r"import\s+(?P<path>\S+)\s+as\s+(?P<dataset>\w+)",
         re.IGNORECASE,
     ),
-    # "load path/to/file.xlsx as tablename"
     re.compile(
         r"load\s+(?P<path>\S+\.(?:xlsx|xls|csv|parquet))\s+as\s+(?P<dataset>\w+)",
         re.IGNORECASE,
     ),
-    # "load path/to/file.xlsx"  (no explicit table name)
     re.compile(
         r"load\s+(?:file\s+)?(?P<path>\S+\.(?:xlsx|xls|csv|parquet))",
         re.IGNORECASE,
@@ -135,26 +130,63 @@ def _detect_load_intent(text: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 def orchestrator(state: AnalyticsState) -> dict:
-    """Classify the user intent and either plan, load a file, chitchat, or synthesise."""
+    """Classify user intent: load / analytics / chitchat / synthesise."""
 
-    # Resolve user_query (handles Studio content-block lists)
-    user_query = state.user_query
-    if not user_query:
-        for msg in reversed(state.messages):
-            if isinstance(msg, HumanMessage):
-                user_query = _extract_text(msg.content)
-                break
+    # ── Extract the latest user message ────────────────────────────────────
+    # Always read from the latest HumanMessage so each turn is fresh.
+    current_query = ""
+    for msg in reversed(state.messages):
+        if isinstance(msg, HumanMessage):
+            current_query = _extract_text(msg.content)
+            break
 
     tables_context = _get_available_tables()
 
+    # ── Synthesis: all plan steps completed ───────────────────────────────
+    # user_query here is the ORIGINAL analytics question (set when plan was built)
+    if state.plan and all(s.status in ("done", "failed") for s in state.plan):
+        synthesis_prompt = (
+            f"User question: {state.user_query}\n\n"
+            f"Query result (first 50 rows): {state.last_query_result}\n\n"
+            f"Verification verdict: {state.verification_verdict}\n"
+            f"Verification feedback: {state.verification_feedback}\n\n"
+            "Synthesise a clear, concise final answer for the user. "
+            'Output JSON: {"final_answer": "..."}'
+        )
+        response = _llm().invoke(
+            [HumanMessage(content=synthesis_prompt)]
+        )
+        parsed = _try_parse_json(response.content) or {}
+        final = parsed.get("final_answer", response.content)
+        return {
+            "final_answer": final,
+            "plan": [],           # clear plan so next turn starts fresh
+            "messages": [AIMessage(content=final)],
+        }
+
+    # ── New turn: reset all stale fields from previous turn ────────────────
+    base_reset = {
+        "user_query": current_query,
+        "final_answer": "",
+        "plan": [],
+        "current_step": None,
+        "last_sql": "",
+        "last_query_result": "",
+        "last_query_metadata": {},
+        "verification_verdict": "",
+        "verification_feedback": "",
+        "load_file_path": "",
+        "load_file_dataset": "",
+        "error": "",
+    }
+
     # ── Fast-path: regex load detection (no LLM needed) ──────────────────────
-    load_match = _detect_load_intent(user_query)
+    load_match = _detect_load_intent(current_query)
     if load_match:
         return {
-            "user_query": user_query,
+            **base_reset,
             "load_file_path": load_match["path"],
             "load_file_dataset": load_match["dataset"],
-            "final_answer": "",
         }
 
     ORCHESTRATOR_SYSTEM = f"""You are the Orchestrator of a DuckDB analytics agent.
@@ -170,50 +202,28 @@ Classify the user message into exactly ONE intent and respond with matching JSON
    Always use the correct table name from the available tables above.
 
 2. CHITCHAT – greeting, small talk, or off-topic:
-   {{"intent": "chitchat", "final_answer": "<friendly reply mentioning available tables and that you can load files with: load file at <path> as <name>>"}}
+   {{"intent": "chitchat", "final_answer": "<friendly reply mentioning available tables and how to load files>"}}
 
 Rules:
 - Output ONLY the JSON. No markdown, no explanation.
 - Never generate Python code.
-- Keep plans minimal.
+- Keep plans minimal (1-2 steps).
 """
 
-    # ---- Synthesis: all steps finished, compose final answer ----
-    if state.plan and all(s.status in ("done", "failed") for s in state.plan):
-        synthesis_prompt = (
-            f"User question: {user_query}\n\n"
-            f"Query result (first 50 rows): {state.last_query_result}\n\n"
-            f"Verification verdict: {state.verification_verdict}\n"
-            f"Verification feedback: {state.verification_feedback}\n\n"
-            "Synthesise a clear, concise final answer for the user. "
-            'Output JSON: {"intent": "chitchat", "final_answer": "..."}'
-        )
-        response = _llm().invoke(
-            [SystemMessage(content=ORCHESTRATOR_SYSTEM),
-             HumanMessage(content=synthesis_prompt)]
-        )
-        parsed = _try_parse_json(response.content) or {}
-        final = parsed.get("final_answer", response.content)
-        return {
-            "final_answer": final,
-            "user_query": user_query,
-            "messages": [AIMessage(content=final)],
-        }
-
-    # ---- LLM classification (analytics vs chitchat) ----
+    # ── LLM classification ───────────────────────────────────────────────────
     llm = _llm().bind_tools(ORCHESTRATOR_TOOLS)
     response = llm.invoke(
         [SystemMessage(content=ORCHESTRATOR_SYSTEM),
-         HumanMessage(content=user_query)]
+         HumanMessage(content=current_query)]
     )
 
     parsed = _try_parse_json(response.content)
 
     if parsed is None:
-        reply = response.content or "Hi! I'm a DuckDB analytics agent. Ask me a data question or say \"load file at <path> as <name>\"."
+        reply = response.content or "Hi! I'm a DuckDB analytics agent. Ask a data question or say: load file at <path> as <name>."
         return {
+            **base_reset,
             "final_answer": reply,
-            "user_query": user_query,
             "messages": [AIMessage(content=reply)],
         }
 
@@ -221,13 +231,13 @@ Rules:
 
     if intent == "analytics":
         plan = [PlanStep(**step) for step in parsed.get("plan", [])]
-        return {"user_query": user_query, "plan": plan, "final_answer": ""}
+        return {**base_reset, "plan": plan, "final_answer": ""}
 
-    # chitchat / fallback
-    reply = parsed.get("final_answer", "Hi! Ask me a data question or load a file with: load file at <path> as <name>.")
+    # chitchat
+    reply = parsed.get("final_answer", "Hi! Ask a data question or load a file.")
     return {
+        **base_reset,
         "final_answer": reply,
-        "user_query": user_query,
         "messages": [AIMessage(content=reply)],
     }
 
@@ -242,7 +252,7 @@ def load_file_node(state: AnalyticsState) -> dict:
     dataset = state.load_file_dataset
 
     if not path:
-        reply = "I couldn't find a file path in your message. Please say: \"load file at <path> as <name>\"."
+        reply = "I couldn't find a file path. Please say: load file at <path> as <name>."
         return {
             "final_answer": reply,
             "messages": [AIMessage(content=reply)],
