@@ -132,8 +132,7 @@ def _detect_load_intent(text: str) -> dict | None:
 def orchestrator(state: AnalyticsState) -> dict:
     """Classify user intent: load / analytics / chitchat / synthesise."""
 
-    # ── Extract the latest user message ────────────────────────────────────
-    # Always read from the latest HumanMessage so each turn is fresh.
+    # Always read from the latest HumanMessage so each turn is independent
     current_query = ""
     for msg in reversed(state.messages):
         if isinstance(msg, HumanMessage):
@@ -142,30 +141,9 @@ def orchestrator(state: AnalyticsState) -> dict:
 
     tables_context = _get_available_tables()
 
-    # ── Synthesis: all plan steps completed ───────────────────────────────
-    # user_query here is the ORIGINAL analytics question (set when plan was built)
-    if state.plan and all(s.status in ("done", "failed") for s in state.plan):
-        synthesis_prompt = (
-            f"User question: {state.user_query}\n\n"
-            f"Query result (first 50 rows): {state.last_query_result}\n\n"
-            f"Verification verdict: {state.verification_verdict}\n"
-            f"Verification feedback: {state.verification_feedback}\n\n"
-            "Synthesise a clear, concise final answer for the user. "
-            'Output JSON: {"final_answer": "..."}'
-        )
-        response = _llm().invoke(
-            [HumanMessage(content=synthesis_prompt)]
-        )
-        parsed = _try_parse_json(response.content) or {}
-        final = parsed.get("final_answer", response.content)
-        return {
-            "final_answer": final,
-            "plan": [],           # clear plan so next turn starts fresh
-            "messages": [AIMessage(content=final)],
-        }
-
-    # ── New turn: reset all stale fields from previous turn ────────────────
-    base_reset = {
+    # ── Reset ALL stale fields at the top of every new turn ─────────────────
+    # None is used for optional fields so LangGraph sees a real value change.
+    base_reset: dict = {
         "user_query": current_query,
         "final_answer": "",
         "plan": [],
@@ -175,12 +153,31 @@ def orchestrator(state: AnalyticsState) -> dict:
         "last_query_metadata": {},
         "verification_verdict": "",
         "verification_feedback": "",
-        "load_file_path": "",
-        "load_file_dataset": "",
+        "load_file_path": None,    # None = not a load turn
+        "load_file_dataset": None,
         "error": "",
     }
 
-    # ── Fast-path: regex load detection (no LLM needed) ──────────────────────
+    # ── Synthesis: all plan steps completed ──────────────────────────────
+    if state.plan and all(s.status in ("done", "failed") for s in state.plan):
+        synthesis_prompt = (
+            f"User question: {state.user_query}\n\n"
+            f"Query result (first 50 rows): {state.last_query_result}\n\n"
+            f"Verification verdict: {state.verification_verdict}\n"
+            f"Verification feedback: {state.verification_feedback}\n\n"
+            "Synthesise a clear, concise final answer for the user. "
+            'Output JSON: {"final_answer": "..."}'
+        )
+        response = _llm().invoke([HumanMessage(content=synthesis_prompt)])
+        parsed = _try_parse_json(response.content) or {}
+        final = parsed.get("final_answer", response.content)
+        return {
+            **base_reset,         # clears plan so next turn starts fresh
+            "final_answer": final,
+            "messages": [AIMessage(content=final)],
+        }
+
+    # ── Fast-path: regex load detection (bypasses LLM entirely) ────────────
     load_match = _detect_load_intent(current_query)
     if load_match:
         return {
@@ -210,7 +207,7 @@ Rules:
 - Keep plans minimal (1-2 steps).
 """
 
-    # ── LLM classification ───────────────────────────────────────────────────
+    # ── LLM classification (analytics vs chitchat only) ──────────────────
     llm = _llm().bind_tools(ORCHESTRATOR_TOOLS)
     response = llm.invoke(
         [SystemMessage(content=ORCHESTRATOR_SYSTEM),
@@ -220,7 +217,7 @@ Rules:
     parsed = _try_parse_json(response.content)
 
     if parsed is None:
-        reply = response.content or "Hi! I'm a DuckDB analytics agent. Ask a data question or say: load file at <path> as <name>."
+        reply = response.content or "Hi! Ask a data question or say: load file at <path> as <name>."
         return {
             **base_reset,
             "final_answer": reply,
@@ -231,7 +228,7 @@ Rules:
 
     if intent == "analytics":
         plan = [PlanStep(**step) for step in parsed.get("plan", [])]
-        return {**base_reset, "plan": plan, "final_answer": ""}
+        return {**base_reset, "plan": plan}
 
     # chitchat
     reply = parsed.get("final_answer", "Hi! Ask a data question or load a file.")
@@ -256,8 +253,8 @@ def load_file_node(state: AnalyticsState) -> dict:
         return {
             "final_answer": reply,
             "messages": [AIMessage(content=reply)],
-            "load_file_path": "",
-            "load_file_dataset": "",
+            "load_file_path": None,
+            "load_file_dataset": None,
         }
 
     if not dataset:
@@ -273,8 +270,8 @@ def load_file_node(state: AnalyticsState) -> dict:
     return {
         "final_answer": reply,
         "messages": [AIMessage(content=reply)],
-        "load_file_path": "",
-        "load_file_dataset": "",
+        "load_file_path": None,
+        "load_file_dataset": None,
     }
 
 
