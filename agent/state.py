@@ -21,26 +21,29 @@ class PlanStep(BaseModel):
 class AnalyticsState(BaseModel):
     """Complete state object for the analytics agent graph."""
 
-    # ── Conversation ─────────────────────────────────────────────────────────
-    # add_messages reducer appends rather than overwrites, enabling multi-turn
+    # ── Conversation ─────────────────────────────────────────────────────────────────────
     messages: Annotated[list[AnyMessage], add_messages] = Field(default_factory=list)
 
-    # ── User intent ──────────────────────────────────────────────────────────
+    # ── User intent ──────────────────────────────────────────────────────────────────────
     user_query: str = ""
 
-    # ── Orchestrator plan ────────────────────────────────────────────────────
+    # ── File loading ─────────────────────────────────────────────────────────────────────
+    load_file_path: str = ""      # set by orchestrator when user asks to load a file
+    load_file_dataset: str = ""   # table name to register the file as
+
+    # ── Orchestrator plan ───────────────────────────────────────────────────────────────
     plan: list[PlanStep] = Field(default_factory=list)
     current_step: PlanStep | None = None
 
-    # ── SQL pipeline ─────────────────────────────────────────────────────────
+    # ── SQL pipeline ───────────────────────────────────────────────────────────────────
     last_sql: str = ""
     last_query_result: str = ""   # JSON string of first 50 rows
     last_query_metadata: dict[str, Any] = Field(default_factory=dict)
 
-    # ── Verification ─────────────────────────────────────────────────────────
+    # ── Verification ────────────────────────────────────────────────────────────────────
     verification_verdict: str = ""   # "pass" | "fail" | "warning"
     verification_feedback: str = ""
 
-    # ── Final answer ─────────────────────────────────────────────────────────
+    # ── Final answer ────────────────────────────────────────────────────────────────────
     final_answer: str = ""
     error: str = ""

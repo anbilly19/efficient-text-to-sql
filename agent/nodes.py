@@ -19,6 +19,7 @@ from agent.tools import (
     PROFILER_TOOLS,
     SQL_WRITER_TOOLS,
     VERIFIER_TOOLS,
+    load_file,
     run_sql,
 )
 from agent.database import get_connection
@@ -63,13 +64,6 @@ def _try_parse_json(text: str) -> dict | None:
         return None
 
 
-def _parse_json_from_response(text: str) -> dict:
-    result = _try_parse_json(text)
-    if result is None:
-        raise ValueError(f"No JSON found in response: {text[:200]}")
-    return result
-
-
 def _get_available_tables() -> str:
     """Query DuckDB for all user-loaded tables and return a summary string."""
     conn = get_connection()
@@ -82,7 +76,7 @@ def _get_available_tables() -> str:
             """
         ).fetchall()
         if not rows:
-            return "No tables loaded yet. Ask the user to load a file first."
+            return "No tables loaded yet."
         tables: dict[str, list[str]] = {}
         for dataset, col, dtype in rows:
             tables.setdefault(dataset, []).append(f"{col} ({dtype})")
@@ -100,7 +94,7 @@ def _get_available_tables() -> str:
 # ---------------------------------------------------------------------------
 
 def orchestrator(state: AnalyticsState) -> dict:
-    """Plan the query or synthesise the final answer when all steps are done."""
+    """Classify the user intent and either plan, load a file, chitchat, or synthesise."""
 
     # Resolve user_query (handles Studio content-block lists)
     user_query = state.user_query
@@ -110,7 +104,6 @@ def orchestrator(state: AnalyticsState) -> dict:
                 user_query = _extract_text(msg.content)
                 break
 
-    # Fetch available tables to inject into every prompt
     tables_context = _get_available_tables()
 
     ORCHESTRATOR_SYSTEM = f"""You are the Orchestrator of a DuckDB analytics agent.
@@ -118,22 +111,24 @@ def orchestrator(state: AnalyticsState) -> dict:
 Available tables in DuckDB:
 {tables_context}
 
-If the user's message is a greeting, small talk, or NOT a data/analytics question
-(e.g. "hi", "hello", "how are you"), respond ONLY with:
-{{"final_answer": "<friendly reply mentioning what tables are available>"}}
+Classify the user message into exactly ONE of these intents and respond with the matching JSON:
 
-Otherwise, for any data or analytics question, create a minimal execution plan:
-{{"plan": [{{"id": 1, "type": "sql", "description": "..."}}]}}
+1. LOAD FILE – user wants to load / import a file into DuckDB:
+   {{"intent": "load", "path": "<file path>", "dataset": "<table name to use>"}}
+   Rules: infer the table name from the filename if the user didn’t specify one.
 
-Step types:
-- "profile" → explore a column's data distribution
-- "sql"     → generate a DuckDB SELECT query
+2. ANALYTICS – user asks a data or SQL question:
+   {{"intent": "analytics", "plan": [{{"id": 1, "type": "sql", "description": "..."}}]}}
+   Step types: "profile" (explore column) or "sql" (SELECT query).
+   Always reference the correct table name from the available tables above.
+
+3. CHITCHAT – greeting, small talk, or off-topic:
+   {{"intent": "chitchat", "final_answer": "<friendly reply mentioning available tables>"}}
 
 Rules:
+- Output ONLY the JSON. No markdown, no explanation.
 - Never generate Python code.
-- Keep plans minimal: profile only when column semantics are ambiguous.
-- When re-planning after a failure, include the verifier's feedback in the new step description.
-- Always reference the correct table name from the available tables listed above.
+- Keep plans minimal.
 """
 
     # ---- Synthesis: all steps finished, compose final answer ----
@@ -144,7 +139,7 @@ Rules:
             f"Verification verdict: {state.verification_verdict}\n"
             f"Verification feedback: {state.verification_feedback}\n\n"
             "Synthesise a clear, concise final answer for the user. "
-            'Output JSON: {"final_answer": "..."}'
+            'Output JSON: {"intent": "chitchat", "final_answer": "..."}'
         )
         response = _llm().invoke(
             [SystemMessage(content=ORCHESTRATOR_SYSTEM),
@@ -154,45 +149,88 @@ Rules:
         final = parsed.get("final_answer", response.content)
         return {
             "final_answer": final,
+            "user_query": user_query,
             "messages": [AIMessage(content=final)],
         }
 
-    # ---- Planning: build execution plan (or reply to chitchat) ----
-    plan_prompt = (
-        f"Available tables:\n{tables_context}\n\n"
-        f"User message: {user_query}\n\n"
-        "If this is a data/analytics question, output a JSON plan using the correct table names above. "
-        "If it is chitchat or a greeting, output a friendly JSON final_answer mentioning the available tables."
-    )
+    # ---- Classify user intent ----
     llm = _llm().bind_tools(ORCHESTRATOR_TOOLS)
     response = llm.invoke(
         [SystemMessage(content=ORCHESTRATOR_SYSTEM),
-         HumanMessage(content=plan_prompt)]
+         HumanMessage(content=user_query)]
     )
 
     parsed = _try_parse_json(response.content)
 
-    # LLM returned no JSON at all (pure conversational reply)
+    # No JSON at all – treat as chitchat
     if parsed is None:
-        reply = response.content or "Hi! I'm a DuckDB analytics agent. Ask me a data question!"
+        reply = response.content or "Hi! I’m a DuckDB analytics agent. Ask me a data question or say \"load file at <path> as <name>\"."
         return {
             "final_answer": reply,
             "user_query": user_query,
             "messages": [AIMessage(content=reply)],
         }
 
-    # LLM returned a final_answer directly (chitchat detected)
-    if "final_answer" in parsed and "plan" not in parsed:
-        reply = parsed["final_answer"]
+    intent = parsed.get("intent", "chitchat")
+
+    if intent == "load":
+        # Hand off to load_file_node via state fields
         return {
-            "final_answer": reply,
             "user_query": user_query,
-            "messages": [AIMessage(content=reply)],
+            "load_file_path": parsed.get("path", ""),
+            "load_file_dataset": parsed.get("dataset", ""),
+            "final_answer": "",  # clear so routing works
         }
 
-    # Normal analytics plan
-    plan = [PlanStep(**step) for step in parsed.get("plan", [])]
-    return {"user_query": user_query, "plan": plan}
+    if intent == "analytics":
+        plan = [PlanStep(**step) for step in parsed.get("plan", [])]
+        return {"user_query": user_query, "plan": plan, "final_answer": ""}
+
+    # chitchat / fallback
+    reply = parsed.get("final_answer", "Hi! Ask me a data question or load a file.")
+    return {
+        "final_answer": reply,
+        "user_query": user_query,
+        "messages": [AIMessage(content=reply)],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Node: load_file_node
+# ---------------------------------------------------------------------------
+
+def load_file_node(state: AnalyticsState) -> dict:
+    """Load a file into DuckDB using the path and dataset name set by orchestrator."""
+    path = state.load_file_path
+    dataset = state.load_file_dataset
+
+    if not path:
+        reply = "I couldn’t find a file path in your message. Please say something like: \"load file at data/sales.xlsx as sales\"."
+        return {
+            "final_answer": reply,
+            "messages": [AIMessage(content=reply)],
+            "load_file_path": "",
+            "load_file_dataset": "",
+        }
+
+    if not dataset:
+        # Infer dataset name from filename
+        from pathlib import Path
+        dataset = Path(path).stem.replace(" ", "_").replace("-", "_").lower()
+
+    result = load_file.invoke({"path": path, "dataset_name": dataset})
+
+    if result.startswith("ERROR"):
+        reply = f"❌ Failed to load file: {result}"
+    else:
+        reply = f"✅ {result}\n\nYou can now ask questions about the `{dataset}` table!"
+
+    return {
+        "final_answer": reply,
+        "messages": [AIMessage(content=reply)],
+        "load_file_path": "",
+        "load_file_dataset": "",
+    }
 
 
 # ---------------------------------------------------------------------------
