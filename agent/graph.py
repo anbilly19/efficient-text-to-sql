@@ -1,12 +1,14 @@
 """LangGraph StateGraph assembly – this is what LangGraph Studio loads.
 
 Exported symbol: `graph`  (referenced in langgraph.json)
+
+Note: No custom checkpointer needed – the LangGraph API platform handles
+persistence automatically (MemorySaver locally, Postgres in cloud).
 """
 from __future__ import annotations
 
 from typing import Literal
 
-from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from agent.nodes import execute_sql, orchestrator, profiler, sql_writer, verifier
@@ -100,7 +102,6 @@ builder.add_conditional_edges(
 # Compiled graph – exported for LangGraph Studio
 # ---------------------------------------------------------------------------
 
-graph = builder.compile(
-    checkpointer=MemorySaver(),  # in-memory multi-turn state for Studio dev
-)
+# No checkpointer argument – LangGraph API injects its own persistence layer
+graph = builder.compile()
 graph.name = "DuckDB Analytics Agent"
