@@ -123,11 +123,6 @@ def _get_schema_for_table(table_name: str) -> str:
 
 
 def _get_date_cast_warnings(table_name: str) -> str:
-    """Return deterministic cast instructions for every VARCHAR date column.
-
-    These are injected verbatim into the sql_writer prompt so the LLM
-    has zero discretion — it MUST use the exact expressions shown.
-    """
     if not table_name:
         return ""
     conn = get_connection()
@@ -142,10 +137,9 @@ def _get_date_cast_warnings(table_name: str) -> str:
     warnings: list[str] = []
     for col, dtype in rows:
         if dtype.upper() == "VARCHAR":
-            # Peek at a sample to check if it looks like a date
             try:
                 sample = conn.execute(
-                    f'SELECT "{col}" FROM {table_name} WHERE "{col}" IS NOT NULL LIMIT 1'
+                    f'SELECT "{col}" FROM "{table_name}" WHERE "{col}" IS NOT NULL LIMIT 1'
                 ).fetchone()
                 if sample and re.match(r"\d{4}-\d{2}-\d{2}", str(sample[0])):
                     warnings.append(
@@ -297,22 +291,26 @@ Available tables in DuckDB:
 
 Most recently loaded table: {most_recent_table or 'none'}
 
-Classify the user message into exactly ONE intent and respond with matching JSON:
+Classify the user message into exactly ONE intent:
 
-1. ANALYTICS – data or SQL question:
+1. ANALYTICS – use ONLY when the question explicitly asks about data IN a loaded table
+   (counts, sums, averages, filters, rankings, trends over rows/columns listed above).
    {{"intent": "analytics", "plan": [{{"id": 1, "type": "sql", "description": "..."}}]}}
-   Step types: "profile" (explore column) or "sql" (SELECT query).
-   CRITICAL: Every step description MUST include the exact table name.
-   If the user does not specify a table, use: "{most_recent_table}".
-   For multiple questions, create one step per question.
+   Step types: "profile" (explore a column) or "sql" (SELECT query).
+   Every step description MUST name the exact table.
+   Default table if unspecified: "{most_recent_table}".
 
-2. CHITCHAT – greeting, small talk, or off-topic:
-   {{"intent": "chitchat", "final_answer": "<friendly reply>"}}
+2. CHITCHAT – use for EVERYTHING else:
+   - Greetings, thanks, how-are-you
+   - General knowledge / world facts ("what is X?", "how does Y work?", comparisons
+     between concepts that are NOT columns/tables)
+   - Ambiguous questions with no clear table reference
+   - Questions about the agent itself
+   {{"intent": "chitchat", "final_answer": "<helpful reply>"}}
 
-Rules:
-- Output ONLY the JSON. No markdown, no explanation.
-- Never generate Python code.
-- Keep steps minimal: one "sql" step per question.
+Decision rule: if in doubt, pick CHITCHAT.
+
+Output ONLY the JSON. No markdown, no explanation.
 """
 
     llm = _llm().bind_tools(ORCHESTRATOR_TOOLS)
@@ -388,8 +386,6 @@ def sql_writer(state: AnalyticsState) -> dict:
 
     table_name = _extract_table_from_plan(state.plan, state.user_query)
     schema_context = _get_schema_for_table(table_name) if table_name else "(No tables loaded)"
-
-    # Deterministic cast warnings — injected per-column, no LLM discretion
     cast_warnings = _get_date_cast_warnings(table_name)
 
     profiling_notes = "\n".join(
