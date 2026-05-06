@@ -21,30 +21,30 @@ class PlanStep(BaseModel):
 class AnalyticsState(BaseModel):
     """Complete state object for the analytics agent graph."""
 
-    # ── Conversation ──────────────────────────────────────────────────────
+    # ── Conversation ─────────────────────────────────────────────────────
     messages: Annotated[list[AnyMessage], add_messages] = Field(default_factory=list)
 
-    # ── User intent ──────────────────────────────────────────────────────────
+    # ── User intent ──────────────────────────────────────────────────────
     user_query: str = ""
 
-    # ── File loading ────────────────────────────────────────────────────────
-    # None = not loading; a string path = load is requested this turn
+    # ── File loading ──────────────────────────────────────────────────────
     load_file_path: str | None = None
     load_file_dataset: str | None = None
 
-    # ── Orchestrator plan ────────────────────────────────────────────────────
+    # ── Orchestrator plan ──────────────────────────────────────────────────
     plan: list[PlanStep] = Field(default_factory=list)
     current_step: PlanStep | None = None
 
-    # ── SQL pipeline ─────────────────────────────────────────────────────────
+    # ── SQL pipeline ────────────────────────────────────────────────────────
     last_sql: str = ""
     last_query_result: str = ""   # JSON string of first 50 rows
     last_query_metadata: dict[str, Any] = Field(default_factory=dict)
 
-    # ── Verification ───────────────────────────────────────────────────────────
+    # ── Verification ───────────────────────────────────────────────────────
     verification_verdict: str = ""   # "pass" | "fail" | "warning"
     verification_feedback: str = ""
+    retry_count: int = 0             # incremented on each verifier fail; reset on pass
 
-    # ── Final answer ───────────────────────────────────────────────────────────
+    # ── Final answer ───────────────────────────────────────────────────────
     final_answer: str = ""
     error: str = ""

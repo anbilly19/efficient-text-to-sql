@@ -5,9 +5,10 @@ Intent routing:
   analytics → profiler | sql_writer → execute_sql → verifier → [next step | orchestrator synthesis] → END
   chitchat  → END
 
-Multi-step plans advance directly through verifier → next node WITHOUT re-entering
-orthestrator mid-plan. Orchestrator is only re-entered for final synthesis (all steps done)
-or on a verifier fail (retry the same step via sql_writer).
+Verifier NEVER calls tools — it reasons on state data only.
+Multi-step plans advance directly: verifier → next pending step (no orchestrator mid-plan).
+Orchestrator re-entered ONLY for final synthesis.
+Hard cap: after MAX_RETRIES consecutive verifier fails, force step to done and continue.
 """
 from __future__ import annotations
 
@@ -24,6 +25,8 @@ from agent.nodes import (
     verifier,
 )
 from agent.state import AnalyticsState, PlanStep
+
+MAX_RETRIES = 2
 
 
 # ---------------------------------------------------------------------------
@@ -54,22 +57,23 @@ def route_after_orchestrator(
 def route_after_verifier(
     state: AnalyticsState,
 ) -> Literal["orchestrator", "profiler", "sql_writer"]:
-    """Advance the plan without returning to orchestrator mid-plan.
+    """Advance plan without re-entering orchestrator mid-plan.
 
-    - verifier FAIL  → retry the same step via sql_writer (corrected SQL already in state)
-    - more pending steps exist  → go directly to profiler or sql_writer
-    - all steps done  → orchestrator (synthesis only)
+    - fail + retries remaining  → sql_writer (retry)
+    - fail + retries exhausted  → mark step done, fall through
+    - more pending steps        → directly to profiler/sql_writer
+    - all steps done            → orchestrator (synthesis)
     """
-    # Retry on fail
     if state.verification_verdict == "fail":
-        return "sql_writer"
+        if state.retry_count < MAX_RETRIES:
+            return "sql_writer"
+        # Retries exhausted — treat current step as done and advance
+        # (step was already marked failed in verifier node; just move on)
 
-    # Advance to the next pending step directly—skip orchestrator
     next_step = _next_pending_step(state)
     if next_step is not None:
         return "profiler" if next_step.type == "profile" else "sql_writer"
 
-    # All done → orchestrator for synthesis
     return "orchestrator"
 
 
@@ -93,14 +97,14 @@ builder.add_conditional_edges(
     route_after_orchestrator,
     {
         "load_file_node": "load_file_node",
-        "profiler": "profiler",
-        "sql_writer": "sql_writer",
-        END: END,
+        "profiler":       "profiler",
+        "sql_writer":     "sql_writer",
+        END:              END,
     },
 )
 
 builder.add_edge("load_file_node", END)
-builder.add_edge("profiler",       "sql_writer")   # profiler feeds directly into sql_writer
+builder.add_edge("profiler",       "sql_writer")
 builder.add_edge("sql_writer",     "execute_sql")
 builder.add_edge("execute_sql",    "verifier")
 

@@ -20,7 +20,6 @@ from agent.tools import (
     ORCHESTRATOR_TOOLS,
     PROFILER_TOOLS,
     SQL_WRITER_TOOLS,
-    VERIFIER_TOOLS,
     get_schema,
     load_file,
     run_sql,
@@ -55,7 +54,7 @@ def _extract_text(content: Any) -> str:
 
 
 def _try_parse_json(text: str) -> dict | None:
-    """Extract the LAST top-level JSON object from text (avoids grabbing row data)."""
+    """Extract the LAST top-level JSON object from text."""
     if not isinstance(text, str):
         return None
     best = None
@@ -105,7 +104,7 @@ def _get_available_tables() -> str:
 
 
 def _get_most_recent_table() -> str:
-    """Return the name of the most recently loaded table (highest rowid in catalog)."""
+    """Return the name of the most recently loaded table."""
     conn = get_connection()
     try:
         row = conn.execute(
@@ -122,7 +121,7 @@ def _get_most_recent_table() -> str:
 
 
 def _get_schema_for_table(table_name: str) -> str:
-    """Fetch real schema with sample values and format it for prompt injection."""
+    """Fetch real schema with sample values."""
     try:
         raw = get_schema.invoke({"dataset": table_name})
         cols = json.loads(raw)
@@ -140,22 +139,10 @@ def _next_pending_step(plan: list[PlanStep]) -> PlanStep | None:
 
 
 _LOAD_PATTERNS = [
-    re.compile(
-        r"load\s+(?:file\s+)?at\s+(?P<path>\S+)\s+as\s+(?P<dataset>\w+)",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"import\s+(?P<path>\S+)\s+as\s+(?P<dataset>\w+)",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"load\s+(?P<path>\S+\.(?:xlsx|xls|csv|parquet))\s+as\s+(?P<dataset>\w+)",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"load\s+(?:file\s+)?(?P<path>\S+\.(?:xlsx|xls|csv|parquet))",
-        re.IGNORECASE,
-    ),
+    re.compile(r"load\s+(?:file\s+)?at\s+(?P<path>\S+)\s+as\s+(?P<dataset>\w+)", re.IGNORECASE),
+    re.compile(r"import\s+(?P<path>\S+)\s+as\s+(?P<dataset>\w+)", re.IGNORECASE),
+    re.compile(r"load\s+(?P<path>\S+\.(?:xlsx|xls|csv|parquet))\s+as\s+(?P<dataset>\w+)", re.IGNORECASE),
+    re.compile(r"load\s+(?:file\s+)?(?P<path>\S+\.(?:xlsx|xls|csv|parquet))", re.IGNORECASE),
 ]
 
 
@@ -173,12 +160,6 @@ def _detect_load_intent(text: str) -> dict | None:
 
 
 def _extract_table_from_plan(plan: list[PlanStep], user_query: str) -> str:
-    """Find the best matching table name.
-
-    Priority:
-    1. Explicit table name mentioned in user query or plan descriptions.
-    2. Most recently loaded table (by rowid in _schema_catalog).
-    """
     conn = get_connection()
     try:
         rows = conn.execute(
@@ -190,24 +171,20 @@ def _extract_table_from_plan(plan: list[PlanStep], user_query: str) -> str:
         if len(tables) == 1:
             return tables[0]
 
-        # Build search text from user query + all plan step descriptions
         search_text = user_query.lower()
         for step in plan:
             search_text += " " + step.description.lower()
 
-        # Check for explicit name match first (longest match wins to avoid substring traps)
         matched = [t for t in tables if t.lower() in search_text]
         if matched:
-            return max(matched, key=len)  # prefer 'sales1000' over 'sales'
+            return max(matched, key=len)
 
-        # Fallback: most recently loaded table
         return _get_most_recent_table() or tables[0]
     except Exception:
         return ""
 
 
 def _rows_to_markdown(rows_json: str) -> str:
-    """Convert a JSON rows string into a readable markdown table."""
     try:
         rows = json.loads(rows_json)
         if not rows:
@@ -229,8 +206,6 @@ def _rows_to_markdown(rows_json: str) -> str:
 # ---------------------------------------------------------------------------
 
 def orchestrator(state: AnalyticsState) -> dict:
-    """Classify user intent: load / analytics / chitchat / synthesise."""
-
     current_query = ""
     for msg in reversed(state.messages):
         if isinstance(msg, HumanMessage):
@@ -250,12 +225,13 @@ def orchestrator(state: AnalyticsState) -> dict:
         "last_query_metadata": {},
         "verification_verdict": "",
         "verification_feedback": "",
+        "retry_count": 0,
         "load_file_path": None,
         "load_file_dataset": None,
         "error": "",
     }
 
-    # ── Synthesis: all plan steps completed ──────────────────────────────
+    # Synthesis: all plan steps completed
     if state.plan and all(s.status in ("done", "failed") for s in state.plan):
         row_count = state.last_query_metadata.get("row_count", "?")
         table_preview = _rows_to_markdown(state.last_query_result)
@@ -268,13 +244,12 @@ def orchestrator(state: AnalyticsState) -> dict:
             f"Verification verdict: {state.verification_verdict}\n"
             f"Verification feedback: {state.verification_feedback}\n\n"
             "Write a clear, concise answer for the user. "
-            "If the result is a table of rows, present them as a formatted markdown table. "
-            "If it is a single value or ranking, describe it in plain English. "
-            'Output ONLY this JSON (no extra keys): {"final_answer": "<your answer as a plain string>"}'
+            "If the result is a table, present it as markdown. "
+            "If it is a single value, describe it in plain English. "
+            'Output ONLY this JSON: {"final_answer": "<your answer>"}'
         )
         response = _llm().invoke([HumanMessage(content=synthesis_prompt)])
         raw = _extract_text(response.content)
-
         parsed = _try_parse_json(raw) or {}
         final = parsed.get("final_answer")
         if final is None or not isinstance(final, str):
@@ -287,7 +262,7 @@ def orchestrator(state: AnalyticsState) -> dict:
             "messages": [AIMessage(content=final)],
         }
 
-    # ── Fast-path: regex load detection ──────────────────────────────────
+    # Fast-path: regex load detection
     load_match = _detect_load_intent(current_query)
     if load_match:
         return {
@@ -308,9 +283,9 @@ Classify the user message into exactly ONE intent and respond with matching JSON
 1. ANALYTICS – data or SQL question:
    {{"intent": "analytics", "plan": [{{"id": 1, "type": "sql", "description": "..."}}]}}
    Step types: "profile" (explore column) or "sql" (SELECT query).
-   CRITICAL: Every step description MUST include the exact table name from the available tables above.
-   If the user does not specify a table, use the most recently loaded table: "{most_recent_table}".
-   Example description: "Count total rows in {most_recent_table}"
+   CRITICAL: Every step description MUST include the exact table name.
+   If the user does not specify a table, use: "{most_recent_table}".
+   For multiple questions, create one step per question.
 
 2. CHITCHAT – greeting, small talk, or off-topic:
    {{"intent": "chitchat", "final_answer": "<friendly reply>"}}
@@ -318,7 +293,7 @@ Classify the user message into exactly ONE intent and respond with matching JSON
 Rules:
 - Output ONLY the JSON. No markdown, no explanation.
 - Never generate Python code.
-- Keep plans minimal (1-2 steps).
+- Keep steps minimal: one "sql" step per question.
 """
 
     llm = _llm().bind_tools(ORCHESTRATOR_TOOLS)
@@ -402,7 +377,6 @@ def sql_writer(state: AnalyticsState) -> dict:
     if step is None:
         return {"last_sql": "", "error": "No pending step found for sql_writer."}
 
-    # ── Always inject real schema into the prompt ─────────────────────────
     table_name = _extract_table_from_plan(state.plan, state.user_query)
     schema_context = _get_schema_for_table(table_name) if table_name else "(No tables loaded)"
 
@@ -460,26 +434,40 @@ def execute_sql(state: AnalyticsState) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Node: verifier
+# Node: verifier  — NO tools bound; reasons purely on state data
 # ---------------------------------------------------------------------------
 
 def verifier(state: AnalyticsState) -> dict:
-    llm = _llm().bind_tools(VERIFIER_TOOLS)
+    """Verify SQL result WITHOUT calling any tools.
+
+    Tools caused the verifier to loop indefinitely. All data needed for
+    verification is already in state (last_sql, last_query_result, metadata).
+    """
     step = state.current_step
+    row_count = state.last_query_metadata.get("row_count", "unknown")
+    table_preview = _rows_to_markdown(state.last_query_result)
 
     prompt = (
         f"Sub-task: {step.description if step else 'unknown'}\n"
         f"SQL executed:\n{state.last_sql}\n\n"
         f"Result metadata: {json.dumps(state.last_query_metadata)}\n"
-        f"First rows: {state.last_query_result[:2000]}\n\n"
-        'Output JSON: {"verdict": "pass|fail|warning", "feedback": "...", "corrected_sql": "(only if fail)"}'
+        f"Row count: {row_count}\n"
+        f"First rows:\n{table_preview[:1500]}\n\n"
+        "Verify whether the SQL correctly answers the sub-task.\n"
+        "Rules:\n"
+        "- If the query returned rows/values and the SQL looks correct: verdict=pass\n"
+        "- If the SQL has a clear bug (wrong column, missing filter, VARCHAR date not cast): verdict=fail\n"
+        "- If results look plausible but uncertain: verdict=warning (treated as pass)\n"
+        "- Do NOT call any tools. Reason only from the data above.\n"
+        'Output ONLY this JSON: {"verdict": "pass|fail|warning", "feedback": "...", "corrected_sql": "(only if fail)"}'
     )
 
-    response = llm.invoke(
+    # Plain LLM call — NO tools bound
+    response = _llm().invoke(
         [SystemMessage(content=VERIFIER_SYSTEM), HumanMessage(content=prompt)]
     )
-    parsed = _try_parse_json(response.content) or {"verdict": "pass", "feedback": ""}
-    verdict = parsed.get("verdict", "pass")
+    parsed = _try_parse_json(_extract_text(response.content)) or {"verdict": "pass", "feedback": ""}
+    verdict = str(parsed.get("verdict", "pass"))
     feedback = str(parsed.get("feedback", ""))
     corrected_sql = parsed.get("corrected_sql", "")
 
@@ -491,7 +479,7 @@ def verifier(state: AnalyticsState) -> dict:
     ]
 
     updates: dict = {
-        "verification_verdict": str(verdict),
+        "verification_verdict": verdict,
         "verification_feedback": feedback,
         "plan": updated_plan,
         "current_step": None,
