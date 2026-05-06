@@ -33,7 +33,7 @@ from agent.database import get_connection
 
 def _llm(temperature: float = 0.0) -> ChatOpenAI:
     return ChatOpenAI(
-        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        model=os.getenv("OPENAI_MODEL", "gpt-4o"),
         temperature=temperature,
         api_key=os.getenv("OPENAI_API_KEY"),
     )
@@ -122,7 +122,34 @@ def _get_schema_for_table(table_name: str) -> str:
         return f"(Schema unavailable: {exc})"
 
 
+def _get_varchar_date_columns(table_name: str) -> set[str]:
+    """Return set of column names that are VARCHAR but store date-like values."""
+    if not table_name:
+        return set()
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT column_name, data_type FROM _schema_catalog WHERE dataset_name = ?",
+            [table_name],
+        ).fetchall()
+    except Exception:
+        return set()
+    result = set()
+    for col, dtype in rows:
+        if dtype.upper() == "VARCHAR":
+            try:
+                sample = conn.execute(
+                    f'SELECT "{col}" FROM "{table_name}" WHERE "{col}" IS NOT NULL LIMIT 1'
+                ).fetchone()
+                if sample and re.match(r"\d{4}-\d{2}-\d{2}", str(sample[0])):
+                    result.add(col)
+            except Exception:
+                pass
+    return result
+
+
 def _get_date_cast_warnings(table_name: str) -> str:
+    """Prompt-level cast instructions for VARCHAR date columns."""
     if not table_name:
         return ""
     conn = get_connection()
@@ -133,7 +160,6 @@ def _get_date_cast_warnings(table_name: str) -> str:
         ).fetchall()
     except Exception:
         return ""
-
     warnings: list[str] = []
     for col, dtype in rows:
         if dtype.upper() == "VARCHAR":
@@ -144,10 +170,10 @@ def _get_date_cast_warnings(table_name: str) -> str:
                 if sample and re.match(r"\d{4}-\d{2}-\d{2}", str(sample[0])):
                     warnings.append(
                         f'  ⚠️  "{col}" is VARCHAR storing dates (e.g. \'{sample[0]}\').'
-                        f" NEVER use YEAR(\"{col}\") or MONTH(\"{col}\") directly."
-                        f" ALWAYS write: YEAR(TRY_CAST(\"{col}\" AS DATE))"
-                        f" / MONTH(TRY_CAST(\"{col}\" AS DATE))"
-                        f" / DATE_TRUNC(\'month\', TRY_CAST(\"{col}\" AS DATE))"
+                        f' NEVER use YEAR("{col}") or MONTH("{col}") directly.'
+                        f' ALWAYS write: YEAR(TRY_CAST("{col}" AS DATE))'
+                        f' / MONTH(TRY_CAST("{col}" AS DATE))'
+                        f" / DATE_TRUNC('month', TRY_CAST(\"{col}\" AS DATE))"
                     )
             except Exception:
                 pass
@@ -156,6 +182,55 @@ def _get_date_cast_warnings(table_name: str) -> str:
                 f'  ✅  "{col}" is DATE — use YEAR("{col}"), MONTH("{col}"), DATE_TRUNC directly.'
             )
     return "\n".join(warnings)
+
+
+def _sanitize_sql(sql: str, table_name: str) -> str:
+    """Post-process LLM-generated SQL before execution.
+
+    Fixes:
+    1. Stray double-quotes: "table_name"" -> "table_name"
+    2. Auto-rewrite YEAR/MONTH/DATE_TRUNC on VARCHAR date columns to use TRY_CAST.
+    """
+    if not sql:
+        return sql
+
+    # --- Fix 1: collapse runs of 2+ double-quotes around an identifier ---
+    # Matches "word"" or ""word" patterns left by LLM escaping errors
+    sql = re.sub(r'"(\w+)""', r'"\1"', sql)   # trailing stray quote
+    sql = re.sub(r'""(\w+)"', r'"\1"', sql)   # leading stray quote
+
+    # --- Fix 2: rewrite date functions on known VARCHAR date columns ---
+    varchar_date_cols = _get_varchar_date_columns(table_name)
+    for col in varchar_date_cols:
+        # Patterns like: YEAR("col"), YEAR(t."col"), YEAR(t.col), YEAR(col)
+        col_pattern = rf'(?:"?\w+"?\.)?"?{re.escape(col)}"?'
+
+        # YEAR(...)
+        sql = re.sub(
+            rf'\bYEAR\s*\(\s*({col_pattern})\s*\)',
+            lambda m, c=col: f'YEAR(TRY_CAST("{c}" AS DATE))',
+            sql, flags=re.IGNORECASE
+        )
+        # MONTH(...)
+        sql = re.sub(
+            rf'\bMONTH\s*\(\s*({col_pattern})\s*\)',
+            lambda m, c=col: f'MONTH(TRY_CAST("{c}" AS DATE))',
+            sql, flags=re.IGNORECASE
+        )
+        # DATE_TRUNC('...', col)
+        sql = re.sub(
+            rf"DATE_TRUNC\s*\(\s*('[^']*')\s*,\s*({col_pattern})\s*\)",
+            lambda m, c=col: f"DATE_TRUNC({m.group(1)}, TRY_CAST(\"{c}\" AS DATE))",
+            sql, flags=re.IGNORECASE
+        )
+        # STRFTIME('...', col)  — also common
+        sql = re.sub(
+            rf"STRFTIME\s*\(\s*('[^']*')\s*,\s*({col_pattern})\s*\)",
+            lambda m, c=col: f"STRFTIME({m.group(1)}, TRY_CAST(\"{c}\" AS DATE))",
+            sql, flags=re.IGNORECASE
+        )
+
+    return sql
 
 
 def _next_pending_step(plan: list[PlanStep]) -> PlanStep | None:
@@ -309,7 +384,6 @@ Classify the user message into exactly ONE intent:
    {{"intent": "chitchat", "final_answer": "<helpful reply>"}}
 
 Decision rule: if in doubt, pick CHITCHAT.
-
 Output ONLY the JSON. No markdown, no explanation.
 """
 
@@ -412,6 +486,9 @@ def sql_writer(state: AnalyticsState) -> dict:
     )
     parsed = _try_parse_json(response.content) or {}
     sql = parsed.get("sql", "")
+
+    # --- Deterministic post-processing: fix stray quotes + enforce date casts ---
+    sql = _sanitize_sql(sql, table_name)
 
     updated_plan = [
         s.model_copy(update={"status": "running"})
