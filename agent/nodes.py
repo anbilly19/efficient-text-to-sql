@@ -9,7 +9,6 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from agent.prompts import (
-    ORCHESTRATOR_SYSTEM,
     PROFILER_SYSTEM,
     SQL_WRITER_SYSTEM,
     VERIFIER_SYSTEM,
@@ -22,6 +21,7 @@ from agent.tools import (
     VERIFIER_TOOLS,
     run_sql,
 )
+from agent.database import get_connection
 
 
 # ---------------------------------------------------------------------------
@@ -37,12 +37,7 @@ def _llm(temperature: float = 0.0) -> ChatOpenAI:
 
 
 def _extract_text(content: Any) -> str:
-    """Safely extract a plain string from a message content.
-
-    LangGraph Studio sends content as a list of block dicts:
-        [{'type': 'text', 'text': 'Hello!'}]
-    Plain LLM responses send content as a str.
-    """
+    """Safely extract a plain string from a message content (handles Studio block lists)."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -69,32 +64,35 @@ def _try_parse_json(text: str) -> dict | None:
 
 
 def _parse_json_from_response(text: str) -> dict:
-    """Extract the first JSON object from an LLM text response (raises on failure)."""
     result = _try_parse_json(text)
     if result is None:
         raise ValueError(f"No JSON found in response: {text[:200]}")
     return result
 
 
-ORCHESTRATOR_SYSTEM_WITH_CHITCHAT = """
-You are the Orchestrator of a DuckDB analytics agent.
-
-If the user's message is a greeting, small talk, or NOT a data/analytics question
-(e.g. "hi", "hello", "how are you", "what can you do"), respond ONLY with:
-{"final_answer": "<friendly reply explaining you are a DuckDB analytics agent>"}
-
-Otherwise, for any data or analytics question, create a minimal execution plan:
-{"plan": [{"id": 1, "type": "sql", "description": "..."}]}
-
-Step types:
-- "profile" → explore a column's data distribution
-- "sql"     → generate a DuckDB SELECT query
-
-Rules:
-- Never generate Python code.
-- Keep plans minimal: profile only when column semantics are ambiguous.
-- When re-planning after a failure, include the verifier's feedback in the new step description.
-"""
+def _get_available_tables() -> str:
+    """Query DuckDB for all user-loaded tables and return a summary string."""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT dataset_name, column_name, data_type
+            FROM _schema_catalog
+            ORDER BY dataset_name, column_name
+            """
+        ).fetchall()
+        if not rows:
+            return "No tables loaded yet. Ask the user to load a file first."
+        tables: dict[str, list[str]] = {}
+        for dataset, col, dtype in rows:
+            tables.setdefault(dataset, []).append(f"{col} ({dtype})")
+        lines = []
+        for tname, cols in tables.items():
+            lines.append(f"Table: {tname}")
+            lines.append("  Columns: " + ", ".join(cols))
+        return "\n".join(lines)
+    except Exception as exc:
+        return f"(Could not read schema catalog: {exc})"
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +110,32 @@ def orchestrator(state: AnalyticsState) -> dict:
                 user_query = _extract_text(msg.content)
                 break
 
+    # Fetch available tables to inject into every prompt
+    tables_context = _get_available_tables()
+
+    ORCHESTRATOR_SYSTEM = f"""You are the Orchestrator of a DuckDB analytics agent.
+
+Available tables in DuckDB:
+{tables_context}
+
+If the user's message is a greeting, small talk, or NOT a data/analytics question
+(e.g. "hi", "hello", "how are you"), respond ONLY with:
+{{"final_answer": "<friendly reply mentioning what tables are available>"}}
+
+Otherwise, for any data or analytics question, create a minimal execution plan:
+{{"plan": [{{"id": 1, "type": "sql", "description": "..."}}]}}
+
+Step types:
+- "profile" → explore a column's data distribution
+- "sql"     → generate a DuckDB SELECT query
+
+Rules:
+- Never generate Python code.
+- Keep plans minimal: profile only when column semantics are ambiguous.
+- When re-planning after a failure, include the verifier's feedback in the new step description.
+- Always reference the correct table name from the available tables listed above.
+"""
+
     # ---- Synthesis: all steps finished, compose final answer ----
     if state.plan and all(s.status in ("done", "failed") for s in state.plan):
         synthesis_prompt = (
@@ -123,7 +147,7 @@ def orchestrator(state: AnalyticsState) -> dict:
             'Output JSON: {"final_answer": "..."}'
         )
         response = _llm().invoke(
-            [SystemMessage(content=ORCHESTRATOR_SYSTEM_WITH_CHITCHAT),
+            [SystemMessage(content=ORCHESTRATOR_SYSTEM),
              HumanMessage(content=synthesis_prompt)]
         )
         parsed = _try_parse_json(response.content) or {}
@@ -135,13 +159,14 @@ def orchestrator(state: AnalyticsState) -> dict:
 
     # ---- Planning: build execution plan (or reply to chitchat) ----
     plan_prompt = (
+        f"Available tables:\n{tables_context}\n\n"
         f"User message: {user_query}\n\n"
-        "If this is a data/analytics question, output a JSON plan. "
-        "If it is chitchat or a greeting, output a friendly JSON final_answer."
+        "If this is a data/analytics question, output a JSON plan using the correct table names above. "
+        "If it is chitchat or a greeting, output a friendly JSON final_answer mentioning the available tables."
     )
     llm = _llm().bind_tools(ORCHESTRATOR_TOOLS)
     response = llm.invoke(
-        [SystemMessage(content=ORCHESTRATOR_SYSTEM_WITH_CHITCHAT),
+        [SystemMessage(content=ORCHESTRATOR_SYSTEM),
          HumanMessage(content=plan_prompt)]
     )
 
@@ -157,7 +182,7 @@ def orchestrator(state: AnalyticsState) -> dict:
         }
 
     # LLM returned a final_answer directly (chitchat detected)
-    if "final_answer" in parsed:
+    if "final_answer" in parsed and "plan" not in parsed:
         reply = parsed["final_answer"]
         return {
             "final_answer": reply,
@@ -175,7 +200,6 @@ def orchestrator(state: AnalyticsState) -> dict:
 # ---------------------------------------------------------------------------
 
 def profiler(state: AnalyticsState) -> dict:
-    """Run data profiling for the current plan step."""
     llm = _llm().bind_tools(PROFILER_TOOLS)
     step = state.current_step
 
@@ -198,7 +222,6 @@ def profiler(state: AnalyticsState) -> dict:
 # ---------------------------------------------------------------------------
 
 def sql_writer(state: AnalyticsState) -> dict:
-    """Generate DuckDB SQL for the current plan step."""
     llm = _llm().bind_tools(SQL_WRITER_TOOLS)
     step = state.current_step
 
@@ -231,11 +254,10 @@ def sql_writer(state: AnalyticsState) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Node: execute_sql  (deterministic – no LLM)
+# Node: execute_sql
 # ---------------------------------------------------------------------------
 
 def execute_sql(state: AnalyticsState) -> dict:
-    """Execute the SQL produced by sql_writer and store results in state."""
     result = run_sql.invoke({"query": state.last_sql})
     if result.startswith("ERROR"):
         updated_plan = [
@@ -262,7 +284,6 @@ def execute_sql(state: AnalyticsState) -> dict:
 # ---------------------------------------------------------------------------
 
 def verifier(state: AnalyticsState) -> dict:
-    """Cross-check the SQL result and return a pass/fail verdict."""
     llm = _llm().bind_tools(VERIFIER_TOOLS)
     step = state.current_step
 

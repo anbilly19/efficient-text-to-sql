@@ -15,7 +15,7 @@ from langchain_core.tools import tool
 from agent.database import get_connection
 
 
-# ── Schema & Catalog ──────────────────────────────────────────────────────────
+# ── Schema & Catalog ───────────────────────────────────────────────────────────────────────
 
 
 @tool
@@ -103,7 +103,7 @@ def profile_column(dataset: str, column: str) -> str:
         return f"ERROR: {exc}"
 
 
-# ── SQL Execution ─────────────────────────────────────────────────────────────
+# ── SQL Execution ───────────────────────────────────────────────────────────────────────
 
 
 def _execute_select(query: str) -> tuple[str, dict]:
@@ -157,7 +157,7 @@ def run_test_query(query: str) -> str:
         return f"ERROR: {exc}"
 
 
-# ── Semantic Layer ────────────────────────────────────────────────────────────
+# ── Semantic Layer ──────────────────────────────────────────────────────────────────────
 
 
 @tool
@@ -180,12 +180,14 @@ def lookup_semantic(term: str) -> str:
         return f"ERROR: {exc}"
 
 
-# ── Data Loading ──────────────────────────────────────────────────────────────
+# ── Data Loading ───────────────────────────────────────────────────────────────────────
 
 
 @tool
 def load_file(path: str, dataset_name: str, force_schema: bool = False) -> str:
     """Load an Excel, Parquet, or CSV file into DuckDB and register its schema.
+
+    The data is persisted as a real DuckDB table so it survives across calls.
 
     Args:
         path: Absolute or relative path to the file.
@@ -200,12 +202,16 @@ def load_file(path: str, dataset_name: str, force_schema: bool = False) -> str:
     suffix = file_path.suffix.lower()
     try:
         if suffix in (".xlsx", ".xls"):
+            # Read into pandas then persist as a real DuckDB table
             df = pd.read_excel(path)
-            conn.register(dataset_name, df)
+            conn.execute(f"DROP TABLE IF EXISTS {dataset_name}")
+            conn.register("_tmp_load", df)
+            conn.execute(f"CREATE TABLE {dataset_name} AS SELECT * FROM _tmp_load")
+            conn.unregister("_tmp_load")
         elif suffix == ".parquet":
-            conn.execute(f"CREATE OR REPLACE VIEW {dataset_name} AS SELECT * FROM read_parquet('{path}')")
+            conn.execute(f"CREATE OR REPLACE TABLE {dataset_name} AS SELECT * FROM read_parquet('{path}')")
         elif suffix == ".csv":
-            conn.execute(f"CREATE OR REPLACE VIEW {dataset_name} AS SELECT * FROM read_csv_auto('{path}')")
+            conn.execute(f"CREATE OR REPLACE TABLE {dataset_name} AS SELECT * FROM read_csv_auto('{path}')")
         else:
             return f"ERROR: Unsupported file type '{suffix}'. Use .xlsx, .parquet, or .csv."
     except Exception as exc:
@@ -213,29 +219,28 @@ def load_file(path: str, dataset_name: str, force_schema: bool = False) -> str:
 
     try:
         desc = conn.execute(f"DESCRIBE {dataset_name}").fetchdf()
-        existing = conn.execute(
-            "SELECT column_name FROM _schema_catalog WHERE dataset_name = ?",
-            [dataset_name],
-        ).fetchdf()["column_name"].tolist()
-
+        # Clear old catalog entries for this dataset
+        conn.execute("DELETE FROM _schema_catalog WHERE dataset_name = ?", [dataset_name])
         for _, row in desc.iterrows():
-            col = row["column_name"]
-            if col not in existing or force_schema:
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO _schema_catalog
-                        (dataset_name, column_name, data_type, nullable, description)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    [dataset_name, col, row["column_type"], True, None],
-                )
+            conn.execute(
+                """
+                INSERT INTO _schema_catalog
+                    (dataset_name, column_name, data_type, nullable, description)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                [dataset_name, row["column_name"], row["column_type"], True, None],
+            )
     except Exception as exc:
         return f"File loaded as '{dataset_name}' but schema catalog update failed: {exc}"
 
-    return f"Successfully loaded '{path}' as table '{dataset_name}'. {len(desc)} columns registered."
+    row_count = conn.execute(f"SELECT COUNT(*) FROM {dataset_name}").fetchone()[0]
+    return (
+        f"Successfully loaded '{path}' as table '{dataset_name}'. "
+        f"{len(desc)} columns, {row_count} rows registered."
+    )
 
 
-# ── Tool registries (used by LLM nodes) ───────────────────────────────────────
+# ── Tool registries (used by LLM nodes) ──────────────────────────────────────────────
 ALL_TOOLS = [get_schema, profile_column, run_sql, run_test_query, lookup_semantic, load_file]
 ORCHESTRATOR_TOOLS = [get_schema, lookup_semantic]
 PROFILER_TOOLS = [get_schema, profile_column]
