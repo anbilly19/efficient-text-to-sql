@@ -21,6 +21,7 @@ from agent.tools import (
     PROFILER_TOOLS,
     SQL_WRITER_TOOLS,
     VERIFIER_TOOLS,
+    get_schema,
     load_file,
     run_sql,
 )
@@ -88,8 +89,21 @@ def _get_available_tables() -> str:
         return f"(Could not read schema catalog: {exc})"
 
 
+def _get_schema_for_table(table_name: str) -> str:
+    """Fetch real schema with sample values and format it for prompt injection."""
+    try:
+        raw = get_schema.invoke({"dataset": table_name})
+        cols = json.loads(raw)
+        lines = [f"Table: {table_name}"]
+        for col in cols:
+            samples = ", ".join(repr(s) for s in col.get("samples", []))
+            lines.append(f"  - \"{col['column']}\" ({col['type']})  samples: [{samples}]")
+        return "\n".join(lines)
+    except Exception as exc:
+        return f"(Schema unavailable: {exc})"
+
+
 def _next_pending_step(plan: list[PlanStep]) -> PlanStep | None:
-    """Return the first pending step, or None."""
     return next((s for s in plan if s.status == "pending"), None)
 
 
@@ -124,6 +138,30 @@ def _detect_load_intent(text: str) -> dict | None:
                 dataset = Path(path).stem.replace(" ", "_").replace("-", "_").lower()
             return {"path": path, "dataset": dataset}
     return None
+
+
+def _extract_table_from_plan(plan: list[PlanStep], user_query: str) -> str:
+    """Best-effort: find the table name from catalog that matches the plan/query context."""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT dataset_name FROM _schema_catalog"
+        ).fetchall()
+        tables = [r[0] for r in rows]
+        if not tables:
+            return ""
+        if len(tables) == 1:
+            return tables[0]
+        # Try to match table name mentioned in query or plan descriptions
+        query_lower = user_query.lower()
+        for step in plan:
+            query_lower += " " + step.description.lower()
+        for t in tables:
+            if t.lower() in query_lower:
+                return t
+        return tables[0]  # fallback to first
+    except Exception:
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -256,7 +294,6 @@ def load_file_node(state: AnalyticsState) -> dict:
 # ---------------------------------------------------------------------------
 
 def profiler(state: AnalyticsState) -> dict:
-    # Resolve step directly from plan — never trust state.current_step
     step = _next_pending_step(state.plan)
     if step is None:
         return {"current_step": None}
@@ -281,15 +318,16 @@ def profiler(state: AnalyticsState) -> dict:
 # ---------------------------------------------------------------------------
 
 def sql_writer(state: AnalyticsState) -> dict:
-    # Resolve step directly from plan — never trust state.current_step
+    # Resolve step directly from plan
     step = _next_pending_step(state.plan)
     if step is None:
-        # Verifier retry: re-use the last step that was "running"
         step = next((s for s in state.plan if s.status == "running"), None)
     if step is None:
         return {"last_sql": "", "error": "No pending step found for sql_writer."}
 
-    llm = _llm().bind_tools(SQL_WRITER_TOOLS)
+    # ── Always inject real schema into the prompt ─────────────────────────────
+    table_name = _extract_table_from_plan(state.plan, state.user_query)
+    schema_context = _get_schema_for_table(table_name) if table_name else "(No tables loaded)"
 
     profiling_notes = "\n".join(
         f"- {s.description}: {s.result}"
@@ -299,12 +337,15 @@ def sql_writer(state: AnalyticsState) -> dict:
 
     prompt = (
         f"Sub-task: {step.description}\n"
-        f"User question: {state.user_query}\n"
+        f"User question: {state.user_query}\n\n"
+        f"=== EXACT SCHEMA (use these column names verbatim) ===\n"
+        f"{schema_context}\n\n"
         f"Profiling notes:\n{profiling_notes or 'None'}\n\n"
         f"Verifier feedback (if retry): {state.verification_feedback or 'None'}\n\n"
         'Output JSON: {"sql": "...", "explanation": "..."}'
     )
 
+    llm = _llm().bind_tools(SQL_WRITER_TOOLS)
     response = llm.invoke(
         [SystemMessage(content=SQL_WRITER_SYSTEM), HumanMessage(content=prompt)]
     )
