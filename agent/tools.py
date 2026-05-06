@@ -1,8 +1,4 @@
-"""Deterministic tool functions – no LLM involved here.
-
-All tools are wrapped as LangChain @tool so they can be bound to LLM nodes.
-The LLM may only produce SQL strings; all execution is done in these tools.
-"""
+"""Deterministic tool functions – no LLM involved here."""
 from __future__ import annotations
 
 import json
@@ -16,54 +12,52 @@ from langchain_core.tools import tool
 from agent.database import get_connection
 
 
-# ── Schema & Catalog ──────────────────────────────────────────────────────────────
-
-_DATE_PATTERN = re.compile(
-    r"^\d{4}-\d{2}-\d{2}"  # YYYY-MM-DD prefix (covers ISO dates and datetimes)
-)
+_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}")
 
 
 def _looks_like_date(value: str) -> bool:
     return bool(_DATE_PATTERN.match(str(value).strip()))
 
 
-def _normalize_date_columns(dataset_name: str) -> list[str]:
-    """Detect VARCHAR columns whose values look like dates and cast them to DATE in-place.
+def _table_info(dataset_name: str) -> list[tuple[str, str]]:
+    """Return [(column_name, column_type), ...] using PRAGMA — always safe."""
+    conn = get_connection()
+    rows = conn.execute(f"PRAGMA table_info('{dataset_name}')").fetchall()
+    # PRAGMA table_info columns: cid, name, type, notnull, dflt_value, pk
+    return [(r[1], r[2]) for r in rows]
 
-    Returns a list of column names that were converted.
-    """
+
+def _normalize_date_columns(dataset_name: str) -> list[str]:
+    """Cast VARCHAR date columns to DATE in-place. Returns converted column names."""
     conn = get_connection()
     converted: list[str] = []
-    try:
-        desc = conn.execute(f"DESCRIBE {dataset_name}").fetchdf()
-        varchar_cols = desc[desc["column_type"].str.upper() == "VARCHAR"]["column_name"].tolist()
-        for col in varchar_cols:
-            try:
-                sample = conn.execute(
-                    f"SELECT {col} FROM {dataset_name} WHERE {col} IS NOT NULL LIMIT 5"
-                ).fetchall()
-                values = [row[0] for row in sample if row[0] is not None]
-                if values and all(_looks_like_date(v) for v in values):
-                    conn.execute(
-                        f"ALTER TABLE {dataset_name} ALTER COLUMN \"{col}\" TYPE DATE "
-                        f"USING TRY_CAST(\"{col}\" AS DATE)"
-                    )
-                    conn.execute(
-                        "UPDATE _schema_catalog SET data_type = 'DATE' "
-                        "WHERE dataset_name = ? AND column_name = ?",
-                        [dataset_name, col],
-                    )
-                    converted.append(col)
-            except Exception:
-                pass  # leave column as-is if cast fails
-    except Exception:
-        pass
+    for col, dtype in _table_info(dataset_name):
+        if dtype.upper() != "VARCHAR":
+            continue
+        try:
+            sample = conn.execute(
+                f'SELECT "{col}" FROM "{dataset_name}" WHERE "{col}" IS NOT NULL LIMIT 5'
+            ).fetchall()
+            values = [row[0] for row in sample if row[0] is not None]
+            if values and all(_looks_like_date(v) for v in values):
+                conn.execute(
+                    f'ALTER TABLE "{dataset_name}" ALTER COLUMN "{col}" TYPE DATE '
+                    f'USING TRY_CAST("{col}" AS DATE)'
+                )
+                conn.execute(
+                    "UPDATE _schema_catalog SET data_type = 'DATE' "
+                    "WHERE dataset_name = ? AND column_name = ?",
+                    [dataset_name, col],
+                )
+                converted.append(col)
+        except Exception:
+            pass
     return converted
 
 
 @tool
 def get_schema(dataset: str, columns: Optional[list[str]] = None) -> str:
-    """Return column names, types, and 3 random sample values for a dataset.
+    """Return column names, types, and 3 sample values for a dataset.
 
     Args:
         dataset: The table / view name in DuckDB.
@@ -71,20 +65,18 @@ def get_schema(dataset: str, columns: Optional[list[str]] = None) -> str:
     """
     conn = get_connection()
     try:
-        desc = conn.execute(f"DESCRIBE {dataset}").fetchdf()
+        col_info = _table_info(dataset)
     except Exception as exc:
         return f"ERROR: {exc}"
 
     if columns:
-        desc = desc[desc["column_name"].isin(columns)]
+        col_info = [(c, t) for c, t in col_info if c in columns]
 
     result: list[dict] = []
-    for _, row in desc.iterrows():
-        col = row["column_name"]
-        dtype = row["column_type"]
+    for col, dtype in col_info:
         try:
             samples = conn.execute(
-                f"SELECT DISTINCT {col} FROM {dataset} WHERE {col} IS NOT NULL LIMIT 3"
+                f'SELECT DISTINCT "{col}" FROM "{dataset}" WHERE "{col}" IS NOT NULL LIMIT 3'
             ).fetchall()
             samples = [str(s[0]) for s in samples]
         except Exception:
@@ -104,40 +96,27 @@ def profile_column(dataset: str, column: str) -> str:
     """
     conn = get_connection()
     try:
-        total = conn.execute(f"SELECT COUNT(*) FROM {dataset}").fetchone()[0]
+        total = conn.execute(f'SELECT COUNT(*) FROM "{dataset}"').fetchone()[0]
         nulls = conn.execute(
-            f"SELECT COUNT(*) FROM {dataset} WHERE {column} IS NULL"
+            f'SELECT COUNT(*) FROM "{dataset}" WHERE "{column}" IS NULL'
         ).fetchone()[0]
         null_pct = round(100 * nulls / total, 2) if total else 0
 
-        top_vals = conn.execute(
-            f"""
-            SELECT {column}, COUNT(*) AS cnt
-            FROM {dataset}
-            GROUP BY {column}
-            ORDER BY cnt DESC
-            LIMIT 10
-            """
-        ).fetchdf().to_dict(orient="records")
+        top_rows = conn.execute(
+            f'SELECT "{column}", COUNT(*) AS cnt FROM "{dataset}" '
+            f'GROUP BY "{column}" ORDER BY cnt DESC LIMIT 10'
+        ).fetchall()
+        top_vals = [{column: str(r[0]), "cnt": r[1]} for r in top_rows]
 
         stats: dict = {"null_pct": null_pct, "top_values": top_vals}
 
         try:
             num_stats = conn.execute(
-                f"SELECT MIN({column}), MAX({column}), AVG({column}) FROM {dataset}"
+                f'SELECT MIN("{column}"), MAX("{column}"), AVG("{column}") FROM "{dataset}"'
             ).fetchone()
             stats["min"] = str(num_stats[0])
             stats["max"] = str(num_stats[1])
             stats["mean"] = str(num_stats[2])
-        except Exception:
-            pass
-
-        try:
-            date_range = conn.execute(
-                f"SELECT MIN({column})::DATE, MAX({column})::DATE FROM {dataset}"
-            ).fetchone()
-            stats["date_min"] = str(date_range[0])
-            stats["date_max"] = str(date_range[1])
         except Exception:
             pass
 
@@ -146,28 +125,34 @@ def profile_column(dataset: str, column: str) -> str:
         return f"ERROR: {exc}"
 
 
-# ── SQL Execution ──────────────────────────────────────────────────────────────────
-
-
 def _execute_select(query: str) -> tuple[str, dict]:
-    """Internal helper – runs a SELECT and returns (rows_json, metadata)."""
+    """Run a read-only SELECT; return (rows_json, metadata). Raises on forbidden DDL."""
     conn = get_connection()
     normalised = query.strip().upper()
     for forbidden in ("INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER", "COPY"):
-        if forbidden in normalised:
+        if re.search(rf"\b{forbidden}\b", normalised):
             raise ValueError(f"Forbidden keyword '{forbidden}' in query.")
 
-    df: pd.DataFrame = conn.execute(query).fetchdf()
-    limited = df.head(50)
-    rows_json = limited.to_json(orient="records", default_handler=str)
-    metadata = {
-        "row_count": len(df),
+    rel = conn.execute(query)
+    rows = rel.fetchall()
+    columns = [desc[0] for desc in rel.description]
+
+    records = [dict(zip(columns, row)) for row in rows]
+    limited = records[:50]
+    rows_json = json.dumps(limited, default=str)
+
+    df_for_stats = pd.DataFrame(records)
+    metadata: dict = {
+        "row_count": len(records),
         "returned_rows": len(limited),
-        "columns": list(df.columns),
+        "columns": columns,
     }
     checksums: dict = {}
-    for col in df.select_dtypes(include="number").columns:
-        checksums[col] = {"sum": float(df[col].sum()), "mean": float(df[col].mean())}
+    for col in df_for_stats.select_dtypes(include="number").columns:
+        checksums[col] = {
+            "sum": float(df_for_stats[col].sum()),
+            "mean": float(df_for_stats[col].mean()),
+        }
     metadata["checksums"] = checksums
     return rows_json, metadata
 
@@ -188,7 +173,7 @@ def run_sql(query: str) -> str:
 
 @tool
 def run_test_query(query: str) -> str:
-    """Like run_sql but also returns row count and numeric checksums for verification.
+    """Like run_sql but also returns checksums for verification.
 
     Args:
         query: A valid DuckDB SELECT statement.
@@ -200,15 +185,12 @@ def run_test_query(query: str) -> str:
         return f"ERROR: {exc}"
 
 
-# ── Semantic Layer ─────────────────────────────────────────────────────────────────
-
-
 @tool
 def lookup_semantic(term: str) -> str:
-    """Look up a business term in the semantic map and return its SQL definition.
+    """Look up a business term in the semantic map.
 
     Args:
-        term: The business term to look up (e.g. 'active_customer').
+        term: The business term (e.g. 'active_customer').
     """
     conn = get_connection()
     try:
@@ -218,20 +200,14 @@ def lookup_semantic(term: str) -> str:
         ).fetchone()
         if row:
             return json.dumps({"term": term, "definition_sql": row[0], "description": row[1]})
-        return json.dumps({"term": term, "definition_sql": None, "description": "Term not found in semantic map."})
+        return json.dumps({"term": term, "definition_sql": None, "description": "Term not found."})
     except Exception as exc:
         return f"ERROR: {exc}"
-
-
-# ── Data Loading ──────────────────────────────────────────────────────────────────
 
 
 @tool
 def load_file(path: str, dataset_name: str, force_schema: bool = False) -> str:
     """Load an Excel, Parquet, or CSV file into DuckDB and register its schema.
-
-    The data is persisted as a real DuckDB table so it survives across calls.
-    Date-like VARCHAR columns are automatically cast to DATE type.
 
     Args:
         path: Absolute or relative path to the file.
@@ -247,46 +223,45 @@ def load_file(path: str, dataset_name: str, force_schema: bool = False) -> str:
     try:
         if suffix in (".xlsx", ".xls"):
             df = pd.read_excel(path)
-            conn.execute(f"DROP TABLE IF EXISTS {dataset_name}")
+            conn.execute(f'DROP TABLE IF EXISTS "{dataset_name}"')
             conn.register("_tmp_load", df)
-            conn.execute(f"CREATE TABLE {dataset_name} AS SELECT * FROM _tmp_load")
+            conn.execute(f'CREATE TABLE "{dataset_name}" AS SELECT * FROM _tmp_load')
             conn.unregister("_tmp_load")
         elif suffix == ".parquet":
-            conn.execute(f"CREATE OR REPLACE TABLE {dataset_name} AS SELECT * FROM read_parquet('{path}')")
+            conn.execute(
+                f'CREATE OR REPLACE TABLE "{dataset_name}" AS SELECT * FROM read_parquet(\'{path}\')'
+            )
         elif suffix == ".csv":
-            conn.execute(f"CREATE OR REPLACE TABLE {dataset_name} AS SELECT * FROM read_csv_auto('{path}')")
+            conn.execute(
+                f'CREATE OR REPLACE TABLE "{dataset_name}" AS SELECT * FROM read_csv_auto(\'{path}\')'
+            )
         else:
             return f"ERROR: Unsupported file type '{suffix}'. Use .xlsx, .parquet, or .csv."
     except Exception as exc:
         return f"ERROR loading file: {exc}"
 
-    # Auto-cast VARCHAR columns that look like dates
     converted = _normalize_date_columns(dataset_name)
 
     try:
-        desc = conn.execute(f"DESCRIBE {dataset_name}").fetchdf()
+        col_info = _table_info(dataset_name)
         conn.execute("DELETE FROM _schema_catalog WHERE dataset_name = ?", [dataset_name])
-        for _, row in desc.iterrows():
+        for col, dtype in col_info:
             conn.execute(
-                """
-                INSERT INTO _schema_catalog
-                    (dataset_name, column_name, data_type, nullable, description)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                [dataset_name, row["column_name"], row["column_type"], True, None],
+                "INSERT INTO _schema_catalog (dataset_name, column_name, data_type, nullable, description) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [dataset_name, col, dtype, True, None],
             )
     except Exception as exc:
         return f"File loaded as '{dataset_name}' but schema catalog update failed: {exc}"
 
-    row_count = conn.execute(f"SELECT COUNT(*) FROM {dataset_name}").fetchone()[0]
+    row_count = conn.execute(f'SELECT COUNT(*) FROM "{dataset_name}"').fetchone()[0]
     converted_note = f" Auto-converted date columns: {converted}." if converted else ""
     return (
         f"Successfully loaded '{path}' as table '{dataset_name}'. "
-        f"{len(desc)} columns, {row_count} rows registered.{converted_note}"
+        f"{len(col_info)} columns, {row_count} rows registered.{converted_note}"
     )
 
 
-# ── Tool registries (used by LLM nodes) ──────────────────────────────────────────────
 ALL_TOOLS = [get_schema, profile_column, run_sql, run_test_query, lookup_semantic, load_file]
 ORCHESTRATOR_TOOLS = [get_schema, lookup_semantic]
 PROFILER_TOOLS = [get_schema, profile_column]
