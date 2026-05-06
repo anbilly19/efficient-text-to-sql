@@ -58,7 +58,6 @@ def _try_parse_json(text: str) -> dict | None:
     """Extract the LAST top-level JSON object from text (avoids grabbing row data)."""
     if not isinstance(text, str):
         return None
-    # Find all {...} spans and return the last valid one that looks like a control object
     best = None
     depth = 0
     start = None
@@ -73,7 +72,6 @@ def _try_parse_json(text: str) -> dict | None:
                 candidate = text[start:i + 1]
                 try:
                     parsed = json.loads(candidate)
-                    # Prefer objects that have control keys over raw data rows
                     if isinstance(parsed, dict):
                         best = parsed
                 except json.JSONDecodeError:
@@ -104,6 +102,23 @@ def _get_available_tables() -> str:
         return "\n".join(lines)
     except Exception as exc:
         return f"(Could not read schema catalog: {exc})"
+
+
+def _get_most_recent_table() -> str:
+    """Return the name of the most recently loaded table (highest rowid in catalog)."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            """
+            SELECT dataset_name
+            FROM _schema_catalog
+            ORDER BY rowid DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        return row[0] if row else ""
+    except Exception:
+        return ""
 
 
 def _get_schema_for_table(table_name: str) -> str:
@@ -158,7 +173,12 @@ def _detect_load_intent(text: str) -> dict | None:
 
 
 def _extract_table_from_plan(plan: list[PlanStep], user_query: str) -> str:
-    """Best-effort: find the table name from catalog that matches the plan/query context."""
+    """Find the best matching table name.
+
+    Priority:
+    1. Explicit table name mentioned in user query or plan descriptions.
+    2. Most recently loaded table (by rowid in _schema_catalog).
+    """
     conn = get_connection()
     try:
         rows = conn.execute(
@@ -169,13 +189,19 @@ def _extract_table_from_plan(plan: list[PlanStep], user_query: str) -> str:
             return ""
         if len(tables) == 1:
             return tables[0]
-        query_lower = user_query.lower()
+
+        # Build search text from user query + all plan step descriptions
+        search_text = user_query.lower()
         for step in plan:
-            query_lower += " " + step.description.lower()
-        for t in tables:
-            if t.lower() in query_lower:
-                return t
-        return tables[0]
+            search_text += " " + step.description.lower()
+
+        # Check for explicit name match first (longest match wins to avoid substring traps)
+        matched = [t for t in tables if t.lower() in search_text]
+        if matched:
+            return max(matched, key=len)  # prefer 'sales1000' over 'sales'
+
+        # Fallback: most recently loaded table
+        return _get_most_recent_table() or tables[0]
     except Exception:
         return ""
 
@@ -212,6 +238,7 @@ def orchestrator(state: AnalyticsState) -> dict:
             break
 
     tables_context = _get_available_tables()
+    most_recent_table = _get_most_recent_table()
 
     base_reset: dict = {
         "user_query": current_query,
@@ -248,11 +275,9 @@ def orchestrator(state: AnalyticsState) -> dict:
         response = _llm().invoke([HumanMessage(content=synthesis_prompt)])
         raw = _extract_text(response.content)
 
-        # Safely extract final_answer — always ensure it's a str
         parsed = _try_parse_json(raw) or {}
         final = parsed.get("final_answer")
         if final is None or not isinstance(final, str):
-            # LLM didn't wrap in JSON — use raw response or fallback to table
             final = raw if isinstance(raw, str) and raw.strip() else table_preview
         final = str(final).strip()
 
@@ -276,12 +301,16 @@ def orchestrator(state: AnalyticsState) -> dict:
 Available tables in DuckDB:
 {tables_context}
 
+Most recently loaded table: {most_recent_table or 'none'}
+
 Classify the user message into exactly ONE intent and respond with matching JSON:
 
 1. ANALYTICS – data or SQL question:
    {{"intent": "analytics", "plan": [{{"id": 1, "type": "sql", "description": "..."}}]}}
    Step types: "profile" (explore column) or "sql" (SELECT query).
-   Always use the correct table name from the available tables above.
+   CRITICAL: Every step description MUST include the exact table name from the available tables above.
+   If the user does not specify a table, use the most recently loaded table: "{most_recent_table}".
+   Example description: "Count total rows in {most_recent_table}"
 
 2. CHITCHAT – greeting, small talk, or off-topic:
    {{"intent": "chitchat", "final_answer": "<friendly reply>"}}
