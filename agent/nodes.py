@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
@@ -24,7 +25,7 @@ from agent.tools import (
 
 
 # ---------------------------------------------------------------------------
-# Shared LLM factory
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _llm(temperature: float = 0.0) -> ChatOpenAI:
@@ -33,6 +34,27 @@ def _llm(temperature: float = 0.0) -> ChatOpenAI:
         temperature=temperature,
         api_key=os.getenv("OPENAI_API_KEY"),
     )
+
+
+def _extract_text(content: Any) -> str:
+    """Safely extract a plain string from a message content.
+
+    LangGraph Studio sends content as a list of block dicts:
+        [{'type': 'text', 'text': 'What do you understand?'}]
+    Plain LLM responses send content as a str.
+    This helper handles both.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                parts.append(block.get("text") or block.get("content") or "")
+            elif isinstance(block, str):
+                parts.append(block)
+        return " ".join(p for p in parts if p).strip()
+    return str(content)
 
 
 def _parse_json_from_response(text: str) -> dict:
@@ -52,10 +74,18 @@ def orchestrator(state: AnalyticsState) -> dict:
     """Plan the query or synthesise the final answer when all steps are done."""
     llm = _llm().bind_tools(ORCHESTRATOR_TOOLS)
 
+    # Resolve user_query from state or latest HumanMessage (handles Studio blocks)
+    user_query = state.user_query
+    if not user_query:
+        for msg in reversed(state.messages):
+            if isinstance(msg, HumanMessage):
+                user_query = _extract_text(msg.content)
+                break
+
     # If all plan steps are done, synthesise the final answer
     if state.plan and all(s.status in ("done", "failed") for s in state.plan):
         synthesis_prompt = (
-            f"User question: {state.user_query}\n\n"
+            f"User question: {user_query}\n\n"
             f"Query result (first 50 rows): {state.last_query_result}\n\n"
             f"Verification verdict: {state.verification_verdict}\n"
             f"Verification feedback: {state.verification_feedback}\n\n"
@@ -72,14 +102,7 @@ def orchestrator(state: AnalyticsState) -> dict:
             "messages": [AIMessage(content=final)],
         }
 
-    # Extract user query from latest human message if not already set
-    user_query = state.user_query
-    if not user_query:
-        for msg in reversed(state.messages):
-            if isinstance(msg, HumanMessage):
-                user_query = msg.content
-                break
-
+    # Build the execution plan
     plan_prompt = (
         f"User question: {user_query}\n\n"
         "Create a minimal execution plan as JSON. "
