@@ -6,6 +6,7 @@ The LLM may only produce SQL strings; all execution is done in these tools.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -15,7 +16,49 @@ from langchain_core.tools import tool
 from agent.database import get_connection
 
 
-# ── Schema & Catalog ───────────────────────────────────────────────────────────────────────
+# ── Schema & Catalog ──────────────────────────────────────────────────────────────
+
+_DATE_PATTERN = re.compile(
+    r"^\d{4}-\d{2}-\d{2}"  # YYYY-MM-DD prefix (covers ISO dates and datetimes)
+)
+
+
+def _looks_like_date(value: str) -> bool:
+    return bool(_DATE_PATTERN.match(str(value).strip()))
+
+
+def _normalize_date_columns(dataset_name: str) -> list[str]:
+    """Detect VARCHAR columns whose values look like dates and cast them to DATE in-place.
+
+    Returns a list of column names that were converted.
+    """
+    conn = get_connection()
+    converted: list[str] = []
+    try:
+        desc = conn.execute(f"DESCRIBE {dataset_name}").fetchdf()
+        varchar_cols = desc[desc["column_type"].str.upper() == "VARCHAR"]["column_name"].tolist()
+        for col in varchar_cols:
+            try:
+                sample = conn.execute(
+                    f"SELECT {col} FROM {dataset_name} WHERE {col} IS NOT NULL LIMIT 5"
+                ).fetchall()
+                values = [row[0] for row in sample if row[0] is not None]
+                if values and all(_looks_like_date(v) for v in values):
+                    conn.execute(
+                        f"ALTER TABLE {dataset_name} ALTER COLUMN \"{col}\" TYPE DATE "
+                        f"USING TRY_CAST(\"{col}\" AS DATE)"
+                    )
+                    conn.execute(
+                        "UPDATE _schema_catalog SET data_type = 'DATE' "
+                        "WHERE dataset_name = ? AND column_name = ?",
+                        [dataset_name, col],
+                    )
+                    converted.append(col)
+            except Exception:
+                pass  # leave column as-is if cast fails
+    except Exception:
+        pass
+    return converted
 
 
 @tool
@@ -103,7 +146,7 @@ def profile_column(dataset: str, column: str) -> str:
         return f"ERROR: {exc}"
 
 
-# ── SQL Execution ───────────────────────────────────────────────────────────────────────
+# ── SQL Execution ──────────────────────────────────────────────────────────────────
 
 
 def _execute_select(query: str) -> tuple[str, dict]:
@@ -157,7 +200,7 @@ def run_test_query(query: str) -> str:
         return f"ERROR: {exc}"
 
 
-# ── Semantic Layer ──────────────────────────────────────────────────────────────────────
+# ── Semantic Layer ─────────────────────────────────────────────────────────────────
 
 
 @tool
@@ -180,7 +223,7 @@ def lookup_semantic(term: str) -> str:
         return f"ERROR: {exc}"
 
 
-# ── Data Loading ───────────────────────────────────────────────────────────────────────
+# ── Data Loading ──────────────────────────────────────────────────────────────────
 
 
 @tool
@@ -188,6 +231,7 @@ def load_file(path: str, dataset_name: str, force_schema: bool = False) -> str:
     """Load an Excel, Parquet, or CSV file into DuckDB and register its schema.
 
     The data is persisted as a real DuckDB table so it survives across calls.
+    Date-like VARCHAR columns are automatically cast to DATE type.
 
     Args:
         path: Absolute or relative path to the file.
@@ -202,7 +246,6 @@ def load_file(path: str, dataset_name: str, force_schema: bool = False) -> str:
     suffix = file_path.suffix.lower()
     try:
         if suffix in (".xlsx", ".xls"):
-            # Read into pandas then persist as a real DuckDB table
             df = pd.read_excel(path)
             conn.execute(f"DROP TABLE IF EXISTS {dataset_name}")
             conn.register("_tmp_load", df)
@@ -217,9 +260,11 @@ def load_file(path: str, dataset_name: str, force_schema: bool = False) -> str:
     except Exception as exc:
         return f"ERROR loading file: {exc}"
 
+    # Auto-cast VARCHAR columns that look like dates
+    converted = _normalize_date_columns(dataset_name)
+
     try:
         desc = conn.execute(f"DESCRIBE {dataset_name}").fetchdf()
-        # Clear old catalog entries for this dataset
         conn.execute("DELETE FROM _schema_catalog WHERE dataset_name = ?", [dataset_name])
         for _, row in desc.iterrows():
             conn.execute(
@@ -234,9 +279,10 @@ def load_file(path: str, dataset_name: str, force_schema: bool = False) -> str:
         return f"File loaded as '{dataset_name}' but schema catalog update failed: {exc}"
 
     row_count = conn.execute(f"SELECT COUNT(*) FROM {dataset_name}").fetchone()[0]
+    converted_note = f" Auto-converted date columns: {converted}." if converted else ""
     return (
         f"Successfully loaded '{path}' as table '{dataset_name}'. "
-        f"{len(desc)} columns, {row_count} rows registered."
+        f"{len(desc)} columns, {row_count} rows registered.{converted_note}"
     )
 
 

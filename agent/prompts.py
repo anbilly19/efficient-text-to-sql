@@ -53,8 +53,18 @@ DuckDB dialect rules:
 - Always qualify column names with the table name when the column contains spaces.
 - Use CTEs for multi-step logic; avoid subquery spaghetti.
 - Never use INSERT, UPDATE, DELETE, DROP, CREATE, or ALTER.
-- For date filtering use: YEAR("date_column") = 2024 or "date_column" BETWEEN '2024-01-01' AND '2024-12-31'
 - The query will be executed verbatim – make it correct the first time.
+
+DATE HANDLING (critical — follow exactly):
+- Check the schema type of any date column before applying date functions.
+- If the column type is TIMESTAMP or DATE: use YEAR(col), MONTH(col), DATE_TRUNC('month', col) directly.
+- If the column type is VARCHAR: the value is a date string like '2023-06-13'.
+  ALWAYS cast it first: TRY_CAST(col AS DATE)
+  Then apply date functions: YEAR(TRY_CAST(col AS DATE)), MONTH(TRY_CAST(col AS DATE))
+  For year filtering:  TRY_CAST(col AS DATE) >= '2023-01-01' AND TRY_CAST(col AS DATE) < '2024-01-01'
+  For month grouping:  DATE_TRUNC('month', TRY_CAST(col AS DATE))
+  NEVER call YEAR(), MONTH(), or DATE_TRUNC() directly on a VARCHAR column.
+- When in doubt, always wrap date columns in TRY_CAST(col AS DATE) — it is safe for both DATE and VARCHAR types.
 """
 
 VERIFIER_SYSTEM = """\
@@ -79,6 +89,8 @@ Verification checklist:
 - Are numeric aggregates plausible (no wild outliers from bad JOINs)?
 - Are filters applied correctly (date ranges, status fields)?
 - Are GROUP BY columns complete?
+- If a date column is VARCHAR type, confirm TRY_CAST(col AS DATE) was used before YEAR/MONTH/DATE_TRUNC.
+  If not, set verdict to fail and provide corrected_sql with the cast added.
 
 Never fabricate data. Only use tool outputs.
 """
