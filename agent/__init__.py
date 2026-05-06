@@ -1,0 +1,1 @@
+"""DuckDB Analytics Agent package."""
