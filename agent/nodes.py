@@ -149,7 +149,6 @@ def _get_varchar_date_columns(table_name: str) -> set[str]:
 
 
 def _get_date_cast_warnings(table_name: str) -> str:
-    """Prompt-level cast instructions for VARCHAR date columns."""
     if not table_name:
         return ""
     conn = get_connection()
@@ -185,51 +184,35 @@ def _get_date_cast_warnings(table_name: str) -> str:
 
 
 def _sanitize_sql(sql: str, table_name: str) -> str:
-    """Post-process LLM-generated SQL before execution.
-
-    Fixes:
-    1. Stray double-quotes: "table_name"" -> "table_name"
-    2. Auto-rewrite YEAR/MONTH/DATE_TRUNC on VARCHAR date columns to use TRY_CAST.
-    """
+    """Post-process LLM SQL: fix stray quotes + enforce TRY_CAST on VARCHAR date cols."""
     if not sql:
         return sql
-
-    # --- Fix 1: collapse runs of 2+ double-quotes around an identifier ---
-    # Matches "word"" or ""word" patterns left by LLM escaping errors
-    sql = re.sub(r'"(\w+)""', r'"\1"', sql)   # trailing stray quote
-    sql = re.sub(r'""(\w+)"', r'"\1"', sql)   # leading stray quote
-
-    # --- Fix 2: rewrite date functions on known VARCHAR date columns ---
-    varchar_date_cols = _get_varchar_date_columns(table_name)
-    for col in varchar_date_cols:
-        # Patterns like: YEAR("col"), YEAR(t."col"), YEAR(t.col), YEAR(col)
+    # Fix stray double-quotes around identifiers
+    sql = re.sub(r'"(\w+)""', r'"\1"', sql)
+    sql = re.sub(r'""(\w+)"', r'"\1"', sql)
+    # Rewrite date functions on VARCHAR date columns
+    for col in _get_varchar_date_columns(table_name):
         col_pattern = rf'(?:"?\w+"?\.)?"?{re.escape(col)}"?'
-
-        # YEAR(...)
         sql = re.sub(
             rf'\bYEAR\s*\(\s*({col_pattern})\s*\)',
             lambda m, c=col: f'YEAR(TRY_CAST("{c}" AS DATE))',
             sql, flags=re.IGNORECASE
         )
-        # MONTH(...)
         sql = re.sub(
             rf'\bMONTH\s*\(\s*({col_pattern})\s*\)',
             lambda m, c=col: f'MONTH(TRY_CAST("{c}" AS DATE))',
             sql, flags=re.IGNORECASE
         )
-        # DATE_TRUNC('...', col)
         sql = re.sub(
             rf"DATE_TRUNC\s*\(\s*('[^']*')\s*,\s*({col_pattern})\s*\)",
             lambda m, c=col: f"DATE_TRUNC({m.group(1)}, TRY_CAST(\"{c}\" AS DATE))",
             sql, flags=re.IGNORECASE
         )
-        # STRFTIME('...', col)  — also common
         sql = re.sub(
             rf"STRFTIME\s*\(\s*('[^']*')\s*,\s*({col_pattern})\s*\)",
             lambda m, c=col: f"STRFTIME({m.group(1)}, TRY_CAST(\"{c}\" AS DATE))",
             sql, flags=re.IGNORECASE
         )
-
     return sql
 
 
@@ -324,7 +307,7 @@ def orchestrator(state: AnalyticsState) -> dict:
         "error": "",
     }
 
-    # Synthesis: all plan steps completed
+    # Synthesis: all plan steps completed (done or failed)
     if state.plan and all(s.status in ("done", "failed") for s in state.plan):
         row_count = state.last_query_metadata.get("row_count", "?")
         table_preview = _rows_to_markdown(state.last_query_result)
@@ -377,8 +360,7 @@ Classify the user message into exactly ONE intent:
 
 2. CHITCHAT – use for EVERYTHING else:
    - Greetings, thanks, how-are-you
-   - General knowledge / world facts ("what is X?", "how does Y work?", comparisons
-     between concepts that are NOT columns/tables)
+   - General knowledge / world facts
    - Ambiguous questions with no clear table reference
    - Questions about the agent itself
    {{"intent": "chitchat", "final_answer": "<helpful reply>"}}
@@ -486,8 +468,6 @@ def sql_writer(state: AnalyticsState) -> dict:
     )
     parsed = _try_parse_json(response.content) or {}
     sql = parsed.get("sql", "")
-
-    # --- Deterministic post-processing: fix stray quotes + enforce date casts ---
     sql = _sanitize_sql(sql, table_name)
 
     updated_plan = [
@@ -503,24 +483,35 @@ def sql_writer(state: AnalyticsState) -> dict:
 
 def execute_sql(state: AnalyticsState) -> dict:
     result = run_sql.invoke({"query": state.last_sql})
-    if result.startswith("ERROR"):
-        updated_plan = [
-            s.model_copy(update={"status": "failed", "result": result})
+
+    # Mark the current step done/failed regardless of verifier
+    def _updated_plan(status: str, msg: str = "") -> list[PlanStep]:
+        return [
+            s.model_copy(update={"status": status, "result": msg})
             if state.current_step and s.id == state.current_step.id else s
             for s in state.plan
         ]
-        return {"last_query_result": result, "last_query_metadata": {},
-                "plan": updated_plan, "error": result}
+
+    if result.startswith("ERROR"):
+        return {
+            "last_query_result": result,
+            "last_query_metadata": {},
+            "plan": _updated_plan("failed", result),
+            "error": result,
+        }
+
     parsed = json.loads(result)
     return {
         "last_query_result": json.dumps(parsed.get("rows", []), default=str),
         "last_query_metadata": parsed.get("metadata", {}),
+        # Mark done here so orchestrator synthesis triggers even without verifier
+        "plan": _updated_plan("done"),
         "error": "",
     }
 
 
 # ---------------------------------------------------------------------------
-# Node: verifier — NO tools; reasons purely on state data
+# Node: verifier — NO tools; increments retry_count
 # ---------------------------------------------------------------------------
 
 def verifier(state: AnalyticsState) -> dict:
@@ -546,7 +537,8 @@ def verifier(state: AnalyticsState) -> dict:
     verdict = str(parsed.get("verdict", "pass"))
     feedback = str(parsed.get("feedback", ""))
     corrected_sql = parsed.get("corrected_sql", "")
-    new_status = "done" if verdict in ("pass", "warning") else "failed"
+
+    new_status = "done" if verdict in ("pass", "warning") else "pending"  # pending = retry
     updated_plan = [
         s.model_copy(update={"status": new_status, "result": feedback})
         if step and s.id == step.id else s for s in state.plan
@@ -556,7 +548,8 @@ def verifier(state: AnalyticsState) -> dict:
         "verification_feedback": feedback,
         "plan": updated_plan,
         "current_step": None,
+        "retry_count": state.retry_count + 1,  # always increment
     }
-    if corrected_sql:
+    if corrected_sql and verdict == "fail":
         updates["last_sql"] = str(corrected_sql)
     return updates

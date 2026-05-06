@@ -1,13 +1,10 @@
 """LangGraph StateGraph assembly.
 
-Routing (simplified):
-  load       -> load_file_node -> END
-  chitchat   -> END
-  analytics  -> sql_writer -> execute_sql -> orchestrator (synthesis) -> END
-               profiler -> sql_writer -> execute_sql -> verifier -> orchestrator -> END
-
-Verifier is ONLY used when a profile step precedes the sql step.
-For plain single-step SQL questions, execute_sql goes straight to orchestrator.
+Routing:
+  chitchat/load  -> END
+  simple sql     -> sql_writer -> execute_sql -> orchestrator (synthesis) -> END
+  with profile   -> profiler -> sql_writer -> execute_sql -> verifier -> orchestrator -> END
+  on fail        -> verifier -> sql_writer (max 2 retries) -> orchestrator -> END
 """
 from __future__ import annotations
 
@@ -25,6 +22,9 @@ from agent.nodes import (
 )
 from agent.state import AnalyticsState, PlanStep
 
+MAX_RETRIES = 2
+MAX_PLAN_STEPS = 5  # hard cap to prevent infinite re-planning
+
 
 def _next_pending_step(state: AnalyticsState) -> PlanStep | None:
     return next((s for s in state.plan if s.status == "pending"), None)
@@ -35,6 +35,9 @@ def route_after_orchestrator(
 ) -> Literal["load_file_node", "profiler", "sql_writer", "__end__"]:
     if state.load_file_path:
         return "load_file_node"
+    # Hard cap: bail out if plan grew too large (re-planning loop)
+    if len(state.plan) > MAX_PLAN_STEPS:
+        return END
     step = _next_pending_step(state)
     if step is not None:
         return "profiler" if step.type == "profile" else "sql_writer"
@@ -44,10 +47,9 @@ def route_after_orchestrator(
 def route_after_execute(
     state: AnalyticsState,
 ) -> Literal["verifier", "orchestrator"]:
-    """Skip verifier for simple single-sql plans; only verify when profiling preceded."""
+    """Skip verifier for simple single-sql plans (no profile step, no pending steps)."""
     has_profile_step = any(s.type == "profile" for s in state.plan)
     next_step = _next_pending_step(state)
-    # Use verifier only if there was profiling OR more steps remain
     if has_profile_step or next_step is not None:
         return "verifier"
     return "orchestrator"
@@ -56,7 +58,10 @@ def route_after_execute(
 def route_after_verifier(
     state: AnalyticsState,
 ) -> Literal["orchestrator", "sql_writer"]:
-    if state.verification_verdict == "fail" and state.retry_count < 2:
+    # Hard stop: always go to orchestrator after MAX_RETRIES
+    if state.retry_count >= MAX_RETRIES:
+        return "orchestrator"
+    if state.verification_verdict == "fail":
         return "sql_writer"
     next_step = _next_pending_step(state)
     if next_step is not None:
