@@ -33,7 +33,7 @@ from agent.database import get_connection
 
 def _llm(temperature: float = 0.0) -> ChatOpenAI:
     return ChatOpenAI(
-        model=os.getenv("OPENAI_MODEL", "gpt-4o"),
+        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
         temperature=temperature,
         api_key=os.getenv("OPENAI_API_KEY"),
     )
