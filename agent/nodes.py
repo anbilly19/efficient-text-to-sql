@@ -186,7 +186,7 @@ def _sanitize_sql(sql: str, table_name: str) -> str:
     if not sql:
         return sql
     sql = re.sub(r'"(\w+)""', r'"\1"', sql)
-    sql = re.sub(r'""(\w+)"', r'"\1"', sql)
+    sql = re.sub(r'""\(\w+)"', r'"\1"', sql)
     for col in _get_varchar_date_columns(table_name):
         col_pattern = rf'(?:"?\w+"?\.)?"?{re.escape(col)}"?'
         sql = re.sub(
@@ -223,6 +223,20 @@ _LOAD_PATTERNS = [
     re.compile(r"load\s+(?:file\s+)?(?P<path>\S+\.(?:xlsx|xls|csv|parquet))", re.IGNORECASE),
 ]
 
+# Patterns that indicate the user is asking about table schema / columns
+_SCHEMA_PATTERNS = [
+    re.compile(r"\bwhat\s+columns?\b", re.IGNORECASE),
+    re.compile(r"\blist\s+columns?\b", re.IGNORECASE),
+    re.compile(r"\bshow\s+(?:me\s+)?(?:the\s+)?(?:available\s+)?(?:columns?|fields?|schema)\b", re.IGNORECASE),
+    re.compile(r"\bwhat\s+(?:fields?|attributes?|schema)\b", re.IGNORECASE),
+    re.compile(r"\bdescribe\s+(?:the\s+)?table\b", re.IGNORECASE),
+    re.compile(r"\bwhat(?:'s|\s+is)\s+(?:in|inside)\s+(?:the\s+)?\w+\s+table\b", re.IGNORECASE),
+    re.compile(r"\bwhich\s+(?:columns?|fields?)\b", re.IGNORECASE),
+    re.compile(r"\btable\s+structure\b", re.IGNORECASE),
+    re.compile(r"\bwhat\s+tables?\s+(?:do\s+(?:i|we|you)\s+have|are\s+(?:available|loaded))\b", re.IGNORECASE),
+    re.compile(r"\bshow\s+(?:me\s+)?(?:all\s+)?(?:available\s+)?tables?\b", re.IGNORECASE),
+]
+
 
 def _detect_load_intent(text: str) -> dict | None:
     for pattern in _LOAD_PATTERNS:
@@ -235,6 +249,11 @@ def _detect_load_intent(text: str) -> dict | None:
                 dataset = Path(path).stem.replace(" ", "_").replace("-", "_").lower()
             return {"path": path, "dataset": dataset}
     return None
+
+
+def _detect_schema_intent(text: str) -> bool:
+    """Return True if the user is asking about table schema/columns."""
+    return any(p.search(text) for p in _SCHEMA_PATTERNS)
 
 
 def _extract_table_from_plan(plan: list[PlanStep], user_query: str) -> str:
@@ -311,9 +330,7 @@ def orchestrator(state: AnalyticsState) -> dict:
         all_failed = all(s.status == "failed" for s in state.plan)
 
         if all_failed:
-            # Graceful error: tell the user what went wrong without re-planning
             err = state.error or "The query could not be executed."
-            # Strip raw DuckDB noise for readability
             short_err = err.replace("ERROR: ", "").strip()
             final = (
                 f"I wasn't able to answer that question due to a SQL error:\n\n"
@@ -356,6 +373,37 @@ def orchestrator(state: AnalyticsState) -> dict:
             "load_file_dataset": load_match["dataset"],
         }
 
+    # ── Fast-path: schema / column questions ──────────────────────────────
+    if _detect_schema_intent(current_query):
+        # Try to identify which table the user is asking about
+        conn = get_connection()
+        try:
+            all_table_rows = conn.execute(
+                "SELECT DISTINCT dataset_name FROM _schema_catalog"
+            ).fetchall()
+            all_tables = [r[0] for r in all_table_rows]
+        except Exception:
+            all_tables = []
+
+        target_table: str | None = None
+        query_lower = current_query.lower()
+        for t in all_tables:
+            if t.lower() in query_lower:
+                target_table = t
+                break
+        if target_table is None and most_recent_table:
+            target_table = most_recent_table
+
+        if not all_tables:
+            reply = "No tables are loaded yet. Load a file first with: `load file at <path> as <name>`."
+        elif target_table:
+            schema_text = _get_schema_for_table(target_table)
+            reply = f"Here is the schema for the **{target_table}** table:\n\n```\n{schema_text}\n```"
+        else:
+            reply = f"Here are all loaded tables:\n\n```\n{tables_context}\n```"
+
+        return {**base_reset, "final_answer": reply, "messages": [AIMessage(content=reply)]}
+
     # ── LLM planning ──────────────────────────────────────────────────────
     ORCHESTRATOR_SYSTEM = f"""You are the Orchestrator of a DuckDB analytics agent.
 
@@ -366,8 +414,11 @@ Most recently loaded table: {most_recent_table or 'none'}
 
 Classify the user message into exactly ONE intent:
 
-1. ANALYTICS – use ONLY when the question explicitly asks about data IN a loaded table
-   (counts, sums, averages, filters, rankings, trends over rows/columns listed above).
+1. ANALYTICS – use when the question asks about data IN a loaded table.
+   This includes:
+   - Counts, sums, averages, filters, rankings, trends
+   - Questions about column values, unique values, or data distribution
+   - Schema / column questions (e.g. "what columns does X have?", "show me the fields")
    {{"intent": "analytics", "plan": [{{"id": 1, "type": "sql", "description": "..."}}]}}
    Step types: "profile" (explore a column) or "sql" (SELECT query).
    Every step description MUST name the exact table.
@@ -375,12 +426,11 @@ Classify the user message into exactly ONE intent:
 
 2. CHITCHAT – use for EVERYTHING else:
    - Greetings, thanks, how-are-you
-   - General knowledge / world facts
-   - Ambiguous questions with no clear table reference
+   - General knowledge / world facts (not about the loaded data)
    - Questions about the agent itself
    {{"intent": "chitchat", "final_answer": "<helpful reply>"}}
 
-Decision rule: if in doubt, pick CHITCHAT.
+Decision rule: if the question references a loaded table or asks about data/columns, pick ANALYTICS.
 Output ONLY the JSON. No markdown, no explanation.
 """
 
@@ -459,10 +509,11 @@ def sql_writer(state: AnalyticsState) -> dict:
     schema_context = _get_schema_for_table(table_name) if table_name else "(No tables loaded)"
     cast_warnings = _get_date_cast_warnings(table_name)
 
-    profiling_notes = "\n".join(
-        f"- {s.description}: {s.result}"
+    # Include results from ALL completed prior steps (not just profile steps)
+    prior_step_notes = "\n".join(
+        f"- Step {s.id} ({s.description}): {s.result}"
         for s in state.plan
-        if s.type == "profile" and s.status == "done" and s.result
+        if s.status == "done" and s.result and s.id != step.id
     )
 
     prompt = (
@@ -472,7 +523,8 @@ def sql_writer(state: AnalyticsState) -> dict:
         f"{schema_context}\n\n"
         f"=== MANDATORY DATE COLUMN RULES (follow exactly, no exceptions) ===\n"
         f"{cast_warnings if cast_warnings else '  (no date columns require special handling)'}\n\n"
-        f"Profiling notes:\n{profiling_notes or 'None'}\n\n"
+        f"Prior step results (use if this step depends on earlier results):\n"
+        f"{prior_step_notes or 'None'}\n\n"
         f"Verifier feedback (if retry): {state.verification_feedback or 'None'}\n\n"
         'Output JSON: {"sql": "...", "explanation": "..."}'
     )
@@ -507,8 +559,6 @@ def execute_sql(state: AnalyticsState) -> dict:
         ]
 
     if result.startswith("ERROR"):
-        # Mark as "pending" (not "failed") so verifier can attempt a fix/retry
-        # Verifier sees the error via last_query_result and can issue corrected_sql
         return {
             "last_query_result": result,
             "last_query_metadata": {},
@@ -536,7 +586,6 @@ def verifier(state: AnalyticsState) -> dict:
     table_preview = _rows_to_markdown(state.last_query_result)
 
     if is_error:
-        # Error recovery mode: ask LLM to fix the SQL
         prompt = (
             f"Sub-task: {step.description if step else 'unknown'}\n"
             f"SQL that failed:\n{state.last_sql}\n\n"
