@@ -404,6 +404,9 @@ def orchestrator(state: AnalyticsState) -> dict:
         return {**base_reset, "final_answer": reply, "messages": [AIMessage(content=reply)]}
 
     # ── LLM planning ──────────────────────────────────────────────────────
+    # NOTE: Do NOT bind tools here. The orchestrator must return plain JSON.
+    # Binding tools causes gpt-4o-mini to emit tool-call objects instead of
+    # text, which makes _try_parse_json return None and breaks routing.
     ORCHESTRATOR_SYSTEM = f"""You are the Orchestrator of a DuckDB analytics agent.
 
 Available tables in DuckDB:
@@ -411,40 +414,50 @@ Available tables in DuckDB:
 
 Most recently loaded table: {most_recent_table or 'none'}
 
-Classify the user message into exactly ONE intent:
+Your job: classify the user message and output ONLY a single JSON object.
 
-1. ANALYTICS – use when the question asks about data IN a loaded table.
-   This includes:
-   - Counts, sums, averages, filters, rankings, trends
-   - Questions about column values, unique values, or data distribution
-   - Schema / column questions (e.g. "what columns does X have?", "show me the fields")
-   {{"intent": "analytics", "plan": [{{"id": 1, "type": "sql", "description": "..."}}]}}
-   Step types: "profile" (explore a column) or "sql" (SELECT query).
-   Every step description MUST name the exact table.
-   Default table if unspecified: "{most_recent_table}".
+Rule 1 — ANALYTICS: ANY question about the data, numbers, values, statistics,
+counts, trends, comparisons, percentages, averages, rankings, filters, or
+anything that requires querying a table → output an analytics plan.
+This includes questions like "what percentage", "how many", "which is the top",
+"average value", "above average", "compare", "trend", etc.
 
-2. CHITCHAT – use for EVERYTHING else:
-   - Greetings, thanks, how-are-you
-   - General knowledge / world facts (not about the loaded data)
-   - Questions about the agent itself
-   {{"intent": "chitchat", "final_answer": "<helpful reply>"}}
+Output format for analytics:
+{{"intent": "analytics", "plan": [{{"id": 1, "type": "sql", "description": "Write a SQL query against the {most_recent_table or 'table'} table to answer: <restate user question>"}}]}}
 
-Decision rule: if the question references a loaded table or asks about data/columns, pick ANALYTICS.
-Output ONLY the JSON. No markdown, no explanation.
+Rule 2 — CHITCHAT: ONLY for greetings, thanks, and questions completely
+unrelated to any data (e.g. "how are you", "what is the capital of France").
+Output format: {{"intent": "chitchat", "final_answer": "<helpful reply>"}}
+
+Default table for all queries: "{most_recent_table}"
+Every step description MUST name the exact table.
+Output ONLY the JSON object. No markdown fences, no explanation.
 """
 
-    llm = _llm().bind_tools(ORCHESTRATOR_TOOLS)
-    response = llm.invoke(
+    # Plain LLM — no tool binding so response is always plain text JSON
+    response = _llm().invoke(
         [SystemMessage(content=ORCHESTRATOR_SYSTEM), HumanMessage(content=current_query)]
     )
-    parsed = _try_parse_json(response.content)
-    if parsed is None:
-        reply = response.content or "Hi! Ask a data question or say: load file at <path> as <name>."
+    raw_text = _extract_text(response.content)
+    parsed = _try_parse_json(raw_text)
+
+    # ── Fallback: if parsing failed but a table is loaded, treat as analytics
+    if parsed is None and most_recent_table:
+        parsed = {
+            "intent": "analytics",
+            "plan": [{"id": 1, "type": "sql", "description": f"Answer the user question against the {most_recent_table} table: {current_query}"}],
+        }
+    elif parsed is None:
+        reply = raw_text or "Hi! Ask a data question or say: load file at <path> as <name>."
         return {**base_reset, "final_answer": str(reply), "messages": [AIMessage(content=str(reply))]}
 
     intent = parsed.get("intent", "chitchat")
     if intent == "analytics":
-        plan = [PlanStep(**step) for step in parsed.get("plan", [])]
+        raw_steps = parsed.get("plan", [])
+        # ── Fallback: empty plan despite analytics intent — build default step
+        if not raw_steps and most_recent_table:
+            raw_steps = [{"id": 1, "type": "sql", "description": f"Answer the user question against the {most_recent_table} table: {current_query}"}]
+        plan = [PlanStep(**step) for step in raw_steps]
         return {**base_reset, "plan": plan}
 
     reply = str(parsed.get("final_answer", "Hi! Ask a data question or load a file."))
@@ -547,6 +560,15 @@ def sql_writer(state: AnalyticsState) -> dict:
     )
     parsed = _try_parse_json(response.content) or {}
     sql = parsed.get("sql", "")
+
+    # Fallback: LLM may have emitted a tool call instead of JSON
+    if not sql and hasattr(response, "tool_calls") and response.tool_calls:
+        for tc in response.tool_calls:
+            args = tc.get("args") or {}
+            sql = args.get("query") or args.get("sql") or ""
+            if sql:
+                break
+
     sql = _sanitize_sql(sql, table_name)
 
     # Guard: if LLM returned empty SQL, mark step failed immediately
