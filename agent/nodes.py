@@ -186,7 +186,7 @@ def _sanitize_sql(sql: str, table_name: str) -> str:
     if not sql:
         return sql
     sql = re.sub(r'"(\w+)""', r'"\1"', sql)
-    sql = re.sub(r'""\(\w+)"', r'"\1"', sql)
+    sql = re.sub(r'""(\w+)"', r'"\1"', sql)
     for col in _get_varchar_date_columns(table_name):
         col_pattern = rf'(?:"?\w+"?\.)?"?{re.escape(col)}"?'
         sql = re.sub(
@@ -375,7 +375,6 @@ def orchestrator(state: AnalyticsState) -> dict:
 
     # ── Fast-path: schema / column questions ──────────────────────────────
     if _detect_schema_intent(current_query):
-        # Try to identify which table the user is asking about
         conn = get_connection()
         try:
             all_table_rows = conn.execute(
@@ -516,6 +515,19 @@ def sql_writer(state: AnalyticsState) -> dict:
         if s.status == "done" and s.result and s.id != step.id
     )
 
+    # ── Retry fast-path: verifier already provided corrected SQL ──────────
+    # verifier sets state.last_sql = corrected_sql on verdict=fail.
+    # Reuse it directly — re-generating from scratch discards the fix
+    # and causes an infinite correction loop.
+    if state.retry_count > 0 and state.last_sql and state.last_sql.strip().upper().startswith("SELECT"):
+        sql = _sanitize_sql(state.last_sql, table_name)
+        updated_plan = [
+            s.model_copy(update={"status": "running"})
+            if s.id == step.id else s for s in state.plan
+        ]
+        return {"last_sql": sql, "plan": updated_plan, "verification_feedback": "", "current_step": step}
+
+    # ── Fresh generation ──────────────────────────────────────────────────
     prompt = (
         f"Sub-task: {step.description}\n"
         f"User question: {state.user_query}\n\n"
@@ -537,6 +549,15 @@ def sql_writer(state: AnalyticsState) -> dict:
     sql = parsed.get("sql", "")
     sql = _sanitize_sql(sql, table_name)
 
+    # Guard: if LLM returned empty SQL, mark step failed immediately
+    if not sql or not sql.strip():
+        updated_plan = [
+            s.model_copy(update={"status": "failed", "result": "sql_writer produced empty SQL"})
+            if s.id == step.id else s for s in state.plan
+        ]
+        return {"last_sql": "", "plan": updated_plan, "current_step": step,
+                "error": "sql_writer produced empty SQL"}
+
     updated_plan = [
         s.model_copy(update={"status": "running"})
         if s.id == step.id else s for s in state.plan
@@ -549,6 +570,14 @@ def sql_writer(state: AnalyticsState) -> dict:
 # ---------------------------------------------------------------------------
 
 def execute_sql(state: AnalyticsState) -> dict:
+    # Guard: empty SQL — sql_writer already marked step failed, just pass through
+    if not state.last_sql or not state.last_sql.strip():
+        return {
+            "last_query_result": "ERROR: empty SQL",
+            "last_query_metadata": {},
+            "error": "empty SQL",
+        }
+
     result = run_sql.invoke({"query": state.last_sql})
 
     def _updated_plan(status: str, msg: str = "") -> list[PlanStep]:
