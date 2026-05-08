@@ -25,6 +25,7 @@ from agent.tools import (
     run_sql,
 )
 from agent.database import get_connection
+from agent.schema_lookup import get_semantic_context, resolve_column
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +326,7 @@ def orchestrator(state: AnalyticsState) -> dict:
         "error": "",
     }
 
-    # ── Synthesis: fire when ALL steps are done or failed ──────────────────
+    # ── Synthesis: fire when ALL steps are done or failed ─────────────────────
     if state.plan and all(s.status in ("done", "failed") for s in state.plan):
         all_failed = all(s.status == "failed" for s in state.plan)
 
@@ -373,7 +374,7 @@ def orchestrator(state: AnalyticsState) -> dict:
             "load_file_dataset": load_match["dataset"],
         }
 
-    # ── Fast-path: schema / column questions ──────────────────────────────
+    # ── Fast-path: schema / column questions ────────────────────────────
     if _detect_schema_intent(current_query):
         conn = get_connection()
         try:
@@ -397,7 +398,13 @@ def orchestrator(state: AnalyticsState) -> dict:
             reply = "No tables are loaded yet. Load a file first with: `load file at <path> as <name>`."
         elif target_table:
             schema_text = _get_schema_for_table(target_table)
-            reply = f"Here is the schema for the **{target_table}** table:\n\n```\n{schema_text}\n```"
+            # ⭐ Enrich schema reply with semantic context from schema_lookup
+            semantic_text = get_semantic_context(target_table)
+            reply = (
+                f"Here is the schema for the **{target_table}** table:\n\n"
+                f"```\n{schema_text}\n```\n\n"
+                f"{semantic_text}"
+            )
         else:
             reply = f"Here are all loaded tables:\n\n```\n{tables_context}\n```"
 
@@ -407,12 +414,18 @@ def orchestrator(state: AnalyticsState) -> dict:
     # NOTE: Do NOT bind tools here. The orchestrator must return plain JSON.
     # Binding tools causes gpt-4o-mini to emit tool-call objects instead of
     # text, which makes _try_parse_json return None and breaks routing.
+
+    # ⭐ Inject semantic context so the LLM understands NIQ column names
+    semantic_context = get_semantic_context(most_recent_table)
+
     ORCHESTRATOR_SYSTEM = f"""You are the Orchestrator of a DuckDB analytics agent.
 
 Available tables in DuckDB:
 {tables_context}
 
 Most recently loaded table: {most_recent_table or 'none'}
+
+{semantic_context}
 
 Your job: classify the user message and output ONLY a single JSON object.
 
@@ -521,6 +534,9 @@ def sql_writer(state: AnalyticsState) -> dict:
     schema_context = _get_schema_for_table(table_name) if table_name else "(No tables loaded)"
     cast_warnings = _get_date_cast_warnings(table_name)
 
+    # ⭐ Prepend semantic column guide so the LLM maps user phrases to exact column names
+    semantic_context = get_semantic_context(table_name)
+
     # Include results from ALL completed prior steps (not just profile steps)
     prior_step_notes = "\n".join(
         f"- Step {s.id} ({s.description}): {s.result}"
@@ -528,7 +544,7 @@ def sql_writer(state: AnalyticsState) -> dict:
         if s.status == "done" and s.result and s.id != step.id
     )
 
-    # ── Retry fast-path: verifier already provided corrected SQL ──────────
+    # ── Retry fast-path: verifier already provided corrected SQL ────────
     # verifier sets state.last_sql = corrected_sql on verdict=fail.
     # Reuse it directly — re-generating from scratch discards the fix
     # and causes an infinite correction loop.
@@ -544,6 +560,7 @@ def sql_writer(state: AnalyticsState) -> dict:
     prompt = (
         f"Sub-task: {step.description}\n"
         f"User question: {state.user_query}\n\n"
+        f"{semantic_context}\n"
         f"=== EXACT SCHEMA (use these column names verbatim) ===\n"
         f"{schema_context}\n\n"
         f"=== MANDATORY DATE COLUMN RULES (follow exactly, no exceptions) ===\n"
