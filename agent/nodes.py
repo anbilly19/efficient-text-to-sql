@@ -185,10 +185,12 @@ def _get_date_cast_warnings(table_name: str) -> str:
 def _sanitize_sql(sql: str, table_name: str) -> str:
     if not sql:
         return sql
+    # Fix stray double-quotes: "col"" -> "col"
     sql = re.sub(r'"(\w+)""', r'"\1"', sql)
-    sql = re.sub(r'""\(\w+)"', r'"\1"', sql)
+    # Fix leading double-quote on identifier: ""col" -> "col"
+    sql = re.sub(r'""(\w+)"', r'"\1"', sql)
     for col in _get_varchar_date_columns(table_name):
-        col_pattern = rf'(?:"?\w+"?\.)?"?{re.escape(col)}"?'
+        col_pattern = rf'(?:"?\w+"?\.)?\"?{re.escape(col)}\"?'
         sql = re.sub(
             rf'\bYEAR\s*\(\s*({col_pattern})\s*\)',
             lambda m, c=col: f'YEAR(TRY_CAST("{c}" AS DATE))',
@@ -375,7 +377,6 @@ def orchestrator(state: AnalyticsState) -> dict:
 
     # ── Fast-path: schema / column questions ──────────────────────────────
     if _detect_schema_intent(current_query):
-        # Try to identify which table the user is asking about
         conn = get_connection()
         try:
             all_table_rows = conn.execute(
@@ -434,18 +435,33 @@ Decision rule: if the question references a loaded table or asks about data/colu
 Output ONLY the JSON. No markdown, no explanation.
 """
 
-    llm = _llm().bind_tools(ORCHESTRATOR_TOOLS)
-    response = llm.invoke(
+    # Plain LLM — no tool binding so response is always plain text JSON
+    response = _llm().invoke(
         [SystemMessage(content=ORCHESTRATOR_SYSTEM), HumanMessage(content=current_query)]
     )
-    parsed = _try_parse_json(response.content)
+    raw_text = _extract_text(response.content)
+    parsed = _try_parse_json(raw_text)
+
+    # Fallback: JSON parse failed but a table is loaded → build a default analytics plan
+    if parsed is None and most_recent_table:
+        parsed = {
+            "intent": "analytics",
+            "plan": [{"id": 1, "type": "sql",
+                      "description": f"Answer the user question against the {most_recent_table} table: {current_query}"}],
+        }
+
     if parsed is None:
-        reply = response.content or "Hi! Ask a data question or say: load file at <path> as <name>."
+        reply = raw_text or "Hi! Ask a data question or say: load file at <path> as <name>."
         return {**base_reset, "final_answer": str(reply), "messages": [AIMessage(content=str(reply))]}
 
     intent = parsed.get("intent", "chitchat")
     if intent == "analytics":
-        plan = [PlanStep(**step) for step in parsed.get("plan", [])]
+        raw_steps = parsed.get("plan", [])
+        # Fallback: analytics intent but empty plan
+        if not raw_steps and most_recent_table:
+            raw_steps = [{"id": 1, "type": "sql",
+                          "description": f"Answer the user question against the {most_recent_table} table: {current_query}"}]
+        plan = [PlanStep(**step) for step in raw_steps]
         return {**base_reset, "plan": plan}
 
     reply = str(parsed.get("final_answer", "Hi! Ask a data question or load a file."))
@@ -509,7 +525,16 @@ def sql_writer(state: AnalyticsState) -> dict:
     schema_context = _get_schema_for_table(table_name) if table_name else "(No tables loaded)"
     cast_warnings = _get_date_cast_warnings(table_name)
 
-    # Include results from ALL completed prior steps (not just profile steps)
+    # On retry, if verifier supplied a corrected SQL, use it directly
+    if state.retry_count > 0 and state.last_sql and state.last_sql.strip().upper().startswith("SELECT"):
+        sql = _sanitize_sql(state.last_sql, table_name)
+        updated_plan = [
+            s.model_copy(update={"status": "running"})
+            if s.id == step.id else s for s in state.plan
+        ]
+        return {"last_sql": sql, "plan": updated_plan, "verification_feedback": "", "current_step": step}
+
+    # Include results from ALL completed prior steps
     prior_step_notes = "\n".join(
         f"- Step {s.id} ({s.description}): {s.result}"
         for s in state.plan
@@ -533,8 +558,29 @@ def sql_writer(state: AnalyticsState) -> dict:
     response = llm.invoke(
         [SystemMessage(content=SQL_WRITER_SYSTEM), HumanMessage(content=prompt)]
     )
-    parsed = _try_parse_json(response.content) or {}
+    parsed = _try_parse_json(_extract_text(response.content)) or {}
     sql = parsed.get("sql", "")
+
+    # Fallback: LLM returned a tool call instead of JSON
+    if not sql and hasattr(response, "tool_calls") and response.tool_calls:
+        for tc in response.tool_calls:
+            sql = (tc.get("args") or {}).get("query") or (tc.get("args") or {}).get("sql") or ""
+            if sql:
+                break
+
+    # Guard: empty SQL — mark step failed immediately
+    if not sql or not sql.strip():
+        updated_plan = [
+            s.model_copy(update={"status": "failed", "result": "sql_writer produced empty SQL"})
+            if s.id == step.id else s for s in state.plan
+        ]
+        return {
+            "last_sql": "",
+            "plan": updated_plan,
+            "error": "sql_writer produced empty SQL",
+            "current_step": step,
+        }
+
     sql = _sanitize_sql(sql, table_name)
 
     updated_plan = [
@@ -549,6 +595,21 @@ def sql_writer(state: AnalyticsState) -> dict:
 # ---------------------------------------------------------------------------
 
 def execute_sql(state: AnalyticsState) -> dict:
+    # Guard: empty SQL
+    if not state.last_sql or not state.last_sql.strip():
+        def _fail_plan() -> list[PlanStep]:
+            return [
+                s.model_copy(update={"status": "failed", "result": "empty SQL"})
+                if state.current_step and s.id == state.current_step.id else s
+                for s in state.plan
+            ]
+        return {
+            "last_query_result": "ERROR: empty SQL",
+            "last_query_metadata": {},
+            "plan": _fail_plan(),
+            "error": "empty SQL",
+        }
+
     result = run_sql.invoke({"query": state.last_sql})
 
     def _updated_plan(status: str, msg: str = "") -> list[PlanStep]:
@@ -562,7 +623,7 @@ def execute_sql(state: AnalyticsState) -> dict:
         return {
             "last_query_result": result,
             "last_query_metadata": {},
-            "plan": _updated_plan("pending", result),
+            "plan": _updated_plan("failed", result),
             "error": result,
         }
 
