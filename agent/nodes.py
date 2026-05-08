@@ -554,19 +554,12 @@ def sql_writer(state: AnalyticsState) -> dict:
         'Output JSON: {"sql": "...", "explanation": "..."}'
     )
 
-    llm = _llm().bind_tools(SQL_WRITER_TOOLS)
-    response = llm.invoke(
+    # Plain LLM — no tool binding so response is always plain text JSON
+    response = _llm().invoke(
         [SystemMessage(content=SQL_WRITER_SYSTEM), HumanMessage(content=prompt)]
     )
     parsed = _try_parse_json(_extract_text(response.content)) or {}
     sql = parsed.get("sql", "")
-
-    # Fallback: LLM returned a tool call instead of JSON
-    if not sql and hasattr(response, "tool_calls") and response.tool_calls:
-        for tc in response.tool_calls:
-            sql = (tc.get("args") or {}).get("query") or (tc.get("args") or {}).get("sql") or ""
-            if sql:
-                break
 
     # Guard: empty SQL — mark step failed immediately
     if not sql or not sql.strip():
