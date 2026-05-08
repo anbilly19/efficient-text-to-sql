@@ -24,8 +24,7 @@ from agent.tools import (
     load_file,
     run_sql,
 )
-from agent.database import get_connection
-from agent.schema_lookup import get_semantic_context, resolve_column
+from agent.database import get_connection, get_semantic_context
 
 
 # ---------------------------------------------------------------------------
@@ -398,7 +397,7 @@ def orchestrator(state: AnalyticsState) -> dict:
             reply = "No tables are loaded yet. Load a file first with: `load file at <path> as <name>`."
         elif target_table:
             schema_text = _get_schema_for_table(target_table)
-            # ⭐ Enrich schema reply with semantic context from schema_lookup
+            # Enrich schema reply with semantic context from DuckDB _semantic_map
             semantic_text = get_semantic_context(target_table)
             reply = (
                 f"Here is the schema for the **{target_table}** table:\n\n"
@@ -415,7 +414,7 @@ def orchestrator(state: AnalyticsState) -> dict:
     # Binding tools causes gpt-4o-mini to emit tool-call objects instead of
     # text, which makes _try_parse_json return None and breaks routing.
 
-    # ⭐ Inject semantic context so the LLM understands NIQ column names
+    # Inject semantic context from DuckDB so the LLM understands NIQ column names
     semantic_context = get_semantic_context(most_recent_table)
 
     ORCHESTRATOR_SYSTEM = f"""You are the Orchestrator of a DuckDB analytics agent.
@@ -534,7 +533,7 @@ def sql_writer(state: AnalyticsState) -> dict:
     schema_context = _get_schema_for_table(table_name) if table_name else "(No tables loaded)"
     cast_warnings = _get_date_cast_warnings(table_name)
 
-    # ⭐ Prepend semantic column guide so the LLM maps user phrases to exact column names
+    # Prepend semantic column guide from DuckDB so the LLM maps user phrases to exact column names
     semantic_context = get_semantic_context(table_name)
 
     # Include results from ALL completed prior steps (not just profile steps)
@@ -644,58 +643,47 @@ def execute_sql(state: AnalyticsState) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Node: verifier — handles both success verification and SQL error recovery
+# Node: verifier
 # ---------------------------------------------------------------------------
 
 def verifier(state: AnalyticsState) -> dict:
     step = state.current_step
-    is_error = state.last_query_result.startswith("ERROR") if state.last_query_result else False
-    row_count = state.last_query_metadata.get("row_count", "unknown")
-    table_preview = _rows_to_markdown(state.last_query_result)
+    if step is None:
+        return {"verification_verdict": "pass", "verification_feedback": ""}
 
-    if is_error:
-        prompt = (
-            f"Sub-task: {step.description if step else 'unknown'}\n"
-            f"SQL that failed:\n{state.last_sql}\n\n"
-            f"DuckDB error:\n{state.last_query_result}\n\n"
-            f"Schema hint: {_get_schema_for_table(_get_most_recent_table())}\n\n"
-            "The SQL produced an error. Provide a corrected SQL query.\n"
-            'Output ONLY: {"verdict": "fail", "feedback": "<what was wrong>", "corrected_sql": "<fixed SQL>"}'
-        )
-    else:
-        prompt = (
-            f"Sub-task: {step.description if step else 'unknown'}\n"
-            f"SQL executed:\n{state.last_sql}\n\n"
-            f"Row count: {row_count}\n"
-            f"First rows:\n{table_preview[:1500]}\n\n"
-            "Verify whether the SQL correctly answers the sub-task.\n"
-            "- Correct and returns data → verdict=pass\n"
-            "- Clear bug (wrong column, bad filter) → verdict=fail with corrected_sql\n"
-            "- Plausible but uncertain → verdict=warning (treated as pass)\n"
-            "- Do NOT call any tools.\n"
-            'Output ONLY: {"verdict": "pass|fail|warning", "feedback": "...", "corrected_sql": "(only if fail)"}'
-        )
+    result_preview = state.last_query_result[:2000] if state.last_query_result else "(empty)"
+    error_msg = state.error or ""
 
-    response = _llm().invoke(
-        [SystemMessage(content=VERIFIER_SYSTEM), HumanMessage(content=prompt)]
+    prompt = (
+        f"SQL: {state.last_sql}\n"
+        f"Result (first 2000 chars): {result_preview}\n"
+        f"Error: {error_msg}\n"
+        f"Original question: {state.user_query}\n\n"
+        "Does the SQL look correct and does the result answer the question?\n"
+        "If yes: output {\"verdict\": \"pass\"}\n"
+        "If no: output {\"verdict\": \"fail\", \"feedback\": \"<what to fix>\", "
+        "\"corrected_sql\": \"<fixed SQL or empty string>\"}\n"
+        "Output ONLY the JSON."
     )
-    parsed = _try_parse_json(_extract_text(response.content)) or {"verdict": "pass", "feedback": ""}
-    verdict = str(parsed.get("verdict", "pass"))
-    feedback = str(parsed.get("feedback", ""))
+
+    response = _llm().invoke([HumanMessage(content=prompt)])
+    parsed = _try_parse_json(_extract_text(response.content)) or {}
+    verdict = parsed.get("verdict", "pass")
+    feedback = parsed.get("feedback", "")
     corrected_sql = parsed.get("corrected_sql", "")
 
-    new_status = "done" if verdict in ("pass", "warning") else "pending"
-    updated_plan = [
-        s.model_copy(update={"status": new_status, "result": feedback})
-        if step and s.id == step.id else s for s in state.plan
-    ]
-    updates: dict = {
+    if verdict == "fail" and corrected_sql and corrected_sql.strip().upper().startswith("SELECT"):
+        table_name = _extract_table_from_plan(state.plan, state.user_query)
+        corrected_sql = _sanitize_sql(corrected_sql, table_name)
+        return {
+            "verification_verdict": "fail",
+            "verification_feedback": feedback,
+            "last_sql": corrected_sql,
+            "retry_count": state.retry_count + 1,
+        }
+
+    return {
         "verification_verdict": verdict,
         "verification_feedback": feedback,
-        "plan": updated_plan,
-        "current_step": None,
-        "retry_count": state.retry_count + 1,
+        "retry_count": state.retry_count + 1 if verdict == "fail" else state.retry_count,
     }
-    if corrected_sql and verdict == "fail":
-        updates["last_sql"] = str(corrected_sql)
-    return updates

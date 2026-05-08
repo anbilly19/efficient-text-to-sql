@@ -3,10 +3,12 @@ agent/schema_lookup.py
 ──────────────────────
 Static semantic catalog for the NIQ Haushaltspaneldaten table.
 
-Consumed by:
-  - orchestrator  → enriches ORCHESTRATOR_SYSTEM with column semantics
-  - sql_writer    → prepends semantic hint to the schema context block
-  - nodes.py      → _SEMANTIC_PATTERNS for pre-LLM alias→column rewrite
+At runtime, this catalog is used ONLY on cold start to seed the DuckDB
+_semantic_map table via agent.database._maybe_seed_semantic_map().
+
+All live lookups, alias resolution, and prompt context generation now read
+from DuckDB (agent.database.resolve_semantic_term / get_semantic_context)
+so that analyst and agent edits persist across restarts.
 """
 from __future__ import annotations
 
@@ -203,75 +205,3 @@ SCHEMA_CATALOG: dict[str, dict] = {
         "aliases": ["basket VJ", "prior year basket", "ausgaben akt VJ", "spend per trip last year"],
     },
 }
-
-
-# ---------------------------------------------------------------------------
-# Alias → exact column lookup (built once at import time)
-# ---------------------------------------------------------------------------
-
-def _build_alias_index() -> dict[str, str]:
-    """Map every alias (lowercased) to its exact column name."""
-    index: dict[str, str] = {}
-    for col_name, meta in SCHEMA_CATALOG.items():
-        index[col_name.lower()] = col_name          # exact name maps to itself
-        index[meta["en"].lower()] = col_name        # English label
-        for alias in meta["aliases"]:
-            index[alias.lower()] = col_name
-    return index
-
-
-ALIAS_INDEX: dict[str, str] = _build_alias_index()
-
-
-def resolve_column(term: str) -> str | None:
-    """
-    Resolve a natural-language term to an exact column name.
-    Returns None if no match found.
-
-    Example:
-        resolve_column("basket size")  →  "Ausgaben pro Einkaufsakt"
-        resolve_column("frequency")   →  "Einkaufsakte pro Käuferhaushalt"
-    """
-    return ALIAS_INDEX.get(term.strip().lower())
-
-
-# ---------------------------------------------------------------------------
-# Schema context block for the LLM
-# ---------------------------------------------------------------------------
-
-def get_semantic_context(table_name: str = "") -> str:
-    """
-    Returns a compact plain-text block describing every column's meaning and
-    common aliases.  Inject this into the sql_writer and orchestrator prompts.
-    """
-    header = f"=== SEMANTIC COLUMN GUIDE — {table_name or 'NIQ Haushaltspaneldaten'} ===\n"
-    lines: list[str] = [header]
-
-    for col, meta in SCHEMA_CATALOG.items():
-        aliases_str = ", ".join(f'"{a}"' for a in meta["aliases"][:5])  # top 5 aliases
-        lines.append(
-            f'  "{col}" ({meta["category"]}) — {meta["description"]}\n'
-            f'  → user may say: {aliases_str}'
-        )
-    lines.append("")
-    return "\n".join(lines)
-
-
-def get_columns_by_category(category: str) -> list[str]:
-    """Return list of column names for a given category: 'dimension', 'metric', 'yoy'."""
-    return [c for c, m in SCHEMA_CATALOG.items() if m["category"] == category]
-
-
-def get_metric_columns() -> list[str]:
-    """All current-year metric columns (not YoY)."""
-    return get_columns_by_category("metric")
-
-
-def get_yoy_columns() -> list[str]:
-    """All year-over-year comparison columns."""
-    return get_columns_by_category("yoy")
-
-
-def get_dimension_columns() -> list[str]:
-    """All dimension / categorical columns."""
-    return get_columns_by_category("dimension")
