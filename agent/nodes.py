@@ -10,85 +10,290 @@ from typing import Any
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
+from agent.prompts import (
+    PROFILER_SYSTEM,
+    SQL_WRITER_SYSTEM,
+    VERIFIER_SYSTEM,
+)
 from agent.state import AnalyticsState, PlanStep
 from agent.tools import (
+    ORCHESTRATOR_TOOLS,
+    PROFILER_TOOLS,
+    SQL_WRITER_TOOLS,
     get_schema,
     load_file,
-    profile_column,
     run_sql,
-    run_test_query,
-    lookup_semantic,
 )
-from agent.database import get_connection, get_semantic_context
+from agent.database import get_connection
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
-_LOAD_RE = re.compile(
-    r"^(?:load\s+(?:file\s+(?:at\s+)?)?)"
-    r"(.+?)\s+as\s+(\w+)\s*$",
-    re.IGNORECASE,
-)
-
-
-def _llm() -> ChatOpenAI:
-    return ChatOpenAI(model=_MODEL, temperature=0)
-
-
-def _try_parse_json(text: str | None) -> dict | None:
-    if not text:
-        return None
-    text = text.strip()
-    if text.startswith("```"):
-        lines = text.split("\n")
-        text = "\n".join(lines[1:-1]) if len(lines) > 2 else text
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group())
-            except json.JSONDecodeError:
-                pass
-    return None
+def _llm(temperature: float = 0.0) -> ChatOpenAI:
+    return ChatOpenAI(
+        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        temperature=temperature,
+        api_key=os.getenv("OPENAI_API_KEY"),
+    )
 
 
 def _extract_text(content: Any) -> str:
-    """Extract plain text from any LangChain message content format.
-
-    Handles:
-      - str
-      - [{"type": "text", "text": "..."}]   <- LangGraph Studio / API
-      - [{"type": "human", "content": ...}]
-    """
     if isinstance(content, str):
         return content
     if isinstance(content, list):
         parts = []
         for block in content:
-            if isinstance(block, str):
+            if isinstance(block, dict):
+                parts.append(block.get("text") or block.get("content") or "")
+            elif isinstance(block, str):
                 parts.append(block)
-            elif isinstance(block, dict):
-                if block.get("type") == "text":
-                    parts.append(block.get("text", ""))
-                elif "content" in block:
-                    parts.append(_extract_text(block["content"]))
         return " ".join(p for p in parts if p).strip()
-    return str(content) if content is not None else ""
+    return str(content)
+
+
+def _try_parse_json(text: str) -> dict | None:
+    if not isinstance(text, str):
+        return None
+    best = None
+    depth = 0
+    start = None
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                candidate = text[start:i + 1]
+                try:
+                    parsed = json.loads(candidate)
+                    if isinstance(parsed, dict):
+                        best = parsed
+                except json.JSONDecodeError:
+                    pass
+                start = None
+    return best
+
+
+def _get_available_tables() -> str:
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT dataset_name, column_name, data_type FROM _schema_catalog ORDER BY dataset_name, column_name"
+        ).fetchall()
+        if not rows:
+            return "No tables loaded yet."
+        tables: dict[str, list[str]] = {}
+        for dataset, col, dtype in rows:
+            tables.setdefault(dataset, []).append(f"{col} ({dtype})")
+        lines = []
+        for tname, cols in tables.items():
+            lines.append(f"Table: {tname}")
+            lines.append("  Columns: " + ", ".join(cols))
+        return "\n".join(lines)
+    except Exception as exc:
+        return f"(Could not read schema catalog: {exc})"
+
+
+def _get_most_recent_table() -> str:
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT dataset_name FROM _schema_catalog ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+        return row[0] if row else ""
+    except Exception:
+        return ""
+
+
+def _get_schema_for_table(table_name: str) -> str:
+    try:
+        raw = get_schema.invoke({"dataset": table_name})
+        cols = json.loads(raw)
+        lines = [f"Table: {table_name}"]
+        for col in cols:
+            samples = ", ".join(repr(s) for s in col.get("samples", []))
+            lines.append(f"  - \"{col['column']}\" ({col['type']})  samples: [{samples}]")
+        return "\n".join(lines)
+    except Exception as exc:
+        return f"(Schema unavailable: {exc})"
+
+
+def _get_varchar_date_columns(table_name: str) -> set[str]:
+    if not table_name:
+        return set()
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT column_name, data_type FROM _schema_catalog WHERE dataset_name = ?",
+            [table_name],
+        ).fetchall()
+    except Exception:
+        return set()
+    result = set()
+    for col, dtype in rows:
+        if dtype.upper() == "VARCHAR":
+            try:
+                sample = conn.execute(
+                    f'SELECT "{col}" FROM "{table_name}" WHERE "{col}" IS NOT NULL LIMIT 1'
+                ).fetchone()
+                if sample and re.match(r"\d{4}-\d{2}-\d{2}", str(sample[0])):
+                    result.add(col)
+            except Exception:
+                pass
+    return result
+
+
+def _get_date_cast_warnings(table_name: str) -> str:
+    if not table_name:
+        return ""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT column_name, data_type FROM _schema_catalog WHERE dataset_name = ?",
+            [table_name],
+        ).fetchall()
+    except Exception:
+        return ""
+    warnings: list[str] = []
+    for col, dtype in rows:
+        if dtype.upper() == "VARCHAR":
+            try:
+                sample = conn.execute(
+                    f'SELECT "{col}" FROM "{table_name}" WHERE "{col}" IS NOT NULL LIMIT 1'
+                ).fetchone()
+                if sample and re.match(r"\d{4}-\d{2}-\d{2}", str(sample[0])):
+                    warnings.append(
+                        f'  ⚠️  "{col}" is VARCHAR storing dates (e.g. \'{sample[0]}\').'
+                        f' NEVER use YEAR("{col}") or MONTH("{col}") directly.'
+                        f' ALWAYS write: YEAR(TRY_CAST("{col}" AS DATE))'
+                        f' / MONTH(TRY_CAST("{col}" AS DATE))'
+                        f" / DATE_TRUNC('month', TRY_CAST(\"{col}\" AS DATE))"
+                    )
+            except Exception:
+                pass
+        elif dtype.upper() == "DATE":
+            warnings.append(
+                f'  ✅  "{col}" is DATE — use YEAR("{col}"), MONTH("{col}"), DATE_TRUNC directly.'
+            )
+    return "\n".join(warnings)
+
+
+def _sanitize_sql(sql: str, table_name: str) -> str:
+    if not sql:
+        return sql
+    sql = re.sub(r'"(\w+)""', r'"\1"', sql)
+    sql = re.sub(r'""(\w+)"', r'"\1"', sql)
+    for col in _get_varchar_date_columns(table_name):
+        col_pattern = rf'(?:"?\w+"?\.)?\"?{re.escape(col)}\"?'
+        sql = re.sub(
+            rf'\bYEAR\s*\(\s*({col_pattern})\s*\)',
+            lambda m, c=col: f'YEAR(TRY_CAST("{c}" AS DATE))',
+            sql, flags=re.IGNORECASE
+        )
+        sql = re.sub(
+            rf'\bMONTH\s*\(\s*({col_pattern})\s*\)',
+            lambda m, c=col: f'MONTH(TRY_CAST("{c}" AS DATE))',
+            sql, flags=re.IGNORECASE
+        )
+        sql = re.sub(
+            rf"DATE_TRUNC\s*\(\s*('[^']*')\s*,\s*({col_pattern})\s*\)",
+            lambda m, c=col: f"DATE_TRUNC({m.group(1)}, TRY_CAST(\"{c}\" AS DATE))",
+            sql, flags=re.IGNORECASE
+        )
+        sql = re.sub(
+            rf"STRFTIME\s*\(\s*('[^']*')\s*,\s*({col_pattern})\s*\)",
+            lambda m, c=col: f"STRFTIME({m.group(1)}, TRY_CAST(\"{c}\" AS DATE))",
+            sql, flags=re.IGNORECASE
+        )
+    return sql
+
+
+def _next_pending_step(plan: list[PlanStep]) -> PlanStep | None:
+    return next((s for s in plan if s.status == "pending"), None)
+
+
+_LOAD_PATTERNS = [
+    re.compile(r"load\s+(?:file\s+)?at\s+(?P<path>\S+)\s+as\s+(?P<dataset>\w+)", re.IGNORECASE),
+    re.compile(r"import\s+(?P<path>\S+)\s+as\s+(?P<dataset>\w+)", re.IGNORECASE),
+    re.compile(r"load\s+(?P<path>\S+\.(?:xlsx|xls|csv|parquet))\s+as\s+(?P<dataset>\w+)", re.IGNORECASE),
+    re.compile(r"load\s+(?:file\s+)?(?P<path>\S+\.(?:xlsx|xls|csv|parquet))", re.IGNORECASE),
+]
+
+_SCHEMA_PATTERNS = [
+    re.compile(r"\bwhat\s+columns?\b", re.IGNORECASE),
+    re.compile(r"\blist\s+columns?\b", re.IGNORECASE),
+    re.compile(r"\bshow\s+(?:me\s+)?(?:the\s+)?(?:available\s+)?(?:columns?|fields?|schema)\b", re.IGNORECASE),
+    re.compile(r"\bwhat\s+(?:fields?|attributes?|schema)\b", re.IGNORECASE),
+    re.compile(r"\bdescribe\s+(?:the\s+)?table\b", re.IGNORECASE),
+    re.compile(r"\bwhat(?:'s|\s+is)\s+(?:in|inside)\s+(?:the\s+)?\w+\s+table\b", re.IGNORECASE),
+    re.compile(r"\bwhich\s+(?:columns?|fields?)\b", re.IGNORECASE),
+    re.compile(r"\btable\s+structure\b", re.IGNORECASE),
+    re.compile(r"\bwhat\s+tables?\s+(?:do\s+(?:i|we|you)\s+have|are\s+(?:available|loaded))\b", re.IGNORECASE),
+    re.compile(r"\bshow\s+(?:me\s+)?(?:all\s+)?(?:available\s+)?tables?\b", re.IGNORECASE),
+]
+
+
+def _detect_load_intent(text: str) -> dict | None:
+    for pattern in _LOAD_PATTERNS:
+        m = pattern.search(text)
+        if m:
+            path = m.group("path")
+            try:
+                dataset = m.group("dataset")
+            except IndexError:
+                dataset = Path(path).stem.replace(" ", "_").replace("-", "_").lower()
+            return {"path": path, "dataset": dataset}
+    return None
+
+
+def _detect_schema_intent(text: str) -> bool:
+    return any(p.search(text) for p in _SCHEMA_PATTERNS)
+
+
+def _extract_table_from_plan(plan: list[PlanStep], user_query: str) -> str:
+    conn = get_connection()
+    try:
+        rows = conn.execute("SELECT DISTINCT dataset_name FROM _schema_catalog").fetchall()
+        tables = [r[0] for r in rows]
+        if not tables:
+            return ""
+        if len(tables) == 1:
+            return tables[0]
+        search_text = user_query.lower()
+        for step in plan:
+            search_text += " " + step.description.lower()
+        matched = [t for t in tables if t.lower() in search_text]
+        if matched:
+            return max(matched, key=len)
+        return _get_most_recent_table() or tables[0]
+    except Exception:
+        return ""
+
+
+def _rows_to_markdown(rows_json: str) -> str:
+    if not rows_json or rows_json.startswith("ERROR"):
+        return rows_json or "No result."
+    try:
+        rows = json.loads(rows_json)
+        if not rows:
+            return "No rows returned."
+        headers = list(rows[0].keys())
+        header_row = " | ".join(headers)
+        sep_row = " | ".join(["---"] * len(headers))
+        data_rows = "\n".join(
+            " | ".join(str(row.get(h, "")) for h in headers) for row in rows
+        )
+        return f"{header_row}\n{sep_row}\n{data_rows}"
+    except Exception:
+        return rows_json
 
 
 def _resolve_user_query(state: AnalyticsState) -> str:
-    """Return state.user_query if set, otherwise extract from last HumanMessage.
-
-    This handles the LangGraph API input format where the test sends:
-        {"messages": [{"type": "human", "content": [{"type": "text", "text": "..."}]}]}
-    rather than a top-level user_query string.
-    """
+    """Return state.user_query if set, otherwise extract from last HumanMessage."""
     if state.user_query and state.user_query.strip():
         return state.user_query.strip()
     for msg in reversed(state.messages):
@@ -99,132 +304,19 @@ def _resolve_user_query(state: AnalyticsState) -> str:
     return ""
 
 
-def _get_most_recent_table() -> str | None:
-    conn = get_connection()
-    try:
-        row = conn.execute(
-            "SELECT dataset_name FROM _schema_catalog ORDER BY rowid DESC LIMIT 1"
-        ).fetchone()
-        return row[0] if row else None
-    except Exception:
-        return None
+# ---------------------------------------------------------------------------
+# Node: orchestrator
+# ---------------------------------------------------------------------------
 
+def orchestrator(state: AnalyticsState) -> dict:
+    current_query = _resolve_user_query(state)
 
-def _get_all_tables() -> list[str]:
-    conn = get_connection()
-    try:
-        rows = conn.execute(
-            "SELECT DISTINCT dataset_name FROM _schema_catalog ORDER BY dataset_name"
-        ).fetchall()
-        return [r[0] for r in rows]
-    except Exception:
-        return []
+    tables_context = _get_available_tables()
+    most_recent_table = _get_most_recent_table()
 
-
-def _get_schema_for_table(table_name: str) -> str:
-    conn = get_connection()
-    try:
-        rows = conn.execute(
-            """
-            SELECT column_name, data_type, COALESCE(description, '')
-            FROM _schema_catalog
-            WHERE dataset_name = ?
-            ORDER BY rowid
-            """,
-            [table_name],
-        ).fetchall()
-        if not rows:
-            return f"(no schema found for {table_name!r})"
-        lines = [f"Table: {table_name}", "-" * 40]
-        for col, dtype, desc in rows:
-            lines.append(f"  {col} ({dtype})" + (f" — {desc}" if desc else ""))
-        return "\n".join(lines)
-    except Exception as e:
-        return f"(error reading schema: {e})"
-
-
-def _extract_table_from_plan(plan: list[PlanStep], query: str) -> str | None:
-    for step in plan:
-        if step.description:
-            conn = get_connection()
-            try:
-                tables = [
-                    r[0]
-                    for r in conn.execute(
-                        "SELECT DISTINCT dataset_name FROM _schema_catalog"
-                    ).fetchall()
-                ]
-                for t in tables:
-                    if t.lower() in step.description.lower():
-                        return t
-            except Exception:
-                pass
-    return _get_most_recent_table()
-
-
-def _get_columns_for_table(table_name: str) -> list[str]:
-    conn = get_connection()
-    try:
-        rows = conn.execute(
-            "SELECT column_name FROM _schema_catalog WHERE dataset_name = ? ORDER BY rowid",
-            [table_name],
-        ).fetchall()
-        return [r[0] for r in rows]
-    except Exception:
-        return []
-
-
-def _rows_to_markdown(result: str | None) -> str:
-    if not result or result.startswith("ERROR"):
-        return result or ""
-    return result
-
-
-def _sanitize_sql(sql: str, table_name: str | None) -> str:
-    if not sql:
-        return sql
-    sql = sql.strip()
-    if sql.startswith("```"):
-        lines = sql.split("\n")
-        sql = "\n".join(lines[1:-1]).strip()
-    sql = sql.rstrip(";").strip()
-    if not table_name:
-        return sql
-    columns = _get_columns_for_table(table_name)
-    for col in columns:
-        if re.search(r'[^a-zA-Z0-9_]', col):
-            col_pattern = rf'(?:"?\w+"?\.)?\"?{re.escape(col)}\"?'
-            sql = re.sub(col_pattern, f'"{col}"', sql)
-    unquoted = re.compile(rf'\b{re.escape(table_name)}\b(?!")', re.IGNORECASE)
-    sql = unquoted.sub(f'"{table_name}"', sql)
-    return sql
-
-
-def _handle_load_command(query: str) -> dict | None:
-    """If query is a load command, execute it and return a state update dict.
-    Returns None if query is not a load command."""
-    match = _LOAD_RE.match(query.strip())
-    if not match:
-        return None
-
-    path_str, dataset_name = match.group(1).strip(), match.group(2).strip()
-    path = Path(path_str)
-    if not path.exists():
-        for candidate in [Path("data") / path_str, Path(".") / path_str]:
-            if candidate.exists():
-                path = candidate
-                break
-
-    try:
-        load_file.invoke({"path": str(path), "dataset_name": dataset_name})
-        reply = (
-            f"Successfully loaded **{dataset_name}** from `{path}`. "
-            f"You can now ask questions about it."
-        )
-    except Exception as exc:
-        reply = f"Failed to load `{path_str}`: {exc}"
-
-    return {
+    base_reset: dict = {
+        "user_query": current_query,
+        "final_answer": "",
         "plan": [],
         "current_step": None,
         "last_sql": "",
@@ -233,119 +325,90 @@ def _handle_load_command(query: str) -> dict | None:
         "verification_verdict": "",
         "verification_feedback": "",
         "retry_count": 0,
-        "error": "",
         "load_file_path": None,
         "load_file_dataset": None,
-        "final_answer": reply,
-        "messages": [AIMessage(content=reply)],
-    }
-
-
-# ---------------------------------------------------------------------------
-# Node: load_file_node  (kept for backwards compat; delegates to helper)
-# ---------------------------------------------------------------------------
-
-def load_file_node(state: AnalyticsState) -> dict:
-    result = _handle_load_command(_resolve_user_query(state))
-    return result or {}
-
-
-# ---------------------------------------------------------------------------
-# Node: orchestrator
-# ---------------------------------------------------------------------------
-
-def orchestrator(state: AnalyticsState) -> dict:
-    """Classify intent and build a plan, or synthesise the final answer."""
-
-    # Resolve query from state.user_query OR last HumanMessage content blocks
-    current_query = _resolve_user_query(state)
-
-    # ── Fast-path: load command (pure regex, no LLM) ──────────────────────
-    load_result = _handle_load_command(current_query)
-    if load_result is not None:
-        return load_result
-
-    base_reset: dict = {
-        "plan": state.plan,
-        "current_step": None,
-        "last_sql": "",
-        "last_query_result": "",
-        "last_query_metadata": {},
-        "verification_verdict": "",
-        "verification_feedback": "",
-        "retry_count": 0,
         "error": "",
-        "final_answer": "",
     }
 
-    # ── Synthesis: fire when ALL steps are done or failed ─────────────────
+    # ── Synthesis: fire when ALL steps are done or failed ──────────────────
     if state.plan and all(s.status in ("done", "failed") for s in state.plan):
-        completed = [s for s in state.plan if s.status == "done" and s.result]
-        if not completed:
-            answer = "I couldn't retrieve any results. Please try rephrasing your question."
-            return {**base_reset, "final_answer": answer,
-                    "messages": [AIMessage(content=answer)]}
+        all_failed = all(s.status == "failed" for s in state.plan)
 
-        results_block = "\n\n".join(
-            f"**Step {s.id} — {s.description}**\n{s.result}" for s in completed
-        )
-        synthesis_prompt = (
-            f"Original question: {current_query}\n\n"
-            f"Query results:\n{results_block}\n\n"
-            "Write a clear, concise answer to the original question using the results above. "
-            "Be specific — include numbers, names, and values from the data. "
-            "Do not mention SQL, steps, or technical details."
-        )
-        response = _llm().invoke(
-            [SystemMessage(content="You are a helpful data analyst."),
-             HumanMessage(content=synthesis_prompt)]
-        )
-        answer = _extract_text(response.content)
-        return {**base_reset, "final_answer": answer,
-                "messages": [AIMessage(content=answer)]}
+        if all_failed:
+            err = state.error or "The query could not be executed."
+            short_err = err.replace("ERROR: ", "").strip()
+            final = (
+                f"I wasn't able to answer that question due to a SQL error:\n\n"
+                f"```\n{short_err}\n```\n\n"
+                f"Could you rephrase, or check that the column names are correct?"
+            )
+        else:
+            row_count = state.last_query_metadata.get("row_count", "?")
+            table_preview = _rows_to_markdown(state.last_query_result)
+            synthesis_prompt = (
+                f"User question: {state.user_query}\n\n"
+                f"SQL executed: {state.last_sql}\n\n"
+                f"Row count: {row_count}\n\n"
+                f"Query results:\n{table_preview}\n\n"
+                "Write a clear, concise answer for the user. "
+                "If the result is a table, present it as markdown. "
+                "If it is a single value, describe it in plain English. "
+                'Output ONLY this JSON: {"final_answer": "<your answer>"}'
+            )
+            response = _llm().invoke([HumanMessage(content=synthesis_prompt)])
+            raw = _extract_text(response.content)
+            parsed = _try_parse_json(raw) or {}
+            final_val = parsed.get("final_answer")
+            if final_val is None or not isinstance(final_val, str):
+                final_val = raw if isinstance(raw, str) and raw.strip() else table_preview
+            final = str(final_val).strip()
 
-    # Already have a plan in progress — don't re-plan
-    if state.plan and any(s.status == "pending" for s in state.plan):
-        return {}
+        return {
+            **base_reset,
+            "final_answer": final,
+            "messages": [AIMessage(content=final)],
+        }
 
-    all_tables = _get_all_tables()
-    most_recent_table = _get_most_recent_table()
-    tables_context = "\n".join(
-        f"- {t}\n{_get_schema_for_table(t)}" for t in all_tables
-    ) or "(no tables loaded)"
+    # ── Fast-path: regex load detection ───────────────────────────────────
+    load_match = _detect_load_intent(current_query)
+    if load_match:
+        return {
+            **base_reset,
+            "load_file_path": load_match["path"],
+            "load_file_dataset": load_match["dataset"],
+        }
 
-    # ── Fast-path: schema / column questions ─────────────────────────────
-    schema_keywords = re.compile(
-        r"\b(schema|columns?|fields?|structure|what.+table|show.+table|describe)\b",
-        re.IGNORECASE,
-    )
-    target_table: str | None = None
-    if schema_keywords.search(current_query):
+    # ── Fast-path: schema / column questions ──────────────────────────────
+    if _detect_schema_intent(current_query):
+        conn = get_connection()
+        try:
+            all_table_rows = conn.execute(
+                "SELECT DISTINCT dataset_name FROM _schema_catalog"
+            ).fetchall()
+            all_tables = [r[0] for r in all_table_rows]
+        except Exception:
+            all_tables = []
+
+        target_table: str | None = None
+        query_lower = current_query.lower()
         for t in all_tables:
-            if t.lower() in current_query.lower():
+            if t.lower() in query_lower:
                 target_table = t
                 break
-        if not target_table and most_recent_table:
+        if target_table is None and most_recent_table:
             target_table = most_recent_table
 
         if not all_tables:
-            reply = "No tables are loaded yet. Load a file first with: `load <path> as <name>`."
+            reply = "No tables are loaded yet. Load a file first with: `load file at <path> as <name>`."
         elif target_table:
             schema_text = _get_schema_for_table(target_table)
-            semantic_text = get_semantic_context(target_table)
-            reply = (
-                f"Here is the schema for the **{target_table}** table:\n\n"
-                f"```\n{schema_text}\n```\n\n"
-                f"{semantic_text}"
-            )
+            reply = f"Here is the schema for the **{target_table}** table:\n\n```\n{schema_text}\n```"
         else:
             reply = f"Here are all loaded tables:\n\n```\n{tables_context}\n```"
 
         return {**base_reset, "final_answer": reply, "messages": [AIMessage(content=reply)]}
 
-    # ── LLM planning ─────────────────────────────────────────────────────
-    semantic_context = get_semantic_context(most_recent_table)
-
+    # ── LLM planning ──────────────────────────────────────────────────────
     ORCHESTRATOR_SYSTEM = f"""You are the Orchestrator of a DuckDB analytics agent.
 
 Available tables in DuckDB:
@@ -353,19 +416,22 @@ Available tables in DuckDB:
 
 Most recently loaded table: {most_recent_table or 'none'}
 
----
-
-{semantic_context}
-
 Classify the user message into exactly ONE intent:
 
 1. ANALYTICS – use when the question asks about data IN a loaded table.
+   This includes:
+   - Counts, sums, averages, filters, rankings, trends
+   - Questions about column values, unique values, or data distribution
+   - Schema / column questions (e.g. "what columns does X have?", "show me the fields")
    {{"intent": "analytics", "plan": [{{"id": 1, "type": "sql", "description": "..."}}]}}
    Step types: "profile" (explore a column) or "sql" (SELECT query).
    Every step description MUST name the exact table.
    Default table if unspecified: "{most_recent_table}".
 
-2. CHITCHAT – use for EVERYTHING else.
+2. CHITCHAT – use for EVERYTHING else:
+   - Greetings, thanks, how-are-you
+   - General knowledge / world facts (not about the loaded data)
+   - Questions about the agent itself
    {{"intent": "chitchat", "final_answer": "<helpful reply>"}}
 
 Decision rule: if the question references a loaded table or asks about data/columns, pick ANALYTICS.
@@ -373,8 +439,7 @@ Output ONLY the JSON. No markdown, no explanation.
 """
 
     response = _llm().invoke(
-        [SystemMessage(content=ORCHESTRATOR_SYSTEM),
-         HumanMessage(content=current_query)]
+        [SystemMessage(content=ORCHESTRATOR_SYSTEM), HumanMessage(content=current_query)]
     )
     raw_text = _extract_text(response.content)
     parsed = _try_parse_json(raw_text)
@@ -387,34 +452,41 @@ Output ONLY the JSON. No markdown, no explanation.
         }
 
     if parsed is None:
-        answer = raw_text or "Sorry, I could not understand that request."
-        return {**base_reset, "final_answer": answer,
-                "messages": [AIMessage(content=answer)]}
+        reply = raw_text or "Hi! Ask a data question or say: load file at <path> as <name>."
+        return {**base_reset, "final_answer": str(reply), "messages": [AIMessage(content=str(reply))]}
 
-    intent = parsed.get("intent", "analytics")
+    intent = parsed.get("intent", "chitchat")
+    if intent == "analytics":
+        raw_steps = parsed.get("plan", [])
+        if not raw_steps and most_recent_table:
+            raw_steps = [{"id": 1, "type": "sql",
+                          "description": f"Answer the user question against the {most_recent_table} table: {current_query}"}]
+        plan = [PlanStep(**step) for step in raw_steps]
+        return {**base_reset, "plan": plan}
 
-    if intent == "chitchat":
-        answer = parsed.get("final_answer", "")
-        return {**base_reset, "final_answer": answer,
-                "messages": [AIMessage(content=answer)]}
+    reply = str(parsed.get("final_answer", "Hi! Ask a data question or load a file."))
+    return {**base_reset, "final_answer": reply, "messages": [AIMessage(content=reply)]}
 
-    raw_steps = parsed.get("plan", [])
 
-    if not raw_steps and most_recent_table:
-        raw_steps = [{"id": 1, "type": "sql",
-                      "description": f"Answer the user question against the {most_recent_table} table: {current_query}"}]
+# ---------------------------------------------------------------------------
+# Node: load_file_node
+# ---------------------------------------------------------------------------
 
-    plan = [
-        PlanStep(
-            id=s.get("id", i + 1),
-            type=s.get("type", "sql"),
-            description=s.get("description", ""),
-            status="pending",
-        )
-        for i, s in enumerate(raw_steps)
-    ]
-
-    return {**base_reset, "plan": plan}
+def load_file_node(state: AnalyticsState) -> dict:
+    path = state.load_file_path
+    dataset = state.load_file_dataset
+    if not path:
+        reply = "I couldn't find a file path. Please say: load file at <path> as <name>."
+        return {"final_answer": reply, "messages": [AIMessage(content=reply)],
+                "load_file_path": None, "load_file_dataset": None}
+    if not dataset:
+        dataset = Path(path).stem.replace(" ", "_").replace("-", "_").lower()
+    result = load_file.invoke({"path": path, "dataset_name": dataset})
+    reply = f"❌ Failed to load file: {result}" if result.startswith("ERROR") else (
+        f"✅ {result}\n\nYou can now ask questions about the `{dataset}` table!"
+    )
+    return {"final_answer": reply, "messages": [AIMessage(content=reply)],
+            "load_file_path": None, "load_file_dataset": None}
 
 
 # ---------------------------------------------------------------------------
@@ -422,82 +494,20 @@ Output ONLY the JSON. No markdown, no explanation.
 # ---------------------------------------------------------------------------
 
 def profiler(state: AnalyticsState) -> dict:
-    step = state.current_step
+    step = _next_pending_step(state.plan)
     if step is None:
-        return {}
-
-    table_name = _extract_table_from_plan(state.plan, state.user_query or "")
-    if not table_name:
-        updated = [
-            s.model_copy(update={"status": "failed", "result": "no table found"})
-            if s.id == step.id else s
-            for s in state.plan
-        ]
-        return {"plan": updated}
-
-    columns = _get_columns_for_table(table_name)
-    if not columns:
-        updated = [
-            s.model_copy(update={"status": "failed", "result": "no columns found"})
-            if s.id == step.id else s
-            for s in state.plan
-        ]
-        return {"plan": updated}
-
-    target_col = None
-    for col in columns:
-        if col.lower() in (step.description or "").lower():
-            target_col = col
-            break
-    if not target_col:
-        target_col = columns[0]
-
-    try:
-        result = profile_column.invoke({"dataset": table_name, "column": target_col})
-    except Exception as exc:
-        result = f"Profile failed: {exc}"
-
-    updated = [
-        s.model_copy(update={"status": "done", "result": str(result)})
-        if s.id == step.id else s
-        for s in state.plan
+        return {"current_step": None}
+    llm = _llm().bind_tools(PROFILER_TOOLS)
+    response = llm.invoke([
+        SystemMessage(content=PROFILER_SYSTEM),
+        HumanMessage(content=f"Profiling task: {step.description}\nUser question: {state.user_query}"),
+    ])
+    result_text = response.content or "No profiling result."
+    updated_plan = [
+        s.model_copy(update={"status": "done", "result": result_text})
+        if s.id == step.id else s for s in state.plan
     ]
-    return {"plan": updated, "current_step": step.model_copy(update={"status": "done", "result": str(result)})}
-
-
-# ---------------------------------------------------------------------------
-# Prompts
-# ---------------------------------------------------------------------------
-
-SQL_WRITER_SYSTEM = """You are a DuckDB SQL expert. Write precise, read-only SELECT queries.
-
-Rules:
-- Output ONLY a JSON object: {"sql": "<query>"}
-- Always double-quote identifiers with spaces or special characters: "My Column"
-- Use DuckDB syntax: TRY_CAST, STRFTIME, REGEXP_MATCHES, etc.
-- Never use INSERT, UPDATE, DELETE, DROP, CREATE, or any DDL/DML.
-- If a column name looks like a date stored as VARCHAR, wrap it:
-  TRY_CAST("Date Column" AS DATE)
-- Return at most 1000 rows unless the question asks for all.
-- Do not call any tools. Output the JSON only.
-"""
-
-VERIFIER_SYSTEM = """You are a SQL result verifier for a DuckDB analytics agent.
-
-Your job:
-- Check whether the SQL correctly answers the sub-task.
-- If the result is clearly wrong or the SQL has a bug, provide a corrected SQL.
-- Output ONLY a JSON object.
-
-Output format:
-{"verdict": "pass|fail|warning", "feedback": "...", "corrected_sql": "(only if fail)"}
-
-Rules:
-- verdict=pass  → result looks correct
-- verdict=warning → result is plausible but uncertain (treated as pass by the agent)
-- verdict=fail  → clear bug; you MUST provide corrected_sql
-- Do NOT call any tools.
-"""
+    return {"plan": updated_plan, "current_step": None}
 
 
 # ---------------------------------------------------------------------------
@@ -505,27 +515,23 @@ Rules:
 # ---------------------------------------------------------------------------
 
 def sql_writer(state: AnalyticsState) -> dict:
-    step = state.current_step
+    step = _next_pending_step(state.plan)
     if step is None:
-        return {}
+        step = next((s for s in state.plan if s.status == "running"), None)
+    if step is None:
+        return {"last_sql": "", "error": "No pending step found for sql_writer."}
 
-    table_name = _extract_table_from_plan(state.plan, state.user_query or "")
-    if not table_name:
-        table_name = _get_most_recent_table()
+    table_name = _extract_table_from_plan(state.plan, state.user_query)
+    schema_context = _get_schema_for_table(table_name) if table_name else "(No tables loaded)"
+    cast_warnings = _get_date_cast_warnings(table_name)
 
-    schema_text = _get_schema_for_table(table_name) if table_name else "(no schema)"
-
-    def _updated_plan(status: str, result: str) -> list[PlanStep]:
-        return [
-            s.model_copy(update={"status": status, "result": result})
-            if s.id == step.id else s
-            for s in state.plan
-        ]
-
-    # On retry, use verifier's corrected SQL directly
-    if state.retry_count > 0 and state.last_sql:
+    if state.retry_count > 0 and state.last_sql and state.last_sql.strip().upper().startswith("SELECT"):
         sql = _sanitize_sql(state.last_sql, table_name)
-        return {"last_sql": sql, "plan": _updated_plan("pending", ""), "current_step": step}
+        updated_plan = [
+            s.model_copy(update={"status": "running"})
+            if s.id == step.id else s for s in state.plan
+        ]
+        return {"last_sql": sql, "plan": updated_plan, "verification_feedback": "", "current_step": step}
 
     prior_step_notes = "\n".join(
         f"- Step {s.id} ({s.description}): {s.result}"
@@ -534,10 +540,16 @@ def sql_writer(state: AnalyticsState) -> dict:
     )
 
     prompt = (
-        f"Schema:\n{schema_text}\n\n"
-        + (f"Prior step results:\n{prior_step_notes}\n\n" if prior_step_notes else "")
-        + f"Task: {step.description}\n\n"
-        'Output ONLY: {"sql": "<your SELECT query>"}'
+        f"Sub-task: {step.description}\n"
+        f"User question: {state.user_query}\n\n"
+        f"=== EXACT SCHEMA (use these column names verbatim) ===\n"
+        f"{schema_context}\n\n"
+        f"=== MANDATORY DATE COLUMN RULES (follow exactly, no exceptions) ===\n"
+        f"{cast_warnings if cast_warnings else '  (no date columns require special handling)'}\n\n"
+        f"Prior step results (use if this step depends on earlier results):\n"
+        f"{prior_step_notes or 'None'}\n\n"
+        f"Verifier feedback (if retry): {state.verification_feedback or 'None'}\n\n"
+        'Output JSON: {"sql": "...", "explanation": "..."}'
     )
 
     response = _llm().invoke(
@@ -555,7 +567,10 @@ def sql_writer(state: AnalyticsState) -> dict:
                 break
 
     if not sql or not sql.strip():
-        updated_plan = _updated_plan("failed", "sql_writer produced empty SQL")
+        updated_plan = [
+            s.model_copy(update={"status": "failed", "result": "sql_writer produced empty SQL"})
+            if s.id == step.id else s for s in state.plan
+        ]
         return {
             "last_sql": "",
             "plan": updated_plan,
@@ -564,7 +579,12 @@ def sql_writer(state: AnalyticsState) -> dict:
         }
 
     sql = _sanitize_sql(sql, table_name)
-    return {"last_sql": sql, "plan": _updated_plan("pending", ""), "current_step": step}
+
+    updated_plan = [
+        s.model_copy(update={"status": "running"})
+        if s.id == step.id else s for s in state.plan
+    ]
+    return {"last_sql": sql, "plan": updated_plan, "verification_feedback": "", "current_step": step}
 
 
 # ---------------------------------------------------------------------------
@@ -572,39 +592,44 @@ def sql_writer(state: AnalyticsState) -> dict:
 # ---------------------------------------------------------------------------
 
 def execute_sql(state: AnalyticsState) -> dict:
-    step = state.current_step
-
     if not state.last_sql or not state.last_sql.strip():
-        failed_plan = [
-            s.model_copy(update={"status": "failed", "result": "empty SQL"})
-            if step and s.id == step.id else s
-            for s in state.plan
-        ]
+        def _fail_plan() -> list[PlanStep]:
+            return [
+                s.model_copy(update={"status": "failed", "result": "empty SQL"})
+                if state.current_step and s.id == state.current_step.id else s
+                for s in state.plan
+            ]
         return {
             "last_query_result": "ERROR: empty SQL",
-            "plan": failed_plan,
             "last_query_metadata": {},
+            "plan": _fail_plan(),
+            "error": "empty SQL",
         }
 
-    try:
-        result = run_sql.invoke({"query": state.last_sql})
-        if isinstance(result, dict):
-            rows = result.get("rows", "")
-            metadata = {k: v for k, v in result.items() if k != "rows"}
-            return {"last_query_result": str(rows), "last_query_metadata": metadata}
-        return {"last_query_result": str(result), "last_query_metadata": {}}
-    except Exception as exc:
-        error_msg = f"ERROR: {exc}"
-        updated_plan = [
-            s.model_copy(update={"status": "failed", "result": error_msg})
-            if step and s.id == step.id else s
+    result = run_sql.invoke({"query": state.last_sql})
+
+    def _updated_plan(status: str, msg: str = "") -> list[PlanStep]:
+        return [
+            s.model_copy(update={"status": status, "result": msg})
+            if state.current_step and s.id == state.current_step.id else s
             for s in state.plan
         ]
+
+    if result.startswith("ERROR"):
         return {
-            "last_query_result": error_msg,
-            "plan": updated_plan,
+            "last_query_result": result,
             "last_query_metadata": {},
+            "plan": _updated_plan("failed", result),
+            "error": result,
         }
+
+    parsed = json.loads(result)
+    return {
+        "last_query_result": json.dumps(parsed.get("rows", []), default=str),
+        "last_query_metadata": parsed.get("metadata", {}),
+        "plan": _updated_plan("done"),
+        "error": "",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -613,7 +638,6 @@ def execute_sql(state: AnalyticsState) -> dict:
 
 def verifier(state: AnalyticsState) -> dict:
     step = state.current_step
-
     is_error = state.last_query_result.startswith("ERROR") if state.last_query_result else False
     row_count = state.last_query_metadata.get("row_count", "unknown")
     table_preview = _rows_to_markdown(state.last_query_result)
@@ -647,7 +671,7 @@ def verifier(state: AnalyticsState) -> dict:
     parsed = _try_parse_json(_extract_text(response.content)) or {"verdict": "pass", "feedback": ""}
     verdict = str(parsed.get("verdict", "pass"))
     feedback = str(parsed.get("feedback", ""))
-    corrected_sql = str(parsed.get("corrected_sql", ""))
+    corrected_sql = parsed.get("corrected_sql", "")
 
     new_status = "done" if verdict in ("pass", "warning") else "pending"
     updated_plan = [
