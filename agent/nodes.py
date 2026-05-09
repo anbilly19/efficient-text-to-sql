@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
+from langchain_core.language_models.chat_models import BaseChatModel
 
 from agent.prompts import (
     PROFILER_SYSTEM,
@@ -29,16 +29,51 @@ from agent.database import get_connection
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# LLM factory — swap backend via LLM_BACKEND env var
 # ---------------------------------------------------------------------------
+#
+#   LLM_BACKEND=openai   (default) — uses ChatOpenAI
+#     OPENAI_MODEL       model name  (default: gpt-4o-mini)
+#     OPENAI_API_KEY     required
+#
+#   LLM_BACKEND=ollama   — uses ChatOllama (local, no API key needed)
+#     OLLAMA_MODEL       model name  (default: gemma4:e2b)
+#     OLLAMA_BASE_URL    base URL    (default: http://localhost:11434)
+#
+# NOTE: gemma4:e2b is a ~2B-param model. Tool-call reliability is lower than
+# larger models. For production use prefer gemma4:e4b (4B) or a 27B variant.
+# Run `ollama pull gemma4:e2b` before switching backends.
 
-def _llm(temperature: float = 0.0) -> ChatOpenAI:
+def _llm(temperature: float = 0.0) -> BaseChatModel:
+    backend = os.getenv("LLM_BACKEND", "openai").lower().strip()
+
+    if backend == "ollama":
+        try:
+            from langchain_ollama import ChatOllama  # type: ignore[import]
+        except ImportError as exc:
+            raise ImportError(
+                "langchain-ollama is not installed. "
+                "Run: pip install langchain-ollama"
+            ) from exc
+
+        return ChatOllama(
+            model=os.getenv("OLLAMA_MODEL", "gemma4:e2b"),
+            base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
+            temperature=temperature,
+        )
+
+    # Default: OpenAI
+    from langchain_openai import ChatOpenAI  # type: ignore[import]
     return ChatOpenAI(
         model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
         temperature=temperature,
         api_key=os.getenv("OPENAI_API_KEY"),
     )
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _extract_text(content: Any) -> str:
     if isinstance(content, str):
@@ -128,7 +163,6 @@ def _get_semantic_context(table_name: str, user_query: str) -> str:
     if not table_name:
         return ""
     try:
-        # Pull top keywords from the query (words > 3 chars)
         keywords = [w for w in re.findall(r"[a-zA-Z]{4,}", user_query.lower()) if w not in
                     {"what", "show", "list", "give", "find", "from", "that", "this", "with",
                      "have", "does", "each", "many", "much", "more", "most", "last", "year",
@@ -332,7 +366,6 @@ def _resolve_user_query(state: AnalyticsState) -> str:
             text = _extract_text(msg.content)
             if text:
                 return text
-    # Fallback for direct API calls (no messages list)
     if state.user_query and state.user_query.strip():
         return state.user_query.strip()
     return ""
@@ -594,7 +627,6 @@ def sql_writer(state: AnalyticsState) -> dict:
     parsed = _try_parse_json(_extract_text(response.content)) or {}
     sql = parsed.get("sql", "")
 
-    # Fallback: LLM returned a tool call instead of plain JSON
     if not sql and hasattr(response, "tool_calls") and response.tool_calls:
         for tc in response.tool_calls:
             args = tc.get("args") or {}
