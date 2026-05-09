@@ -9,7 +9,7 @@ from typing import Optional
 import pandas as pd
 from langchain_core.tools import tool
 
-from agent.database import get_connection
+from agent.database import get_connection, get_parquet_path, PARQUET_STORE
 
 
 _DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}")
@@ -23,8 +23,19 @@ def _table_info(dataset_name: str) -> list[tuple[str, str]]:
     """Return [(column_name, column_type), ...] using PRAGMA — always safe."""
     conn = get_connection()
     rows = conn.execute(f"PRAGMA table_info('{dataset_name}')").fetchall()
-    # PRAGMA table_info columns: cid, name, type, notnull, dflt_value, pk
     return [(r[1], r[2]) for r in rows]
+
+
+def _normalize_date_columns_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Cast object columns that look like ISO dates to datetime64."""
+    for col in df.select_dtypes(include="object").columns:
+        sample = df[col].dropna().head(5)
+        if len(sample) > 0 and all(_looks_like_date(str(v)) for v in sample):
+            try:
+                df[col] = pd.to_datetime(df[col], errors="coerce")
+            except Exception:
+                pass
+    return df
 
 
 def _normalize_date_columns(dataset_name: str) -> list[str]:
@@ -53,6 +64,48 @@ def _normalize_date_columns(dataset_name: str) -> list[str]:
         except Exception:
             pass
     return converted
+
+
+def _build_semantic_lookup(df: pd.DataFrame, dataset_name: str) -> None:
+    """Populate _semantic_lookup with per-column stats derived from the DataFrame."""
+    conn = get_connection()
+    conn.execute("DELETE FROM _semantic_lookup WHERE dataset_name = ?", [dataset_name])
+    total_rows = len(df)
+    for col in df.columns:
+        series = df[col]
+        dtype_str = str(series.dtype)
+
+        # n_distinct
+        try:
+            n_distinct = int(series.nunique(dropna=True))
+        except Exception:
+            n_distinct = -1
+
+        # null_frac
+        null_frac = float(series.isna().sum()) / total_rows if total_rows > 0 else 0.0
+
+        # sample_values: up to 5 representative non-null values
+        try:
+            raw_samples = series.dropna().unique()[:5].tolist()
+            sample_values = json.dumps([str(s) for s in raw_samples], default=str)
+        except Exception:
+            sample_values = "[]"
+
+        # human-readable description derived purely from metadata (no LLM)
+        col_lower = col.lower().replace("_", " ")
+        description = (
+            f"{col_lower.title()} — {dtype_str} column with {n_distinct} distinct values"
+            + (f", e.g. {', '.join(json.loads(sample_values)[:3])}" if json.loads(sample_values) else "")
+        )
+
+        conn.execute(
+            """
+            INSERT INTO _semantic_lookup
+                (dataset_name, column_name, data_type, sample_values, n_distinct, null_frac, description)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [dataset_name, col, dtype_str, sample_values, n_distinct, null_frac, description],
+        )
 
 
 @tool
@@ -206,13 +259,69 @@ def lookup_semantic(term: str) -> str:
 
 
 @tool
-def load_file(path: str, dataset_name: str, force_schema: bool = False) -> str:
-    """Load an Excel, Parquet, or CSV file into DuckDB and register its schema.
+def search_semantic_lookup(query: str, dataset: Optional[str] = None) -> str:
+    """Search the semantic_lookup for columns matching a keyword or description.
+
+    Useful for finding which column represents a business concept (e.g. 'revenue',
+    'customer id', 'date of order') without knowing the exact column name.
 
     Args:
-        path: Absolute or relative path to the file.
-        dataset_name: Name to register the table as in DuckDB.
-        force_schema: If True, re-populate _schema_catalog even if entry exists.
+        query: Keyword or phrase to search for in column names and descriptions.
+        dataset: Optional dataset name to restrict the search to one table.
+    """
+    conn = get_connection()
+    try:
+        like_term = f"%{query.lower()}%"
+        if dataset:
+            rows = conn.execute(
+                """
+                SELECT dataset_name, column_name, data_type, sample_values, n_distinct, description
+                FROM _semantic_lookup
+                WHERE dataset_name = ?
+                  AND (LOWER(column_name) LIKE ? OR LOWER(description) LIKE ?)
+                ORDER BY dataset_name, column_name
+                """,
+                [dataset, like_term, like_term],
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT dataset_name, column_name, data_type, sample_values, n_distinct, description
+                FROM _semantic_lookup
+                WHERE LOWER(column_name) LIKE ? OR LOWER(description) LIKE ?
+                ORDER BY dataset_name, column_name
+                """,
+                [like_term, like_term],
+            ).fetchall()
+        results = [
+            {
+                "dataset": r[0],
+                "column": r[1],
+                "type": r[2],
+                "samples": json.loads(r[3] or "[]"),
+                "n_distinct": r[4],
+                "description": r[5],
+            }
+            for r in rows
+        ]
+        return json.dumps(results, default=str)
+    except Exception as exc:
+        return f"ERROR: {exc}"
+
+
+@tool
+def load_file(path: str, dataset_name: str, force_schema: bool = False) -> str:
+    """Load an Excel, Parquet, or CSV file into DuckDB.
+
+    Excel and CSV files are converted to Parquet and persisted on disk so they
+    survive server restarts. DuckDB holds a VIEW backed by the Parquet file,
+    keeping memory usage minimal. _schema_catalog and _semantic_lookup are
+    rebuilt for the dataset.
+
+    Args:
+        path: Absolute or relative path to the source file.
+        dataset_name: Name to register the table / view as in DuckDB.
+        force_schema: If True, re-populate catalog even if entry exists.
     """
     conn = get_connection()
     file_path = Path(path)
@@ -220,50 +329,70 @@ def load_file(path: str, dataset_name: str, force_schema: bool = False) -> str:
         return f"ERROR: File not found at '{path}'"
 
     suffix = file_path.suffix.lower()
+    parquet_path = get_parquet_path(dataset_name)
+
+    # ── 1. Read source into DataFrame ────────────────────────────────────
     try:
         if suffix in (".xlsx", ".xls"):
             df = pd.read_excel(path)
-            conn.execute(f'DROP TABLE IF EXISTS "{dataset_name}"')
-            conn.register("_tmp_load", df)
-            conn.execute(f'CREATE TABLE "{dataset_name}" AS SELECT * FROM _tmp_load')
-            conn.unregister("_tmp_load")
-        elif suffix == ".parquet":
-            conn.execute(
-                f'CREATE OR REPLACE TABLE "{dataset_name}" AS SELECT * FROM read_parquet(\'{path}\')'
-            )
+            df = _normalize_date_columns_df(df)
         elif suffix == ".csv":
-            conn.execute(
-                f'CREATE OR REPLACE TABLE "{dataset_name}" AS SELECT * FROM read_csv_auto(\'{path}\')'
-            )
+            df = pd.read_csv(path, low_memory=False)
+            df = _normalize_date_columns_df(df)
+        elif suffix == ".parquet":
+            df = pd.read_parquet(path)
         else:
             return f"ERROR: Unsupported file type '{suffix}'. Use .xlsx, .parquet, or .csv."
     except Exception as exc:
-        return f"ERROR loading file: {exc}"
+        return f"ERROR reading file: {exc}"
 
-    converted = _normalize_date_columns(dataset_name)
+    # ── 2. Persist as Parquet ─────────────────────────────────────────────
+    try:
+        PARQUET_STORE.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(parquet_path, index=False, engine="pyarrow")
+    except Exception as exc:
+        return f"ERROR writing Parquet: {exc}"
 
+    # ── 3. Register as a DuckDB VIEW backed by the Parquet file ──────────
+    try:
+        conn.execute(
+            f"CREATE OR REPLACE VIEW \"{dataset_name}\" AS "
+            f"SELECT * FROM read_parquet('{parquet_path.as_posix()}')"
+        )
+    except Exception as exc:
+        return f"ERROR registering view in DuckDB: {exc}"
+
+    # ── 4. Rebuild _schema_catalog ────────────────────────────────────────
     try:
         col_info = _table_info(dataset_name)
         conn.execute("DELETE FROM _schema_catalog WHERE dataset_name = ?", [dataset_name])
         for col, dtype in col_info:
             conn.execute(
-                "INSERT INTO _schema_catalog (dataset_name, column_name, data_type, nullable, description) "
+                "INSERT INTO _schema_catalog "
+                "(dataset_name, column_name, data_type, nullable, description) "
                 "VALUES (?, ?, ?, ?, ?)",
                 [dataset_name, col, dtype, True, None],
             )
     except Exception as exc:
-        return f"File loaded as '{dataset_name}' but schema catalog update failed: {exc}"
+        return f"File loaded but schema catalog update failed: {exc}"
 
-    row_count = conn.execute(f'SELECT COUNT(*) FROM "{dataset_name}"').fetchone()[0]
-    converted_note = f" Auto-converted date columns: {converted}." if converted else ""
+    # ── 5. Build _semantic_lookup ─────────────────────────────────────────
+    try:
+        _build_semantic_lookup(df, dataset_name)
+    except Exception as exc:
+        # Non-fatal: semantic lookup failure shouldn't block querying
+        pass
+
+    row_count = len(df)
     return (
-        f"Successfully loaded '{path}' as table '{dataset_name}'. "
-        f"{len(col_info)} columns, {row_count} rows registered.{converted_note}"
+        f"Successfully loaded '{file_path.name}' as view '{dataset_name}'. "
+        f"{len(col_info)} columns, {row_count} rows. "
+        f"Persisted to '{parquet_path}' and indexed in semantic_lookup."
     )
 
 
-ALL_TOOLS = [get_schema, profile_column, run_sql, run_test_query, lookup_semantic, load_file]
+ALL_TOOLS = [get_schema, profile_column, run_sql, run_test_query, lookup_semantic, search_semantic_lookup, load_file]
 ORCHESTRATOR_TOOLS = [get_schema, lookup_semantic]
 PROFILER_TOOLS = [get_schema, profile_column]
-SQL_WRITER_TOOLS = [get_schema, lookup_semantic, profile_column]
+SQL_WRITER_TOOLS = [get_schema, lookup_semantic, search_semantic_lookup, profile_column]
 VERIFIER_TOOLS = [run_test_query, profile_column]

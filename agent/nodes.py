@@ -23,6 +23,7 @@ from agent.tools import (
     get_schema,
     load_file,
     run_sql,
+    search_semantic_lookup,
 )
 from agent.database import get_connection
 
@@ -122,6 +123,38 @@ def _get_schema_for_table(table_name: str) -> str:
         return f"(Schema unavailable: {exc})"
 
 
+def _get_semantic_context(table_name: str, user_query: str) -> str:
+    """Return a short semantic_lookup snippet relevant to the user query."""
+    if not table_name:
+        return ""
+    try:
+        # Pull top keywords from the query (words > 3 chars)
+        keywords = [w for w in re.findall(r"[a-zA-Z]{4,}", user_query.lower()) if w not in
+                    {"what", "show", "list", "give", "find", "from", "that", "this", "with",
+                     "have", "does", "each", "many", "much", "more", "most", "last", "year",
+                     "month", "week", "date", "time", "when", "where", "which"}]
+        hits: list[dict] = []
+        seen: set[str] = set()
+        for kw in keywords[:6]:
+            raw = search_semantic_lookup.invoke({"query": kw, "dataset": table_name})
+            for entry in json.loads(raw) if raw and not raw.startswith("ERROR") else []:
+                key = entry["column"]
+                if key not in seen:
+                    seen.add(key)
+                    hits.append(entry)
+        if not hits:
+            return ""
+        lines = ["=== Semantic column hints ==="]
+        for h in hits[:8]:
+            lines.append(
+                f"  {h['column']} ({h['type']}, {h['n_distinct']} distinct) "
+                f"— {h['description']}"
+            )
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
+
 def _get_varchar_date_columns(table_name: str) -> set[str]:
     if not table_name:
         return set()
@@ -175,9 +208,9 @@ def _get_date_cast_warnings(table_name: str) -> str:
                     )
             except Exception:
                 pass
-        elif dtype.upper() == "DATE":
+        elif dtype.upper() in ("DATE", "TIMESTAMP", "TIMESTAMP WITH TIME ZONE"):
             warnings.append(
-                f'  ✅  "{col}" is DATE — use YEAR("{col}"), MONTH("{col}"), DATE_TRUNC directly.'
+                f'  ✅  "{col}" is {dtype} — use YEAR("{col}"), MONTH("{col}"), DATE_TRUNC directly.'
             )
     return "\n".join(warnings)
 
@@ -525,6 +558,7 @@ def sql_writer(state: AnalyticsState) -> dict:
     table_name = _extract_table_from_plan(state.plan, state.user_query)
     schema_context = _get_schema_for_table(table_name) if table_name else "(No tables loaded)"
     cast_warnings = _get_date_cast_warnings(table_name)
+    semantic_context = _get_semantic_context(table_name, state.user_query)
 
     if state.retry_count > 0 and state.last_sql and state.last_sql.strip().upper().startswith("SELECT"):
         sql = _sanitize_sql(state.last_sql, table_name)
@@ -545,7 +579,8 @@ def sql_writer(state: AnalyticsState) -> dict:
         f"User question: {state.user_query}\n\n"
         f"=== EXACT SCHEMA (use these column names verbatim) ===\n"
         f"{schema_context}\n\n"
-        f"=== MANDATORY DATE COLUMN RULES (follow exactly, no exceptions) ===\n"
+        + (f"{semantic_context}\n\n" if semantic_context else "")
+        + f"=== MANDATORY DATE COLUMN RULES (follow exactly, no exceptions) ===\n"
         f"{cast_warnings if cast_warnings else '  (no date columns require special handling)'}\n\n"
         f"Prior step results (use if this step depends on earlier results):\n"
         f"{prior_step_notes or 'None'}\n\n"
