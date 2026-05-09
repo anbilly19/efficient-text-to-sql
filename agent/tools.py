@@ -1,6 +1,8 @@
 """Deterministic tool functions – no LLM involved here."""
 from __future__ import annotations
 
+import csv
+import io
 import json
 import re
 from pathlib import Path
@@ -75,23 +77,19 @@ def _build_semantic_lookup(df: pd.DataFrame, dataset_name: str) -> None:
         series = df[col]
         dtype_str = str(series.dtype)
 
-        # n_distinct
         try:
             n_distinct = int(series.nunique(dropna=True))
         except Exception:
             n_distinct = -1
 
-        # null_frac
         null_frac = float(series.isna().sum()) / total_rows if total_rows > 0 else 0.0
 
-        # sample_values: up to 5 representative non-null values
         try:
             raw_samples = series.dropna().unique()[:5].tolist()
             sample_values = json.dumps([str(s) for s in raw_samples], default=str)
         except Exception:
             sample_values = "[]"
 
-        # human-readable description derived purely from metadata (no LLM)
         col_lower = col.lower().replace("_", " ")
         description = (
             f"{col_lower.title()} — {dtype_str} column with {n_distinct} distinct values"
@@ -106,6 +104,50 @@ def _build_semantic_lookup(df: pd.DataFrame, dataset_name: str) -> None:
             """,
             [dataset_name, col, dtype_str, sample_values, n_distinct, null_frac, description],
         )
+
+
+def _semantic_map_coverage(dataset_name: str, columns: list[str]) -> int:
+    """Return the number of columns that have at least one alias in _semantic_map.
+
+    The check is intentionally broad: a column is considered 'covered' if its
+    exact name (case-insensitive) appears as a term in _semantic_map.
+    """
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT COUNT(DISTINCT term) FROM _semantic_map "
+            "WHERE LOWER(term) IN ({})".format(
+                ", ".join(["LOWER(?)"] * len(columns))
+            ),
+            [c.lower() for c in columns],
+        ).fetchone()
+        return rows[0] if rows else 0
+    except Exception:
+        return 0
+
+
+def _build_alias_csv_template(dataset_name: str, columns: list[str]) -> str:
+    """Return a CSV string as an alias registration template.
+
+    The user fills in 'definition_sql' (a SQL expression or column ref) and
+    an optional 'description' then passes the file back via register_alias.
+    """
+    buf = io.StringIO()
+    writer = csv.DictWriter(
+        buf,
+        fieldnames=["term", "definition_sql", "description"],
+        lineterminator="\n",
+    )
+    writer.writeheader()
+    for col in columns:
+        writer.writerow(
+            {
+                "term": col,
+                "definition_sql": f'"{col}"',  # default: identity reference
+                "description": "",
+            }
+        )
+    return buf.getvalue()
 
 
 @tool
@@ -310,13 +352,109 @@ def search_semantic_lookup(query: str, dataset: Optional[str] = None) -> str:
 
 
 @tool
+def list_loaded_tables() -> str:
+    """List all datasets currently registered in DuckDB.
+
+    Returns dataset name, row count, column count, source file, and when it
+    was loaded.  Falls back to scanning _semantic_lookup when _data_registry
+    is empty (e.g. datasets loaded in a prior session without the registry).
+    """
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT dataset_name, source_file, row_count, column_count, loaded_at
+            FROM _data_registry
+            ORDER BY loaded_at DESC
+            """
+        ).fetchall()
+        if rows:
+            results = [
+                {
+                    "dataset": r[0],
+                    "source_file": r[1],
+                    "row_count": r[2],
+                    "column_count": r[3],
+                    "loaded_at": str(r[4]),
+                }
+                for r in rows
+            ]
+            return json.dumps(results, default=str)
+    except Exception:
+        pass
+
+    # Fallback: derive from _semantic_lookup
+    try:
+        rows = conn.execute(
+            """
+            SELECT dataset_name, COUNT(*) AS column_count
+            FROM _semantic_lookup
+            GROUP BY dataset_name
+            ORDER BY dataset_name
+            """
+        ).fetchall()
+        results = [
+            {"dataset": r[0], "column_count": r[1], "source_file": None, "row_count": None}
+            for r in rows
+        ]
+        return json.dumps(results, default=str)
+    except Exception as exc:
+        return f"ERROR: {exc}"
+
+
+@tool
+def register_alias(
+    term: str,
+    definition_sql: str,
+    description: Optional[str] = None,
+) -> str:
+    """Register or update a business-term alias in the semantic map.
+
+    After registration the alias is immediately available to lookup_semantic
+    and the sql_writer uses it when constructing queries.
+
+    Args:
+        term: Short business name for the concept, e.g. 'umsatz' or 'revenue'.
+        definition_sql: SQL expression that resolves the term, e.g.
+            '"Umsatz_EUR"' or 'SUM("Umsatz_EUR") / 1000'.
+        description: Optional human-readable explanation shown to the LLM.
+    """
+    conn = get_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO _semantic_map (term, definition_sql, description)
+            VALUES (?, ?, ?)
+            ON CONFLICT (term) DO UPDATE
+                SET definition_sql = excluded.definition_sql,
+                    description    = excluded.description
+            """,
+            [term.lower().strip(), definition_sql, description],
+        )
+        return json.dumps(
+            {
+                "status": "ok",
+                "term": term.lower().strip(),
+                "definition_sql": definition_sql,
+                "description": description,
+            }
+        )
+    except Exception as exc:
+        return f"ERROR: {exc}"
+
+
+@tool
 def load_file(path: str, dataset_name: str, force_schema: bool = False) -> str:
     """Load an Excel, Parquet, or CSV file into DuckDB.
 
     Excel and CSV files are converted to Parquet and persisted on disk so they
     survive server restarts. DuckDB holds a VIEW backed by the Parquet file,
-    keeping memory usage minimal. _schema_catalog and _semantic_lookup are
-    rebuilt for the dataset.
+    keeping memory usage minimal. _schema_catalog, _semantic_lookup, and
+    _data_registry are rebuilt for the dataset.
+
+    If no alias entries exist in _semantic_map for this dataset's columns a
+    CSV template is generated and its path is included in the response so the
+    user can fill in business-term mappings and run register_alias.
 
     Args:
         path: Absolute or relative path to the source file.
@@ -345,6 +483,9 @@ def load_file(path: str, dataset_name: str, force_schema: bool = False) -> str:
             return f"ERROR: Unsupported file type '{suffix}'. Use .xlsx, .parquet, or .csv."
     except Exception as exc:
         return f"ERROR reading file: {exc}"
+
+    columns = list(df.columns)
+    row_count = len(df)
 
     # ── 2. Persist as Parquet ─────────────────────────────────────────────
     try:
@@ -379,20 +520,77 @@ def load_file(path: str, dataset_name: str, force_schema: bool = False) -> str:
     # ── 5. Build _semantic_lookup ─────────────────────────────────────────
     try:
         _build_semantic_lookup(df, dataset_name)
-    except Exception as exc:
-        # Non-fatal: semantic lookup failure shouldn't block querying
-        pass
+    except Exception:
+        pass  # non-fatal
 
-    row_count = len(df)
+    # ── 6. Update _data_registry ──────────────────────────────────────────
+    try:
+        conn.execute(
+            """
+            INSERT INTO _data_registry
+                (dataset_name, parquet_path, source_file, row_count, column_count, loaded_at)
+            VALUES (?, ?, ?, ?, ?, current_timestamp)
+            ON CONFLICT (dataset_name) DO UPDATE
+                SET parquet_path  = excluded.parquet_path,
+                    source_file   = excluded.source_file,
+                    row_count     = excluded.row_count,
+                    column_count  = excluded.column_count,
+                    loaded_at     = excluded.loaded_at
+            """,
+            [
+                dataset_name,
+                parquet_path.as_posix(),
+                file_path.name,
+                row_count,
+                len(columns),
+            ],
+        )
+    except Exception:
+        pass  # non-fatal
+
+    # ── 7. Check semantic_map coverage → emit template if missing ─────────
+    alias_warning = ""
+    template_path: Optional[Path] = None
+    coverage = _semantic_map_coverage(dataset_name, columns)
+    if coverage == 0:
+        try:
+            template_csv = _build_alias_csv_template(dataset_name, columns)
+            template_dir = PARQUET_STORE.parent / "templates"
+            template_dir.mkdir(parents=True, exist_ok=True)
+            template_path = template_dir / f"{dataset_name}_aliases.csv"
+            template_path.write_text(template_csv, encoding="utf-8")
+            alias_warning = (
+                f" No business-term aliases found for '{dataset_name}'. "
+                f"A template CSV has been saved to '{template_path}'. "
+                f"Fill in 'definition_sql' and 'description' for each column, "
+                f"then use register_alias to load them."
+            )
+        except Exception:
+            alias_warning = (
+                f" No business-term aliases found for '{dataset_name}'. "
+                f"Use register_alias(term, definition_sql) to map column names to business terms."
+            )
+
     return (
         f"Successfully loaded '{file_path.name}' as view '{dataset_name}'. "
-        f"{len(col_info)} columns, {row_count} rows. "
-        f"Persisted to '{parquet_path}' and indexed in semantic_lookup."
+        f"{len(col_info)} columns, {row_count:,} rows. "
+        f"Persisted to '{parquet_path}'."
+        + alias_warning
     )
 
 
-ALL_TOOLS = [get_schema, profile_column, run_sql, run_test_query, lookup_semantic, search_semantic_lookup, load_file]
-ORCHESTRATOR_TOOLS = [get_schema, lookup_semantic]
+ALL_TOOLS = [
+    get_schema,
+    profile_column,
+    run_sql,
+    run_test_query,
+    lookup_semantic,
+    search_semantic_lookup,
+    list_loaded_tables,
+    register_alias,
+    load_file,
+]
+ORCHESTRATOR_TOOLS = [get_schema, lookup_semantic, list_loaded_tables]
 PROFILER_TOOLS = [get_schema, profile_column]
 SQL_WRITER_TOOLS = [get_schema, lookup_semantic, search_semantic_lookup, profile_column]
 VERIFIER_TOOLS = [run_test_query, profile_column]
