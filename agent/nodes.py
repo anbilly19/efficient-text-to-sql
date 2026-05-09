@@ -293,14 +293,15 @@ def _rows_to_markdown(rows_json: str) -> str:
 
 
 def _resolve_user_query(state: AnalyticsState) -> str:
-    """Return state.user_query if set, otherwise extract from last HumanMessage."""
-    if state.user_query and state.user_query.strip():
-        return state.user_query.strip()
+    """Always read the latest HumanMessage to avoid stale user_query across turns."""
     for msg in reversed(state.messages):
         if isinstance(msg, HumanMessage):
             text = _extract_text(msg.content)
             if text:
                 return text
+    # Fallback for direct API calls (no messages list)
+    if state.user_query and state.user_query.strip():
+        return state.user_query.strip()
     return ""
 
 
