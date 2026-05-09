@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 
@@ -61,6 +62,33 @@ def _parse_args() -> tuple[argparse.Namespace, list[str]]:
     return parser.parse_known_args()
 
 
+def _find_langgraph() -> str:
+    """Locate the langgraph console-script in the active venv or PATH."""
+    # 1. Prefer the script sitting next to the current Python executable
+    #    (.venv/Scripts/langgraph.exe on Windows, .venv/bin/langgraph on Unix)
+    scripts_dir = os.path.join(os.path.dirname(sys.executable),
+                               "Scripts" if sys.platform == "win32" else "")
+    candidate = os.path.join(scripts_dir, "langgraph")
+    if sys.platform == "win32":
+        for ext in (".exe", ".cmd", ""):
+            if os.path.isfile(candidate + ext):
+                return candidate + ext
+    elif os.path.isfile(candidate):
+        return candidate
+
+    # 2. Fall back to whatever is on PATH
+    found = shutil.which("langgraph")
+    if found:
+        return found
+
+    print(
+        "[cli] ERROR: 'langgraph' executable not found.\n"
+        "       Make sure the venv is activated or run via: uv run cli.py",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
 def main() -> None:
     args, extra = _parse_args()
     env = os.environ.copy()
@@ -76,7 +104,6 @@ def main() -> None:
         else:
             env["OPENAI_MODEL"] = args.model
     else:
-        # Apply defaults only when the env var is not already set
         if backend == "ollama" and "OLLAMA_MODEL" not in env:
             env["OLLAMA_MODEL"] = "gemma4:e2b"
         elif backend == "openai" and "OPENAI_MODEL" not in env:
@@ -98,11 +125,12 @@ def main() -> None:
     print()
 
     # ── Hand off to langgraph dev ─────────────────────────────────────────
-    cmd = [sys.executable, "-m", "langgraph", "dev"] + extra
+    langgraph_bin = _find_langgraph()
+    cmd = [langgraph_bin, "dev"] + extra
     try:
         subprocess.run(cmd, env=env, check=True)
     except KeyboardInterrupt:
-        pass  # clean Ctrl-C exit
+        pass
     except subprocess.CalledProcessError as exc:
         sys.exit(exc.returncode)
 
