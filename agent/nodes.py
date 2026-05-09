@@ -59,6 +59,13 @@ def _try_parse_json(text: str | None) -> dict | None:
 
 
 def _extract_text(content: Any) -> str:
+    """Extract plain text from any LangChain message content format.
+
+    Handles:
+      - str
+      - [{"type": "text", "text": "..."}]   <- LangGraph Studio / API
+      - [{"type": "human", "content": ...}]
+    """
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -66,10 +73,30 @@ def _extract_text(content: Any) -> str:
         for block in content:
             if isinstance(block, str):
                 parts.append(block)
-            elif isinstance(block, dict) and block.get("type") == "text":
-                parts.append(block.get("text", ""))
-        return "".join(parts)
-    return str(content)
+            elif isinstance(block, dict):
+                if block.get("type") == "text":
+                    parts.append(block.get("text", ""))
+                elif "content" in block:
+                    parts.append(_extract_text(block["content"]))
+        return " ".join(p for p in parts if p).strip()
+    return str(content) if content is not None else ""
+
+
+def _resolve_user_query(state: AnalyticsState) -> str:
+    """Return state.user_query if set, otherwise extract from last HumanMessage.
+
+    This handles the LangGraph API input format where the test sends:
+        {"messages": [{"type": "human", "content": [{"type": "text", "text": "..."}]}]}
+    rather than a top-level user_query string.
+    """
+    if state.user_query and state.user_query.strip():
+        return state.user_query.strip()
+    for msg in reversed(state.messages):
+        if isinstance(msg, HumanMessage):
+            text = _extract_text(msg.content)
+            if text:
+                return text
+    return ""
 
 
 def _get_most_recent_table() -> str | None:
@@ -150,11 +177,6 @@ def _get_columns_for_table(table_name: str) -> list[str]:
 def _rows_to_markdown(result: str | None) -> str:
     if not result or result.startswith("ERROR"):
         return result or ""
-    lines = [l for l in result.strip().split("\n") if l.strip()]
-    if not lines:
-        return result
-    if "|" in lines[0]:
-        return result
     return result
 
 
@@ -166,8 +188,6 @@ def _sanitize_sql(sql: str, table_name: str | None) -> str:
         lines = sql.split("\n")
         sql = "\n".join(lines[1:-1]).strip()
     sql = sql.rstrip(";").strip()
-    sql = re.sub(r'"([^"]+)""', r'"\1"', sql)
-    sql = re.sub(r'""([^"]+)"', r'"\1"', sql)
     if not table_name:
         return sql
     columns = _get_columns_for_table(table_name)
@@ -222,11 +242,11 @@ def _handle_load_command(query: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Node: load_file_node  (kept for graph wiring; delegates to helper)
+# Node: load_file_node  (kept for backwards compat; delegates to helper)
 # ---------------------------------------------------------------------------
 
 def load_file_node(state: AnalyticsState) -> dict:
-    result = _handle_load_command(state.user_query or "")
+    result = _handle_load_command(_resolve_user_query(state))
     return result or {}
 
 
@@ -237,8 +257,11 @@ def load_file_node(state: AnalyticsState) -> dict:
 def orchestrator(state: AnalyticsState) -> dict:
     """Classify intent and build a plan, or synthesise the final answer."""
 
+    # Resolve query from state.user_query OR last HumanMessage content blocks
+    current_query = _resolve_user_query(state)
+
     # ── Fast-path: load command (pure regex, no LLM) ──────────────────────
-    load_result = _handle_load_command(state.user_query or "")
+    load_result = _handle_load_command(current_query)
     if load_result is not None:
         return load_result
 
@@ -267,7 +290,7 @@ def orchestrator(state: AnalyticsState) -> dict:
             f"**Step {s.id} — {s.description}**\n{s.result}" for s in completed
         )
         synthesis_prompt = (
-            f"Original question: {state.user_query}\n\n"
+            f"Original question: {current_query}\n\n"
             f"Query results:\n{results_block}\n\n"
             "Write a clear, concise answer to the original question using the results above. "
             "Be specific — include numbers, names, and values from the data. "
@@ -285,7 +308,6 @@ def orchestrator(state: AnalyticsState) -> dict:
     if state.plan and any(s.status == "pending" for s in state.plan):
         return {}
 
-    current_query = state.user_query or ""
     all_tables = _get_all_tables()
     most_recent_table = _get_most_recent_table()
     tables_context = "\n".join(
@@ -393,17 +415,6 @@ Output ONLY the JSON. No markdown, no explanation.
     ]
 
     return {**base_reset, "plan": plan}
-
-
-# ---------------------------------------------------------------------------
-# Node: set_step
-# ---------------------------------------------------------------------------
-
-def set_step(state: AnalyticsState) -> dict:
-    for step in state.plan:
-        if step.status == "pending":
-            return {"current_step": step}
-    return {"current_step": None}
 
 
 # ---------------------------------------------------------------------------
