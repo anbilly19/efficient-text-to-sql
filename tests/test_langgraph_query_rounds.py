@@ -15,7 +15,7 @@ POLL_SECONDS = float(os.getenv("TEST_POLL_SECONDS", "0.5"))
 
 QUERY_ROUNDS = [
     (
-        "round_1_basic_aggregations",
+        "round_01_basic_aggregations",
         [
             "What is the total revenue in the sales1000 table?",
             "What is the average order value?",
@@ -23,7 +23,7 @@ QUERY_ROUNDS = [
         ],
     ),
     (
-        "round_2_date_filtering",
+        "round_02_date_filtering",
         [
             "What is the total revenue for 2023?",
             "What is the month-by-month revenue trend for 2024?",
@@ -31,7 +31,7 @@ QUERY_ROUNDS = [
         ],
     ),
     (
-        "round_3_grouping_ranking",
+        "round_03_grouping_ranking",
         [
             "Which product category had the most orders?",
             "What are the top 5 customers by total spend?",
@@ -39,7 +39,7 @@ QUERY_ROUNDS = [
         ],
     ),
     (
-        "round_4_multi_step_complex",
+        "round_04_multi_step_complex",
         [
             "What is the 2023-2024 revenue growth?",
             "Show me the revenue breakdown by category and year",
@@ -47,7 +47,7 @@ QUERY_ROUNDS = [
         ],
     ),
     (
-        "round_5_window_functions",
+        "round_05_window_functions",
         [
             "Rank customers by total spend and show their percentile",
             "What is the running total of revenue by order date?",
@@ -55,7 +55,7 @@ QUERY_ROUNDS = [
         ],
     ),
     (
-        "round_6_conditional_logic",
+        "round_06_conditional_logic",
         [
             "What percentage of orders were placed on weekends?",
             "How many orders had a revenue above the 90th percentile?",
@@ -63,7 +63,7 @@ QUERY_ROUNDS = [
         ],
     ),
     (
-        "round_7_multi_step_reasoning",
+        "round_07_multi_step_reasoning",
         [
             "Which product category had the fastest revenue growth from 2022 to 2023?",
             "Find customers who placed orders in both 2022 and 2023",
@@ -71,7 +71,7 @@ QUERY_ROUNDS = [
         ],
     ),
     (
-        "round_8_adversarial_duckdb",
+        "round_08_adversarial_duckdb",
         [
             "What is the correlation between order quantity and revenue?",
             "List the bottom 10% of customers by order frequency",
@@ -79,7 +79,7 @@ QUERY_ROUNDS = [
         ],
     ),
     (
-        "round_9_self_joins",
+        "round_09_self_joins",
         [
             "Find customers who have placed more than one order and show their order count",
             "Which customers placed a repeat order within 30 days of their previous order?",
@@ -104,6 +104,24 @@ QUERY_ROUNDS = [
     ),
 ]
 
+# Flatten into (round_name, query_index, query) for parametrize
+_ALL_QUERIES = [
+    pytest.param(
+        round_name,
+        idx,
+        query,
+        id=f"{round_name}[q{idx}]",
+    )
+    for round_name, queries in QUERY_ROUNDS
+    for idx, query in enumerate(queries, start=1)
+]
+
+TOTAL_QUERIES = len(_ALL_QUERIES)  # 33
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 class LangGraphTestError(AssertionError):
     pass
@@ -152,14 +170,14 @@ def _extract_last_ai_text(outputs: dict[str, Any]) -> str:
         if isinstance(content, str) and content.strip():
             return content.strip()
         if isinstance(content, list):
-            chunks = []
-            for block in content:
-                if isinstance(block, dict):
-                    text = block.get("text") or block.get("content") or ""
-                    if text:
-                        chunks.append(text)
-            if chunks:
-                return " ".join(chunks).strip()
+            chunks = [
+                block.get("text") or block.get("content") or ""
+                for block in content
+                if isinstance(block, dict)
+            ]
+            joined = " ".join(c for c in chunks if c).strip()
+            if joined:
+                return joined
     return ""
 
 
@@ -198,6 +216,10 @@ def _run_wait(thread_id: str, user_text: str) -> dict[str, Any]:
     raise LangGraphTestError(f"Run request failed for thread {thread_id}: {last_error}")
 
 
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
 @pytest.fixture(scope="session")
 def thread_id() -> str:
     return _create_thread()
@@ -213,40 +235,46 @@ def loaded_dataset(thread_id: str) -> None:
     )
 
 
-def test_all_11_rounds_of_queries_sequentially(thread_id: str) -> None:
-    failures: list[str] = []
-    total_queries = 0
+# Counter shared across workers (single-process only; fine for sequential runs)
+_query_counter: dict[str, int] = {"n": 0}
 
-    for round_name, queries in QUERY_ROUNDS:
-        for index, query in enumerate(queries, start=1):
-            total_queries += 1
-            outputs = _run_wait(thread_id, query)
-            answer = _extract_last_ai_text(outputs)
-            error = str(outputs.get("error", "") or "")
-            result_text = str(outputs.get("last_query_result", "") or "")
 
-            try:
-                assert answer, f"No final answer returned. Outputs: {outputs}"
-                assert "empty sql" not in answer.lower(), f"Empty SQL surfaced in answer: {answer}"
-                assert "sql error" not in answer.lower(), f"SQL error surfaced in answer: {answer}"
-                assert "wasn't able to answer" not in answer.lower(), f"Failure answer surfaced: {answer}"
-                assert "empty sql" not in error.lower(), f"Empty SQL in error field: {error}"
-                assert not result_text.startswith("ERROR:"), f"Query execution error: {result_text}"
-            except AssertionError as exc:
-                failures.append(
-                    f"{round_name}[{index}] {query}\n"
-                    f"Assertion: {exc}\n"
-                    f"Outputs: {outputs}"
-                )
+# ---------------------------------------------------------------------------
+# Per-query parametrized test  (each query = one pytest node with live result)
+# ---------------------------------------------------------------------------
 
-            time.sleep(POLL_SECONDS)
+@pytest.mark.parametrize("round_name,query_index,query", _ALL_QUERIES)
+def test_query(
+    round_name: str,
+    query_index: int,
+    query: str,
+    thread_id: str,
+    loaded_dataset: None,  # ensures file is loaded before any query runs
+) -> None:
+    _query_counter["n"] += 1
+    n = _query_counter["n"]
+    print(f"\n[{n:>2}/{TOTAL_QUERIES}] {round_name}[q{query_index}]  ➤  {query}")
 
-    if failures:
-        joined = "\n\n".join(failures)
-        raise LangGraphTestError(
-            f"{len(failures)} query checks failed out of {total_queries}.\n\n{joined}"
-        )
+    outputs = _run_wait(thread_id, query)
+    answer = _extract_last_ai_text(outputs)
+    error = str(outputs.get("error", "") or "")
+    result_text = str(outputs.get("last_query_result", "") or "")
 
+    print(f"         answer: {answer[:120]}{'...' if len(answer) > 120 else ''}")
+
+    assert answer, f"No final answer returned.\nOutputs: {outputs}"
+    assert "empty sql" not in answer.lower(), f"Empty SQL surfaced in answer: {answer}"
+    assert "sql error" not in answer.lower(), f"SQL error surfaced in answer: {answer}"
+    assert "wasn't able to answer" not in answer.lower(), f"Failure answer surfaced: {answer}"
+    assert "empty sql" not in error.lower(), f"Empty SQL in error field: {error}"
+    assert not result_text.startswith("ERROR:"), f"Query execution error: {result_text}"
+
+    time.sleep(POLL_SECONDS)
+
+
+# ---------------------------------------------------------------------------
+# Sanity check: catalog shape
+# ---------------------------------------------------------------------------
 
 def test_query_catalog_is_complete() -> None:
     round_count = len(QUERY_ROUNDS)
