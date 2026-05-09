@@ -12,12 +12,12 @@ from langchain_openai import ChatOpenAI
 
 from agent.state import AnalyticsState, PlanStep
 from agent.tools import (
-    execute_sql_query,
-    get_schema_for_table,
-    list_loaded_tables,
+    get_schema,
     load_file,
     profile_column,
     run_sql,
+    run_test_query,
+    lookup_semantic,
 )
 from agent.database import get_connection, get_semantic_context
 
@@ -27,7 +27,6 @@ from agent.database import get_connection, get_semantic_context
 # ---------------------------------------------------------------------------
 
 _MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-SQL_WRITER_TOOLS = [execute_sql_query]
 
 
 def _llm() -> ChatOpenAI:
@@ -153,76 +152,48 @@ def _rows_to_markdown(result: str | None) -> str:
     lines = [l for l in result.strip().split("\n") if l.strip()]
     if not lines:
         return result
-    # Already markdown-ish
     if "|" in lines[0]:
         return result
     return result
 
 
 def _sanitize_sql(sql: str, table_name: str | None) -> str:
-    """Normalise SQL returned by the LLM.
-
-    1. Strip markdown fences.
-    2. Remove trailing semicolons (DuckDB executes fine without them and some
-       multi-statement strings cause errors).
-    3. Fix common quoting mistakes introduced by the LLM:
-         "col""  -> "col"   (stray double closing quote)
-         ""col"  -> "col"   (stray double opening quote)
-    4. Rewrite un-quoted table references to double-quoted form so DuckDB
-       matches the exact dataset_name stored in _schema_catalog.
-    """
+    """Normalise SQL returned by the LLM."""
     if not sql:
         return sql
 
-    # Strip fences
     sql = sql.strip()
     if sql.startswith("```"):
         lines = sql.split("\n")
         sql = "\n".join(lines[1:-1]).strip()
 
-    # Remove trailing semicolons
     sql = sql.rstrip(";").strip()
-
-    # Fix stray double-quotes: "col"" -> "col"
     sql = re.sub(r'"([^"]+)""', r'"\1"', sql)
-    # Fix leading double-quote on identifier: ""col" -> "col"
     sql = re.sub(r'""([^"]+)"', r'"\1"', sql)
 
     if not table_name:
         return sql
 
     columns = _get_columns_for_table(table_name)
-
-    # Quote any column name that contains spaces / special chars and is referenced
-    # unquoted in the SQL.
     for col in columns:
         if re.search(r'[^a-zA-Z0-9_]', col):
             col_pattern = rf'(?:"?\w+"?\.)?\"?{re.escape(col)}\"?'
-            sql = re.sub(
-                col_pattern,
-                f'"{col}"',
-                sql,
-            )
+            sql = re.sub(col_pattern, f'"{col}"', sql)
 
-    # Ensure table reference is properly double-quoted
-    unquoted = re.compile(
-        rf'\b{re.escape(table_name)}\b(?!")',
-        re.IGNORECASE,
-    )
+    unquoted = re.compile(rf'\b{re.escape(table_name)}\b(?!")', re.IGNORECASE)
     sql = unquoted.sub(f'"{table_name}"', sql)
 
     return sql
 
 
 # ---------------------------------------------------------------------------
-# Node: loader  (handles "load …" commands)
+# Node: load_file_node  (handles "load …" commands)
 # ---------------------------------------------------------------------------
 
-def loader(state: AnalyticsState) -> dict:
+def load_file_node(state: AnalyticsState) -> dict:
     """Detect and execute file-load commands, then reset conversation state."""
     query = (state.user_query or "").strip()
 
-    # Pattern: "load <path> as <name>"  or  "load file at <path> as <name>"
     match = re.match(
         r"(?:load\s+(?:file\s+(?:at\s+)?)?)"
         r"([^\s]+(?:\s+[^\s]+)*?)\s+as\s+(\w+)",
@@ -230,12 +201,10 @@ def loader(state: AnalyticsState) -> dict:
         re.IGNORECASE,
     )
     if not match:
-        # Not a load command — pass through unchanged
         return {}
 
     path_str, dataset_name = match.group(1).strip(), match.group(2).strip()
 
-    # Resolve relative to CWD or a known data dir
     path = Path(path_str)
     if not path.exists():
         for candidate in [Path("data") / path_str, Path(".") / path_str]:
@@ -245,9 +214,9 @@ def loader(state: AnalyticsState) -> dict:
 
     try:
         result = load_file.invoke({"path": str(path), "dataset_name": dataset_name})
-        reply = f"✅ Loaded **{dataset_name}** from `{path}`. {result}"
+        reply = f"\u2705 Successfully loaded **{dataset_name}** from `{path}`. You can now ask questions about it."
     except Exception as exc:
-        reply = f"❌ Failed to load `{path_str}`: {exc}"
+        reply = f"\u274c Failed to load `{path_str}`: {exc}"
 
     base_reset: dict = {
         "plan": [],
@@ -351,11 +320,6 @@ def orchestrator(state: AnalyticsState) -> dict:
         return {**base_reset, "final_answer": reply, "messages": [AIMessage(content=reply)]}
 
     # ── LLM planning ──────────────────────────────────────────────────────
-    # NOTE: Do NOT bind tools here. The orchestrator must return plain JSON.
-    # Binding tools causes gpt-4o-mini to emit tool-call objects instead of
-    # text, which makes _try_parse_json return None and breaks routing.
-
-    # Inject semantic context from DuckDB so the LLM understands NIQ column names
     semantic_context = get_semantic_context(most_recent_table)
 
     ORCHESTRATOR_SYSTEM = f"""You are the Orchestrator of a DuckDB analytics agent.
@@ -372,19 +336,12 @@ Most recently loaded table: {most_recent_table or 'none'}
 Classify the user message into exactly ONE intent:
 
 1. ANALYTICS – use when the question asks about data IN a loaded table.
-   This includes:
-   - Counts, sums, averages, filters, rankings, trends
-   - Questions about column values, unique values, or data distribution
-   - Schema / column questions (e.g. "what columns does X have?", "show me the fields")
    {{"intent": "analytics", "plan": [{{"id": 1, "type": "sql", "description": "..."}}]}}
    Step types: "profile" (explore a column) or "sql" (SELECT query).
    Every step description MUST name the exact table.
    Default table if unspecified: "{most_recent_table}".
 
-2. CHITCHAT – use for EVERYTHING else:
-   - Greetings, thanks, how-are-you
-   - General knowledge / world facts (not about the loaded data)
-   - Questions about the agent itself
+2. CHITCHAT – use for EVERYTHING else.
    {{"intent": "chitchat", "final_answer": "<helpful reply>"}}
 
 Decision rule: if the question references a loaded table or asks about data/columns, pick ANALYTICS.
@@ -398,7 +355,6 @@ Output ONLY the JSON. No markdown, no explanation.
     raw_text = _extract_text(response.content)
     parsed = _try_parse_json(raw_text)
 
-    # Fallback: JSON parse failed but a table is loaded → build a default analytics plan
     if parsed is None and most_recent_table:
         parsed = {
             "intent": "analytics",
@@ -418,10 +374,8 @@ Output ONLY the JSON. No markdown, no explanation.
         return {**base_reset, "final_answer": answer,
                 "messages": [AIMessage(content=answer)]}
 
-    # analytics intent
     raw_steps = parsed.get("plan", [])
 
-    # Fallback: analytics intent but empty plan
     if not raw_steps and most_recent_table:
         raw_steps = [{"id": 1, "type": "sql",
                       "description": f"Answer the user question against the {most_recent_table} table: {current_query}"}]
@@ -477,7 +431,6 @@ def profiler(state: AnalyticsState) -> dict:
         ]
         return {"plan": updated}
 
-    # Try to identify which column this profile step targets
     target_col = None
     for col in columns:
         if col.lower() in (step.description or "").lower():
@@ -488,7 +441,7 @@ def profiler(state: AnalyticsState) -> dict:
 
     try:
         result = profile_column.invoke(
-            {"dataset_name": table_name, "column_name": target_col}
+            {"dataset": table_name, "column": target_col}
         )
     except Exception as exc:
         result = f"Profile failed: {exc}"
@@ -564,7 +517,6 @@ def sql_writer(state: AnalyticsState) -> dict:
         updated_plan = _updated_plan("pending", "")
         return {"last_sql": sql, "plan": updated_plan, "current_step": step}
 
-    # Include results from ALL completed prior steps
     prior_step_notes = "\n".join(
         f"- Step {s.id} ({s.description}): {s.result}"
         for s in state.plan
@@ -578,14 +530,20 @@ def sql_writer(state: AnalyticsState) -> dict:
         "Output ONLY: {\"sql\": \"<your SELECT query>\"}"
     )
 
-    # Plain LLM — no tool binding so response is always plain text JSON
     response = _llm().invoke(
         [SystemMessage(content=SQL_WRITER_SYSTEM), HumanMessage(content=prompt)]
     )
     parsed = _try_parse_json(_extract_text(response.content)) or {}
     sql = parsed.get("sql", "")
 
-    # Guard: empty SQL — mark step failed immediately
+    # Fallback: LLM returned a tool call instead of plain JSON
+    if not sql and hasattr(response, "tool_calls") and response.tool_calls:
+        for tc in response.tool_calls:
+            args = tc.get("args") or {}
+            sql = args.get("query") or args.get("sql") or ""
+            if sql:
+                break
+
     if not sql or not sql.strip():
         updated_plan = _updated_plan("failed", "sql_writer produced empty SQL")
         return {
@@ -607,7 +565,6 @@ def sql_writer(state: AnalyticsState) -> dict:
 def execute_sql(state: AnalyticsState) -> dict:
     step = state.current_step
 
-    # Guard: empty SQL
     if not state.last_sql or not state.last_sql.strip():
         def _fail_plan() -> list[PlanStep]:
             return [
@@ -615,7 +572,6 @@ def execute_sql(state: AnalyticsState) -> dict:
                 if state.current_step and s.id == state.current_step.id else s
                 for s in state.plan
             ]
-
         return {
             "last_query_result": "ERROR: empty SQL",
             "plan": _fail_plan(),
@@ -623,7 +579,7 @@ def execute_sql(state: AnalyticsState) -> dict:
         }
 
     try:
-        result = run_sql.invoke({"sql": state.last_sql})
+        result = run_sql.invoke({"query": state.last_sql})
         if isinstance(result, dict):
             rows = result.get("rows", "")
             metadata = {k: v for k, v in result.items() if k != "rows"}
@@ -641,13 +597,13 @@ def execute_sql(state: AnalyticsState) -> dict:
         ]
         return {
             "last_query_result": error_msg,
-            "plan": _updated_plan("failed", error_msg),
+            "plan": updated_plan,
             "last_query_metadata": {},
         }
 
 
 # ---------------------------------------------------------------------------
-# Node: verifier — handles both success verification and SQL error recovery
+# Node: verifier
 # ---------------------------------------------------------------------------
 
 def verifier(state: AnalyticsState) -> dict:
