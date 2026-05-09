@@ -28,6 +28,12 @@ from agent.database import get_connection, get_semantic_context
 
 _MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
+_LOAD_RE = re.compile(
+    r"^(?:load\s+(?:file\s+(?:at\s+)?)?)"
+    r"(.+?)\s+as\s+(\w+)\s*$",
+    re.IGNORECASE,
+)
+
 
 def _llm() -> ChatOpenAI:
     return ChatOpenAI(model=_MODEL, temperature=0)
@@ -37,14 +43,12 @@ def _try_parse_json(text: str | None) -> dict | None:
     if not text:
         return None
     text = text.strip()
-    # Strip markdown fences if present
     if text.startswith("```"):
         lines = text.split("\n")
         text = "\n".join(lines[1:-1]) if len(lines) > 2 else text
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        # Try extracting first {...} block
         match = re.search(r"\{.*\}", text, re.DOTALL)
         if match:
             try:
@@ -55,7 +59,6 @@ def _try_parse_json(text: str | None) -> dict | None:
 
 
 def _extract_text(content: Any) -> str:
-    """Extract plain text from an LLM response content (str or list of blocks)."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -114,7 +117,6 @@ def _get_schema_for_table(table_name: str) -> str:
 
 
 def _extract_table_from_plan(plan: list[PlanStep], query: str) -> str | None:
-    """Guess the target table from the plan descriptions or fall back to most recent."""
     for step in plan:
         if step.description:
             conn = get_connection()
@@ -146,7 +148,6 @@ def _get_columns_for_table(table_name: str) -> list[str]:
 
 
 def _rows_to_markdown(result: str | None) -> str:
-    """Convert a pipe-delimited result string to a markdown table (best-effort)."""
     if not result or result.startswith("ERROR"):
         return result or ""
     lines = [l for l in result.strip().split("\n") if l.strip()]
@@ -158,53 +159,35 @@ def _rows_to_markdown(result: str | None) -> str:
 
 
 def _sanitize_sql(sql: str, table_name: str | None) -> str:
-    """Normalise SQL returned by the LLM."""
     if not sql:
         return sql
-
     sql = sql.strip()
     if sql.startswith("```"):
         lines = sql.split("\n")
         sql = "\n".join(lines[1:-1]).strip()
-
     sql = sql.rstrip(";").strip()
     sql = re.sub(r'"([^"]+)""', r'"\1"', sql)
     sql = re.sub(r'""([^"]+)"', r'"\1"', sql)
-
     if not table_name:
         return sql
-
     columns = _get_columns_for_table(table_name)
     for col in columns:
         if re.search(r'[^a-zA-Z0-9_]', col):
             col_pattern = rf'(?:"?\w+"?\.)?\"?{re.escape(col)}\"?'
             sql = re.sub(col_pattern, f'"{col}"', sql)
-
     unquoted = re.compile(rf'\b{re.escape(table_name)}\b(?!")', re.IGNORECASE)
     sql = unquoted.sub(f'"{table_name}"', sql)
-
     return sql
 
 
-# ---------------------------------------------------------------------------
-# Node: load_file_node  (handles "load …" commands)
-# ---------------------------------------------------------------------------
-
-def load_file_node(state: AnalyticsState) -> dict:
-    """Detect and execute file-load commands, then reset conversation state."""
-    query = (state.user_query or "").strip()
-
-    match = re.match(
-        r"(?:load\s+(?:file\s+(?:at\s+)?)?)"
-        r"([^\s]+(?:\s+[^\s]+)*?)\s+as\s+(\w+)",
-        query,
-        re.IGNORECASE,
-    )
+def _handle_load_command(query: str) -> dict | None:
+    """If query is a load command, execute it and return a state update dict.
+    Returns None if query is not a load command."""
+    match = _LOAD_RE.match(query.strip())
     if not match:
-        return {}
+        return None
 
     path_str, dataset_name = match.group(1).strip(), match.group(2).strip()
-
     path = Path(path_str)
     if not path.exists():
         for candidate in [Path("data") / path_str, Path(".") / path_str]:
@@ -213,12 +196,15 @@ def load_file_node(state: AnalyticsState) -> dict:
                 break
 
     try:
-        result = load_file.invoke({"path": str(path), "dataset_name": dataset_name})
-        reply = f"\u2705 Successfully loaded **{dataset_name}** from `{path}`. You can now ask questions about it."
+        load_file.invoke({"path": str(path), "dataset_name": dataset_name})
+        reply = (
+            f"Successfully loaded **{dataset_name}** from `{path}`. "
+            f"You can now ask questions about it."
+        )
     except Exception as exc:
-        reply = f"\u274c Failed to load `{path_str}`: {exc}"
+        reply = f"Failed to load `{path_str}`: {exc}"
 
-    base_reset: dict = {
+    return {
         "plan": [],
         "current_step": None,
         "last_sql": "",
@@ -228,9 +214,20 @@ def load_file_node(state: AnalyticsState) -> dict:
         "verification_feedback": "",
         "retry_count": 0,
         "error": "",
+        "load_file_path": None,
+        "load_file_dataset": None,
         "final_answer": reply,
+        "messages": [AIMessage(content=reply)],
     }
-    return {**base_reset, "messages": [AIMessage(content=reply)]}
+
+
+# ---------------------------------------------------------------------------
+# Node: load_file_node  (kept for graph wiring; delegates to helper)
+# ---------------------------------------------------------------------------
+
+def load_file_node(state: AnalyticsState) -> dict:
+    result = _handle_load_command(state.user_query or "")
+    return result or {}
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +236,11 @@ def load_file_node(state: AnalyticsState) -> dict:
 
 def orchestrator(state: AnalyticsState) -> dict:
     """Classify intent and build a plan, or synthesise the final answer."""
+
+    # ── Fast-path: load command (pure regex, no LLM) ──────────────────────
+    load_result = _handle_load_command(state.user_query or "")
+    if load_result is not None:
+        return load_result
 
     base_reset: dict = {
         "plan": state.plan,
@@ -253,7 +255,7 @@ def orchestrator(state: AnalyticsState) -> dict:
         "final_answer": "",
     }
 
-    # ── Synthesis: fire when ALL steps are done or failed ─────────────────────
+    # ── Synthesis: fire when ALL steps are done or failed ─────────────────
     if state.plan and all(s.status in ("done", "failed") for s in state.plan):
         completed = [s for s in state.plan if s.status == "done" and s.result]
         if not completed:
@@ -290,7 +292,7 @@ def orchestrator(state: AnalyticsState) -> dict:
         f"- {t}\n{_get_schema_for_table(t)}" for t in all_tables
     ) or "(no tables loaded)"
 
-    # ── Fast-path: schema / column questions ────────────────────────────
+    # ── Fast-path: schema / column questions ─────────────────────────────
     schema_keywords = re.compile(
         r"\b(schema|columns?|fields?|structure|what.+table|show.+table|describe)\b",
         re.IGNORECASE,
@@ -305,7 +307,7 @@ def orchestrator(state: AnalyticsState) -> dict:
             target_table = most_recent_table
 
         if not all_tables:
-            reply = "No tables are loaded yet. Load a file first with: `load file at <path> as <name>`."
+            reply = "No tables are loaded yet. Load a file first with: `load <path> as <name>`."
         elif target_table:
             schema_text = _get_schema_for_table(target_table)
             semantic_text = get_semantic_context(target_table)
@@ -319,7 +321,7 @@ def orchestrator(state: AnalyticsState) -> dict:
 
         return {**base_reset, "final_answer": reply, "messages": [AIMessage(content=reply)]}
 
-    # ── LLM planning ──────────────────────────────────────────────────────
+    # ── LLM planning ─────────────────────────────────────────────────────
     semantic_context = get_semantic_context(most_recent_table)
 
     ORCHESTRATOR_SYSTEM = f"""You are the Orchestrator of a DuckDB analytics agent.
@@ -394,7 +396,7 @@ Output ONLY the JSON. No markdown, no explanation.
 
 
 # ---------------------------------------------------------------------------
-# Node: set_step  (router — picks the next pending step)
+# Node: set_step
 # ---------------------------------------------------------------------------
 
 def set_step(state: AnalyticsState) -> dict:
@@ -440,9 +442,7 @@ def profiler(state: AnalyticsState) -> dict:
         target_col = columns[0]
 
     try:
-        result = profile_column.invoke(
-            {"dataset": table_name, "column": target_col}
-        )
+        result = profile_column.invoke({"dataset": table_name, "column": target_col})
     except Exception as exc:
         result = f"Profile failed: {exc}"
 
@@ -511,11 +511,10 @@ def sql_writer(state: AnalyticsState) -> dict:
             for s in state.plan
         ]
 
-    # On retry, if verifier supplied a corrected SQL, use it directly
+    # On retry, use verifier's corrected SQL directly
     if state.retry_count > 0 and state.last_sql:
         sql = _sanitize_sql(state.last_sql, table_name)
-        updated_plan = _updated_plan("pending", "")
-        return {"last_sql": sql, "plan": updated_plan, "current_step": step}
+        return {"last_sql": sql, "plan": _updated_plan("pending", ""), "current_step": step}
 
     prior_step_notes = "\n".join(
         f"- Step {s.id} ({s.description}): {s.result}"
@@ -527,7 +526,7 @@ def sql_writer(state: AnalyticsState) -> dict:
         f"Schema:\n{schema_text}\n\n"
         + (f"Prior step results:\n{prior_step_notes}\n\n" if prior_step_notes else "")
         + f"Task: {step.description}\n\n"
-        "Output ONLY: {\"sql\": \"<your SELECT query>\"}"
+        'Output ONLY: {"sql": "<your SELECT query>"}'
     )
 
     response = _llm().invoke(
@@ -554,8 +553,7 @@ def sql_writer(state: AnalyticsState) -> dict:
         }
 
     sql = _sanitize_sql(sql, table_name)
-    updated_plan = _updated_plan("pending", "")
-    return {"last_sql": sql, "plan": updated_plan, "current_step": step}
+    return {"last_sql": sql, "plan": _updated_plan("pending", ""), "current_step": step}
 
 
 # ---------------------------------------------------------------------------
@@ -566,15 +564,14 @@ def execute_sql(state: AnalyticsState) -> dict:
     step = state.current_step
 
     if not state.last_sql or not state.last_sql.strip():
-        def _fail_plan() -> list[PlanStep]:
-            return [
-                s.model_copy(update={"status": "failed", "result": "empty SQL"})
-                if state.current_step and s.id == state.current_step.id else s
-                for s in state.plan
-            ]
+        failed_plan = [
+            s.model_copy(update={"status": "failed", "result": "empty SQL"})
+            if step and s.id == step.id else s
+            for s in state.plan
+        ]
         return {
             "last_query_result": "ERROR: empty SQL",
-            "plan": _fail_plan(),
+            "plan": failed_plan,
             "last_query_metadata": {},
         }
 
@@ -583,10 +580,7 @@ def execute_sql(state: AnalyticsState) -> dict:
         if isinstance(result, dict):
             rows = result.get("rows", "")
             metadata = {k: v for k, v in result.items() if k != "rows"}
-            return {
-                "last_query_result": str(rows),
-                "last_query_metadata": metadata,
-            }
+            return {"last_query_result": str(rows), "last_query_metadata": metadata}
         return {"last_query_result": str(result), "last_query_metadata": {}}
     except Exception as exc:
         error_msg = f"ERROR: {exc}"
