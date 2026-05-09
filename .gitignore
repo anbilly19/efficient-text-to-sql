@@ -219,3 +219,4 @@ __marimo__/
 *.pckl
 *.xlsx
 exports/*
+data/parquet/*.parquet
