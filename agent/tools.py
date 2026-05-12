@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Optional
@@ -22,16 +23,43 @@ from agent.database import (
 # Parquet storage
 # ---------------------------------------------------------------------------
 
-# Anchored to the project root (parent of the agent/ package directory).
-# This matches the pattern used by database.py for _DEFAULT_DB_PATH and
-# ensures the path is stable regardless of the working directory at launch
-# time (LangGraph Studio, VS Code, terminal, etc.).
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-PARQUET_STORE = _PROJECT_ROOT / ".local" / "parquet"
+_DEFAULT_PARQUET_STORE = _PROJECT_ROOT / ".local" / "parquet"
+
+
+def _get_parquet_store() -> Path:
+    """Return the active PARQUET_STORE path, reading the env var at call-time.
+
+    During tests, conftest.py sets PARQUET_STORE to a tmp_path *before* any
+    agent module is imported. Reading the env var here (rather than at module
+    import time) ensures the test-injected value is always respected even when
+    sys.modules caching would otherwise serve a stale constant.
+    """
+    env = os.environ.get("PARQUET_STORE")
+    return Path(env) if env else _DEFAULT_PARQUET_STORE
 
 
 def get_parquet_path(dataset_name: str) -> Path:
-    return PARQUET_STORE / f"{dataset_name}.parquet"
+    """Return the absolute path where *dataset_name* is (or will be) stored."""
+    return _get_parquet_store() / f"{dataset_name}.parquet"
+
+
+class _LazyParquetStore:
+    """Proxy that forwards Path operations to _get_parquet_store() at call-time.
+
+    Kept for any code that does `from agent.tools import PARQUET_STORE` and
+    uses it like a Path (e.g. PARQUET_STORE / name, PARQUET_STORE.mkdir()).
+    """
+    def __truediv__(self, other):   return _get_parquet_store() / other
+    def __str__(self):              return str(_get_parquet_store())
+    def __repr__(self):             return repr(_get_parquet_store())
+    def __fspath__(self):           return os.fspath(_get_parquet_store())
+    def mkdir(self, **kw):          return _get_parquet_store().mkdir(**kw)
+    def exists(self):               return _get_parquet_store().exists()
+    def __eq__(self, other):        return _get_parquet_store() == other
+
+
+PARQUET_STORE = _LazyParquetStore()
 
 
 # ---------------------------------------------------------------------------
@@ -413,7 +441,6 @@ def load_file(path: str, dataset_name: str) -> str:
     """
     conn = get_connection()
 
-    # Resolve the source path: try as-is first, then relative to project root.
     file_path = Path(path)
     if not file_path.exists():
         file_path = _PROJECT_ROOT / path
@@ -422,9 +449,11 @@ def load_file(path: str, dataset_name: str) -> str:
     file_path = file_path.resolve()
 
     suffix = file_path.suffix.lower()
-    parquet_path = get_parquet_path(dataset_name)
+    # Resolve store at call-time so PARQUET_STORE env override is always respected.
+    parquet_store = _get_parquet_store()
+    parquet_path = parquet_store / f"{dataset_name}.parquet"
 
-    # ── 1. Read source ────────────────────────────────────────────────────────────────
+    # ── 1. Read source ───────────────────────────────────────────────────────────────────────────────────
     try:
         if suffix in (".xlsx", ".xls"):
             df = pd.read_excel(file_path)
@@ -439,9 +468,9 @@ def load_file(path: str, dataset_name: str) -> str:
     except Exception as exc:
         return f"ERROR reading file: {exc}"
 
-    # ── 2. Persist as Parquet (absolute path stored in registry) ────────────────
+    # ── 2. Persist as Parquet ───────────────────────────────────────────────────────────────────
     try:
-        PARQUET_STORE.mkdir(parents=True, exist_ok=True)
+        parquet_store.mkdir(parents=True, exist_ok=True)
         df.to_parquet(parquet_path, index=False, engine="pyarrow")
     except Exception as exc:
         return f"ERROR writing Parquet: {exc}"
@@ -458,12 +487,7 @@ def load_file(path: str, dataset_name: str) -> str:
     row_count = len(df)
     col_count = len(df.columns)
 
-    # ── 4. Update _data_registry (store absolute path for restart resilience) ───
-    # NOTE: use now() instead of current_timestamp in the ON CONFLICT clause.
-    # DuckDB resolves bare identifiers in ON CONFLICT SET against the target
-    # table's column list first; on an old .duckdb file that lacks ingested_at,
-    # `current_timestamp` is mis-bound as a column name and throws a Binder
-    # Error.  now() is always resolved as a function call, regardless of schema.
+    # ── 4. Update _data_registry ─────────────────────────────────────────────────────
     try:
         conn.execute(
             """
@@ -482,13 +506,13 @@ def load_file(path: str, dataset_name: str) -> str:
     except Exception as exc:
         return f"File loaded but registry update failed: {exc}"
 
-    # ── 5. Index schema into _column_catalog ──────────────────────────────────
+    # ── 5. Index schema into _column_catalog ─────────────────────────────────
     try:
         index_table_schema(conn, dataset_name)
     except Exception as exc:
         return f"File loaded but column catalog indexing failed: {exc}"
 
-    # ── 6. Auto-detect join relationships ─────────────────────────────────────
+    # ── 6. Auto-detect join relationships ──────────────────────────────────────
     inferred = []
     try:
         inferred = infer_and_register_relationships(conn, dataset_name)
