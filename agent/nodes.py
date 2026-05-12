@@ -298,11 +298,31 @@ _META_PATTERNS = [
     re.compile(r"\bare\s+(?:you|any\s+tables?)\s+(?:ready|set\s+up|configured)\b", re.IGNORECASE),
 ]
 
-# DuckDB "table not found" patterns — covers both quoted and unquoted identifiers
+# ---------------------------------------------------------------------------
+# Error pattern matchers
+# ---------------------------------------------------------------------------
+
+# DuckDB "table not found" — covers quoted/unquoted identifiers and truncated form
 _TABLE_NOT_FOUND_RE = re.compile(
     r'(?:Table with name|Table|Catalog Error.*?table)\s+["\']?([\w]+)["\']?\s+does not exist'
     r'|(?:relation|table)\s+["\']?([\w.]+)["\']?\s+does not exist'
     r'|([\w"]+)\s+not exist',
+    re.IGNORECASE,
+)
+
+# DuckDB Binder Error — column referenced in SQL doesn’t exist in the FROM clause.
+# Captures:
+#   group 1  → the missing column name (from “Referenced column X not found”)
+#   group 2  → the same name from the inline “^ column_name” pointer (fallback)
+_BINDER_ERROR_RE = re.compile(
+    r'Binder Error[:\s]+Referenced column\s+["\']?([\w ]+)["\']?\s+not found'
+    r'|Binder Error[:\s]+.*?Column[\s]+["\']?([\w ]+)["\']?\s+not found',
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Extract candidate bindings DuckDB helpfully lists after the error
+_CANDIDATES_RE = re.compile(
+    r'Candidate bindings:\s*([^\n]+)',
     re.IGNORECASE,
 )
 
@@ -402,29 +422,22 @@ def _resolve_user_query(state: AnalyticsState) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Error message builder — table-not-found with loaded-table suggestions
+# Error message builders
 # ---------------------------------------------------------------------------
 
 def _build_table_not_found_message(error: str, sql: str, all_tables: list[str]) -> str | None:
-    """Return a rich user-facing message when DuckDB says a table does not exist.
+    """Rich user-facing message when DuckDB says a table does not exist.
 
-    Extracts the missing table name from the error string, lists all currently
-    loaded tables, and offers a concrete rename hint if the file was ingested
-    under a different alias.
-
-    Returns None when the error is not a table-not-found error so the caller
-    can fall through to the generic handler.
+    Returns None when the error is not a table-not-found error.
     """
     m = _TABLE_NOT_FOUND_RE.search(error)
     if not m:
         return None
 
-    # Pick the first non-None capture group — that's the unrecognised table name
     missing = next((g.strip('"\' ') for g in m.groups() if g), None)
     if not missing:
         return None
 
-    # Collect loaded table info from the registry
     conn = get_connection()
     try:
         reg_rows = conn.execute(
@@ -434,11 +447,10 @@ def _build_table_not_found_message(error: str, sql: str, all_tables: list[str]) 
         reg_rows = []
 
     loaded_lines = [
-        f"  • **{name}** (from `{Path(src).name if src else 'unknown'}`)"
+        f"  \u2022 **{name}** (from `{Path(src).name if src else 'unknown'}`)"
         for name, src in reg_rows
-    ] or ["  • *(no tables loaded)*"]
+    ] or ["  \u2022 *(no tables loaded)*"]
 
-    # Best-guess match: find a loaded table whose name is similar to the missing one
     suggestion = ""
     missing_lower = missing.lower().replace("_", "").replace("-", "")
     for loaded_name, _ in reg_rows:
@@ -448,7 +460,7 @@ def _build_table_not_found_message(error: str, sql: str, all_tables: list[str]) 
             or loaded_name.lower() in missing_lower
         ):
             suggestion = (
-                f"\n💡 **Did you mean `{loaded_name}`?** "
+                f"\n\U0001f4a1 **Did you mean `{loaded_name}`?** "
                 f"The file was ingested as `{loaded_name}`, not `{missing}`.\n"
                 f"Edit your question to use `{loaded_name}` instead, or reload the file with:\n"
                 f"`load <file> as {missing}`"
@@ -456,7 +468,7 @@ def _build_table_not_found_message(error: str, sql: str, all_tables: list[str]) 
             break
 
     lines = [
-        f"❌ **Table `{missing}` does not exist** in the current session.",
+        f"\u274c **Table `{missing}` does not exist** in the current session.",
         "",
         "**Currently loaded tables:**",
         *loaded_lines,
@@ -466,6 +478,91 @@ def _build_table_not_found_message(error: str, sql: str, all_tables: list[str]) 
         f"- Replace `{missing}` in your question with one of the table names above, **or**",
         f"- Reload your file under the expected name: `load <file> as {missing}`",
     ]
+    return "\n".join(lines)
+
+
+def _build_binder_error_message(error: str, sql: str) -> str | None:
+    """Rich user-facing message when DuckDB raises a Binder Error (column not found).
+
+    Strategy:
+      1. Extract the missing column name from the error string.
+      2. Look up the DuckDB candidate bindings that DuckDB already reported.
+      3. Look up the actual columns from _column_catalog for each table in the SQL.
+      4. Find the closest real column names via substring matching.
+      5. Return a plain-English explanation — no retry, no corrected SQL.
+
+    Returns None when the error is not a Binder Error.
+    """
+    if "Binder Error" not in error:
+        return None
+
+    bm = _BINDER_ERROR_RE.search(error)
+    missing_col = next((g.strip('"\' ') for g in (bm.groups() if bm else []) if g), None)
+
+    # DuckDB already tells us the valid bindings — use them directly
+    candidates_match = _CANDIDATES_RE.search(error)
+    duckdb_candidates: list[str] = []
+    if candidates_match:
+        raw = candidates_match.group(1)
+        duckdb_candidates = [c.strip().strip('"') for c in raw.split(",") if c.strip()]
+
+    # Also look up catalog columns for the tables involved in the SQL
+    catalog_cols: dict[str, list[str]] = {}   # table_name → [col, ...]
+    all_tables = _all_table_names()
+    conn = get_connection()
+    for table in all_tables:
+        # Only look up tables that are actually referenced in the SQL
+        if table.lower() not in sql.lower():
+            continue
+        try:
+            rows = conn.execute(
+                "SELECT column_name FROM _column_catalog WHERE dataset_name = ? ORDER BY column_name",
+                [table],
+            ).fetchall()
+            catalog_cols[table] = [r[0] for r in rows]
+        except Exception:
+            pass
+
+    # Fuzzy-match: find columns whose name overlaps with the missing column
+    suggestions: list[str] = []
+    if missing_col:
+        missing_norm = missing_col.lower().replace("_", "").replace(" ", "")
+        for tbl, cols in catalog_cols.items():
+            for col in cols:
+                col_norm = col.lower().replace("_", "").replace(" ", "")
+                if missing_norm in col_norm or col_norm in missing_norm:
+                    suggestions.append(f'`{tbl}."{col}"`')
+
+    # Build the message
+    lines: list[str] = []
+
+    if missing_col:
+        lines.append(f'\u274c **Column `{missing_col}` does not exist** in the loaded table(s).')
+    else:
+        lines.append('\u274c **A column referenced in the query does not exist** in the loaded table(s).')
+
+    lines.append("")
+
+    if duckdb_candidates:
+        lines.append(f"**DuckDB reported these available columns:** {', '.join(f'`{c}`' for c in duckdb_candidates)}")
+        lines.append("")
+
+    if catalog_cols:
+        lines.append("**Full column list for the queried table(s):**")
+        for tbl, cols in catalog_cols.items():
+            col_list = ", ".join(f'"{c}"' for c in cols)
+            lines.append(f"  \u2022 **{tbl}**: {col_list}")
+        lines.append("")
+
+    if suggestions:
+        lines.append(f"\U0001f4a1 **Closest match(es):** {', '.join(suggestions)}")
+        lines.append("Rephrase your question using one of those column names.")
+    elif missing_col:
+        lines.append(
+            f"\U0001f4a1 No column named `{missing_col}` exists in any loaded table. "
+            "Please rephrase your question using one of the column names listed above."
+        )
+
     return "\n".join(lines)
 
 
@@ -622,16 +719,23 @@ def orchestrator(state: AnalyticsState) -> dict:
         all_failed = all(s.status == "failed" for s in state.plan)
         if all_failed:
             err = state.error or "The query could not be executed."
-            # ── Table-not-found: give a rich, actionable message ───────────
-            rich_msg = _build_table_not_found_message(err, state.last_sql, all_tables)
-            if rich_msg:
-                final = rich_msg
-            else:
-                final = (
-                    f"I wasn't able to answer that question due to a SQL error:\n\n"
-                    f"```\n{err.replace('ERROR: ', '').strip()}\n```\n\n"
-                    "Could you rephrase, or check that the column names are correct?"
-                )
+
+            # Priority 1: Binder Error (column not found) — explain + full schema, no retry
+            binder_msg = _build_binder_error_message(err, state.last_sql or "")
+            if binder_msg:
+                return {**base_reset, "final_answer": binder_msg, "messages": [AIMessage(content=binder_msg)]}
+
+            # Priority 2: Table not found — alias hint
+            table_msg = _build_table_not_found_message(err, state.last_sql or "", all_tables)
+            if table_msg:
+                return {**base_reset, "final_answer": table_msg, "messages": [AIMessage(content=table_msg)]}
+
+            # Fallback: generic error
+            final = (
+                f"I wasn't able to answer that question due to a SQL error:\n\n"
+                f"```\n{err.replace('ERROR: ', '').strip()}\n```\n\n"
+                "Could you rephrase, or check that the column names are correct?"
+            )
         else:
             row_count = state.last_query_metadata.get("row_count", "?")
             table_preview = _rows_to_markdown(state.last_query_result)
@@ -983,6 +1087,19 @@ def execute_sql(state: AnalyticsState) -> dict:
         ]
 
     if result.startswith("ERROR"):
+        error_body = result[len("ERROR:"):].strip() if result.startswith("ERROR:") else result
+
+        # Short-circuit: Binder Errors are unrecoverable — the column simply does not
+        # exist. Mark the step failed immediately so the orchestrator synthesis block
+        # can produce a schema-aware explanation without any verifier retry loop.
+        if "Binder Error" in error_body:
+            return {
+                "last_query_result": result,
+                "last_query_metadata": {},
+                "plan": _updated_plan("failed", error_body),
+                "error": error_body,
+            }
+
         return {
             "last_query_result": result,
             "last_query_metadata": {},
@@ -1008,6 +1125,17 @@ def verifier(state: AnalyticsState) -> dict:
     is_error = state.last_query_result.startswith("ERROR") if state.last_query_result else False
     row_count = state.last_query_metadata.get("row_count", "unknown")
     table_preview = _rows_to_markdown(state.last_query_result)
+
+    # Binder Errors are already marked failed with status="failed" by execute_sql.
+    # The orchestrator synthesis block handles them directly via _build_binder_error_message.
+    # There is nothing for the verifier to correct here — skip immediately.
+    if is_error and state.error and "Binder Error" in state.error:
+        return {
+            "verification_verdict": "fail",
+            "verification_feedback": state.error,
+            "current_step": None,
+            "retry_count": state.retry_count,
+        }
 
     # ── Cardinality check ──────────────────────────────────────────────────
     cardinality_warning = ""
