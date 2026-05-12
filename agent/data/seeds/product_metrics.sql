@@ -1,0 +1,6 @@
+-- REMOVED: this file derived product_metrics directly from sales1000 via GROUP BY.
+-- The correct approach is to generate an independent Excel file and upload it
+-- via the agent.  See scripts/generate_test_data.py.
+--
+-- This placeholder is kept so git history is readable.  The file is intentionally
+-- empty of any executable SQL.
