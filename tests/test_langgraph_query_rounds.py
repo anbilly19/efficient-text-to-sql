@@ -102,6 +102,30 @@ QUERY_ROUNDS = [
             "Show the distribution of order counts per customer (how many customers placed 1, 2, 3... orders)",
         ],
     ),
+    # ------------------------------------------------------------------
+    # round_12 — multi-table: forces the agent to JOIN across the three
+    # seeded tables (sales1000, sales_rep_targets, product_metrics).
+    # Pre-requisite: python scripts/seed_multi_table.py
+    # Skip this round if the seed tables are absent:
+    #   pytest tests/test_langgraph_query_rounds.py -k "not round_12" -v
+    # Run only this round:
+    #   pytest tests/test_langgraph_query_rounds.py -k round_12 -v
+    # ------------------------------------------------------------------
+    (
+        "round_12_multi_table",
+        [
+            # sales1000 × sales_rep_targets
+            "Which sales reps are below their annual quota? Show actual revenue vs quota and the gap.",
+            "Rank sales reps by quota attainment (actual revenue / annual quota) within each region.",
+            "What is the total quota gap across all regions combined?",
+            # sales1000 × product_metrics
+            "Which products have a higher average unit price than the historical average in product_metrics?",
+            "Show total revenue per product category and compare it to the baseline revenue in product_metrics.",
+            # sales1000 × sales_rep_targets × product_metrics (three-table)
+            "For each sales rep, break down their revenue by product category and show what share of their quota each category contributes.",
+            "Which sales reps below quota are selling the top-5 revenue products? Show the rep, region, quota gap, and the top product they sell.",
+        ],
+    ),
 ]
 
 # Flatten into (round_name, query_index, query) for parametrize
@@ -116,7 +140,7 @@ _ALL_QUERIES = [
     for idx, query in enumerate(queries, start=1)
 ]
 
-TOTAL_QUERIES = len(_ALL_QUERIES)  # 33
+TOTAL_QUERIES = len(_ALL_QUERIES)  # 40
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +264,7 @@ _query_counter: dict[str, int] = {"n": 0}
 
 
 # ---------------------------------------------------------------------------
-# Per-query parametrized test  (each query = one pytest node with live result)
+# Per-query parametrized test
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("round_name,query_index,query", _ALL_QUERIES)
@@ -249,7 +273,7 @@ def test_query(
     query_index: int,
     query: str,
     thread_id: str,
-    loaded_dataset: None,  # ensures file is loaded before any query runs
+    loaded_dataset: None,
 ) -> None:
     _query_counter["n"] += 1
     n = _query_counter["n"]
@@ -279,5 +303,5 @@ def test_query(
 def test_query_catalog_is_complete() -> None:
     round_count = len(QUERY_ROUNDS)
     query_count = sum(len(queries) for _, queries in QUERY_ROUNDS)
-    assert round_count == 11, f"Expected 11 rounds, found {round_count}"
-    assert query_count == 33, f"Expected 33 total queries, found {query_count}"
+    assert round_count == 12, f"Expected 12 rounds, found {round_count}"
+    assert query_count == 40, f"Expected 40 total queries, found {query_count}"
