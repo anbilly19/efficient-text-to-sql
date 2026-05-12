@@ -75,7 +75,6 @@ class TestParquetPersistence:
     """load_file converts Excel -> Parquet and registers a DuckDB view."""
 
     def test_parquet_file_created(self, tmp_path):
-        # PARQUET_STORE and get_parquet_path live in agent.tools on this branch
         from agent.tools import load_file, PARQUET_STORE, get_parquet_path  # noqa: F401
 
         xl = tmp_path / "sales.xlsx"
@@ -113,20 +112,55 @@ class TestParquetPersistence:
         assert row[0] == 5
 
     def test_view_survives_connection_reset(self, tmp_path):
-        """Simulate a server restart: reset singleton, reconnect, view still works."""
-        from agent.tools import load_file
+        """Simulate a server restart: _data_registry persists in a file DB so
+        _auto_reattach_parquet can rebuild the view on reconnect.
+
+        This test cannot use :memory: because resetting _conn destroys the
+        entire in-memory database including _data_registry. A temp .duckdb
+        file is used instead so the registry survives the singleton reset.
+        """
         import agent.database as db_module
 
-        xl = tmp_path / "sales4.xlsx"
-        _make_sample_excel(xl)
-        load_file.invoke({"path": str(xl), "dataset_name": "sales4"})
+        # Switch to a temp file DB just for this test.
+        file_db = tmp_path / "restart_test.duckdb"
+        prev_db_path = os.environ.get("DUCKDB_PATH")
+        os.environ["DUCKDB_PATH"] = str(file_db)
 
+        # Purge singleton and modules so they bind against the new path.
         db_module._conn = None
+        for mod_name in [m for m in sys.modules if m.startswith("agent")]:
+            del sys.modules[mod_name]
 
-        from agent.database import get_connection
-        conn = get_connection()  # triggers _auto_reattach_parquet
-        row = conn.execute('SELECT COUNT(*) FROM "sales4"').fetchone()
-        assert row[0] == 5, "View not restored after connection reset"
+        try:
+            from agent.tools import load_file
+            import agent.database as db_module  # noqa: F811
+
+            xl = tmp_path / "sales4.xlsx"
+            _make_sample_excel(xl)
+            load_file.invoke({"path": str(xl), "dataset_name": "sales4"})
+
+            # Simulate restart: drop singleton — file DB keeps _data_registry.
+            db_module._conn = None
+            for mod_name in [m for m in sys.modules if m.startswith("agent")]:
+                del sys.modules[mod_name]
+
+            from agent.database import get_connection
+            conn = get_connection()  # triggers _auto_reattach_parquet from registry
+            row = conn.execute('SELECT COUNT(*) FROM "sales4"').fetchone()
+            assert row[0] == 5, "View not restored after connection reset"
+
+        finally:
+            # Restore :memory: for all subsequent tests.
+            import agent.database as db_m
+            db_m._conn = None
+            for mod_name in [m for m in sys.modules if m.startswith("agent")]:
+                del sys.modules[mod_name]
+            if prev_db_path is not None:
+                os.environ["DUCKDB_PATH"] = prev_db_path
+            else:
+                os.environ["DUCKDB_PATH"] = ":memory:"
+            import agent.database as db_m  # noqa: F811
+            db_m._conn = None
 
     def test_date_columns_stored_as_native_type(self, tmp_path):
         """order_date (ISO strings in Excel) should land as datetime in Parquet."""
