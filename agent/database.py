@@ -19,8 +19,6 @@ _conn: duckdb.DuckDBPyConnection | None = None
 _lock = threading.Lock()
 
 # Absolute path to the project root (parent of the agent/ package directory).
-# Anchoring here means the DB location is stable regardless of the working
-# directory at launch time (LangGraph Studio, VS Code, terminal, etc.).
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _DEFAULT_DB_PATH = _PROJECT_ROOT / ".local" / "duckdb" / "efficient-text-to-sql.duckdb"
 
@@ -45,16 +43,41 @@ def get_connection() -> duckdb.DuckDBPyConnection:
 
 
 # ---------------------------------------------------------------------------
-# Metadata table bootstrap
+# Metadata table bootstrap + schema migration
 # ---------------------------------------------------------------------------
 
-def _ensure_metadata_tables(conn: duckdb.DuckDBPyConnection) -> None:
-    """Create all metadata tables if they do not exist.
+def _add_column_if_missing(
+    conn: duckdb.DuckDBPyConnection,
+    table: str,
+    column: str,
+    definition: str,
+) -> None:
+    """ALTER TABLE ADD COLUMN only if the column does not already exist.
 
-    These tables are the single source of truth for schema, relationships,
-    and data registry. They survive process restarts because the DB is
-    file-backed by default.
+    DuckDB does not support IF NOT EXISTS on ALTER TABLE ADD COLUMN, so we
+    check information_schema first.
     """
+    exists = conn.execute(
+        """
+        SELECT COUNT(*) FROM information_schema.columns
+        WHERE table_name = ? AND column_name = ?
+        """,
+        [table, column],
+    ).fetchone()[0]
+    if not exists:
+        conn.execute(f'ALTER TABLE "{table}" ADD COLUMN {column} {definition}')
+
+
+def _ensure_metadata_tables(conn: duckdb.DuckDBPyConnection) -> None:
+    """Create all metadata tables if they do not exist, then migrate any
+    columns that are missing from older on-disk schemas.
+
+    Two-phase approach:
+      1. CREATE TABLE IF NOT EXISTS — no-op if the table already exists.
+      2. _add_column_if_missing() for every column added after the initial
+         schema so that existing .duckdb files are upgraded automatically.
+    """
+    # ── _data_registry ─────────────────────────────────────────────────────────────
     conn.execute("""
         CREATE TABLE IF NOT EXISTS _data_registry (
             dataset_name  VARCHAR NOT NULL PRIMARY KEY,
@@ -65,21 +88,33 @@ def _ensure_metadata_tables(conn: duckdb.DuckDBPyConnection) -> None:
             column_count  INTEGER
         )
     """)
+    # Migration: add columns introduced after the initial schema
+    _add_column_if_missing(conn, "_data_registry", "ingested_at",
+                           "TIMESTAMP DEFAULT current_timestamp")
+    _add_column_if_missing(conn, "_data_registry", "row_count",   "BIGINT")
+    _add_column_if_missing(conn, "_data_registry", "column_count", "INTEGER")
 
+    # ── _column_catalog ───────────────────────────────────────────────────────────
     conn.execute("""
         CREATE TABLE IF NOT EXISTS _column_catalog (
             dataset_name  VARCHAR NOT NULL,
             column_name   VARCHAR NOT NULL,
-            column_type   VARCHAR,           -- DuckDB type string
+            column_type   VARCHAR,
             is_metric     BOOLEAN DEFAULT FALSE,
             is_dimension  BOOLEAN DEFAULT FALSE,
             is_join_key   BOOLEAN DEFAULT FALSE,
             description   VARCHAR,
-            sample_values VARCHAR,           -- JSON array of up to 5 representative values
+            sample_values VARCHAR,
             PRIMARY KEY (dataset_name, column_name)
         )
     """)
+    _add_column_if_missing(conn, "_column_catalog", "is_metric",     "BOOLEAN DEFAULT FALSE")
+    _add_column_if_missing(conn, "_column_catalog", "is_dimension",  "BOOLEAN DEFAULT FALSE")
+    _add_column_if_missing(conn, "_column_catalog", "is_join_key",   "BOOLEAN DEFAULT FALSE")
+    _add_column_if_missing(conn, "_column_catalog", "description",   "VARCHAR")
+    _add_column_if_missing(conn, "_column_catalog", "sample_values", "VARCHAR")
 
+    # ── _relationships ──────────────────────────────────────────────────────────────
     conn.execute("""
         CREATE TABLE IF NOT EXISTS _relationships (
             relationship_id  INTEGER PRIMARY KEY,
@@ -87,31 +122,38 @@ def _ensure_metadata_tables(conn: duckdb.DuckDBPyConnection) -> None:
             left_column      VARCHAR NOT NULL,
             right_table      VARCHAR NOT NULL,
             right_column     VARCHAR NOT NULL,
-            cardinality      VARCHAR DEFAULT 'many-to-one',  -- e.g. many-to-one, one-to-one
+            cardinality      VARCHAR DEFAULT 'many-to-one',
             description      VARCHAR,
             added_at         TIMESTAMP DEFAULT current_timestamp,
             UNIQUE (left_table, left_column, right_table, right_column)
         )
     """)
+    _add_column_if_missing(conn, "_relationships", "cardinality",
+                           "VARCHAR DEFAULT 'many-to-one'")
+    _add_column_if_missing(conn, "_relationships", "description", "VARCHAR")
+    _add_column_if_missing(conn, "_relationships", "added_at",
+                           "TIMESTAMP DEFAULT current_timestamp")
 
     conn.execute("""
         CREATE SEQUENCE IF NOT EXISTS _rel_seq START 1
     """)
 
+    # ── _table_context ──────────────────────────────────────────────────────────────
     conn.execute("""
         CREATE TABLE IF NOT EXISTS _table_context (
             dataset_name  VARCHAR NOT NULL PRIMARY KEY,
-            summary       VARCHAR,        -- one sentence: what this table contains
-            grain         VARCHAR,        -- e.g. "one row per order per sales rep"
-            tags          VARCHAR,        -- JSON array of keyword tags
+            summary       VARCHAR,
+            grain         VARCHAR,
+            tags          VARCHAR,
             updated_at    TIMESTAMP DEFAULT current_timestamp
         )
     """)
+    _add_column_if_missing(conn, "_table_context", "grain",      "VARCHAR")
+    _add_column_if_missing(conn, "_table_context", "tags",       "VARCHAR")
+    _add_column_if_missing(conn, "_table_context", "updated_at",
+                           "TIMESTAMP DEFAULT current_timestamp")
 
-    # dataset_name uses '' as the sentinel for "applies to all tables".
-    # DuckDB does not support function expressions (e.g. COALESCE) inside a
-    # PRIMARY KEY definition, so we use NOT NULL DEFAULT '' and a UNIQUE
-    # constraint instead — semantically identical.
+    # ── _semantic_map ───────────────────────────────────────────────────────────────
     conn.execute("""
         CREATE TABLE IF NOT EXISTS _semantic_map (
             term          VARCHAR NOT NULL,
@@ -121,6 +163,7 @@ def _ensure_metadata_tables(conn: duckdb.DuckDBPyConnection) -> None:
             UNIQUE (term, dataset_name)
         )
     """)
+    _add_column_if_missing(conn, "_semantic_map", "description", "VARCHAR")
 
 
 # ---------------------------------------------------------------------------
@@ -155,14 +198,7 @@ def _auto_reattach_parquet(conn: duckdb.DuckDBPyConnection) -> None:
 # ---------------------------------------------------------------------------
 
 def index_table_schema(conn: duckdb.DuckDBPyConnection, dataset_name: str) -> None:
-    """Introspect a newly loaded table and populate _column_catalog.
-
-    Called automatically by load_file() after the table is created.
-    Classifies each column as metric / dimension based on DuckDB type.
-    Collects up to 5 sample values for context.
-
-    Existing catalog entries for this table are replaced (re-ingestion).
-    """
+    """Introspect a newly loaded table and populate _column_catalog."""
     conn.execute(
         "DELETE FROM _column_catalog WHERE dataset_name = ?",
         [dataset_name],
@@ -183,7 +219,6 @@ def index_table_schema(conn: duckdb.DuckDBPyConnection, dataset_name: str) -> No
         )
         is_dimension = not is_metric
 
-        # Collect sample values (up to 5 distinct non-null)
         try:
             sample_rows = conn.execute(
                 f'SELECT DISTINCT "{col_name}" FROM "{dataset_name}" '
@@ -200,8 +235,8 @@ def index_table_schema(conn: duckdb.DuckDBPyConnection, dataset_name: str) -> No
             col_type,
             is_metric,
             is_dimension,
-            False,   # is_join_key — set explicitly via register_relationship()
-            None,    # description — set by agent or human later
+            False,
+            None,
             sample_values,
         ))
 
@@ -214,14 +249,7 @@ def index_table_schema(conn: duckdb.DuckDBPyConnection, dataset_name: str) -> No
 
 
 def infer_and_register_relationships(conn: duckdb.DuckDBPyConnection, new_table: str) -> list[dict]:
-    """Auto-detect probable join keys between new_table and all existing tables.
-
-    Strategy: find columns with identical names and compatible types across tables.
-    Inferred relationships are inserted with cardinality='inferred'.
-    Returns a list of dicts describing what was registered.
-
-    NOTE: Inference is best-effort. Use register_relationship() for authoritative joins.
-    """
+    """Auto-detect probable join keys between new_table and all existing tables."""
     existing_tables = conn.execute(
         "SELECT DISTINCT dataset_name FROM _column_catalog WHERE dataset_name != ?",
         [new_table],
@@ -295,11 +323,7 @@ def register_relationship(
     cardinality: str = "many-to-one",
     description: str | None = None,
 ) -> None:
-    """Explicitly register an authoritative join relationship.
-
-    This is the definitive version; it overwrites any inferred entry for the
-    same (left_table, left_column, right_table, right_column) quad.
-    """
+    """Explicitly register an authoritative join relationship."""
     conn.execute(
         """
         INSERT INTO _relationships
@@ -325,11 +349,7 @@ def register_relationship(
 # ---------------------------------------------------------------------------
 
 def get_schema_context(table_names: list[str]) -> str:
-    """Return a compact schema block for the given tables.
-
-    Used by the sql_writer node to inject only the tables relevant to
-    the current query — not the full catalog.
-    """
+    """Return a compact schema block for the given tables."""
     conn = get_connection()
     lines = []
     for tbl in table_names:
@@ -382,10 +402,7 @@ def get_schema_context(table_names: list[str]) -> str:
 
 
 def get_table_summaries() -> str:
-    """Return a short listing of all registered tables with their summaries.
-
-    Used by the orchestrator's select_relevant_tables pass.
-    """
+    """Return a short listing of all registered tables with their summaries."""
     conn = get_connection()
     rows = conn.execute(
         """
