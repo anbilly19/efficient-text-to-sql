@@ -1,3 +1,18 @@
+"""
+test_langgraph_query_rounds.py
+
+Run a specific round:
+    pytest tests/test_langgraph_query_rounds.py -m round_01 -v
+
+Run from round_05 onward:
+    pytest tests/test_langgraph_query_rounds.py -m "round_05 or round_06 or round_07 or round_08 or round_09 or round_10 or round_11 or round_12" -v
+
+Skip multi-table rounds:
+    pytest tests/test_langgraph_query_rounds.py -m "not round_12" -v
+
+All rounds:
+    pytest tests/test_langgraph_query_rounds.py -v
+"""
 import os
 import time
 from typing import Any
@@ -9,27 +24,34 @@ import requests
 LANGGRAPH_API_URL = os.getenv("LANGGRAPH_API_URL", "http://127.0.0.1:2024").rstrip("/")
 ASSISTANT_ID = os.getenv("ASSISTANT_ID", "fe096781-5601-53d2-b2f6-0d3403f7e9ca")
 
-# Load commands issued once per session before any query runs.
-# Override any individual command via env vars if the filenames differ.
-LOAD_SALES       = os.getenv("LOAD_SALES",       "load data/sample_sales_1000.xlsx as sales1000")
-LOAD_REP_TARGETS = os.getenv("LOAD_REP_TARGETS", "load data/sales_rep_targets.xlsx as sales_rep_targets")
+LOAD_SALES        = os.getenv("LOAD_SALES",        "load data/sample_sales_1000.xlsx as sales1000")
+LOAD_REP_TARGETS  = os.getenv("LOAD_REP_TARGETS",  "load data/sales_rep_targets.xlsx as sales_rep_targets")
 LOAD_PROD_METRICS = os.getenv("LOAD_PROD_METRICS", "load data/product_metrics.xlsx as product_metrics")
 
 REQUEST_TIMEOUT = float(os.getenv("TEST_REQUEST_TIMEOUT", "120"))
 POLL_SECONDS    = float(os.getenv("TEST_POLL_SECONDS", "0.5"))
 
 
+# ---------------------------------------------------------------------------
+# Query rounds
+# Each entry: (round_id, mark_label, [queries])
+# round_id   -> used in pytest param ids
+# mark_label -> used with -m flag for selective runs
+# ---------------------------------------------------------------------------
+
 QUERY_ROUNDS = [
     (
         "round_01_basic_aggregations",
+        "round_01",
         [
             "What is the total revenue in the sales1000 table?",
             "What is the average order value?",
-            "How many unique customers are there?",
+            "How many unique sales reps are there?",
         ],
     ),
     (
         "round_02_date_filtering",
+        "round_02",
         [
             "What is the total revenue for 2023?",
             "What is the month-by-month revenue trend for 2024?",
@@ -38,14 +60,16 @@ QUERY_ROUNDS = [
     ),
     (
         "round_03_grouping_ranking",
+        "round_03",
         [
             "Which product category had the most orders?",
-            "What are the top 5 customers by total spend?",
+            "What are the top 5 regions by total revenue?",
             "What percentage of orders were above average order value?",
         ],
     ),
     (
         "round_04_multi_step_complex",
+        "round_04",
         [
             "What is the 2023-2024 revenue growth?",
             "Show me the revenue breakdown by category and year",
@@ -54,14 +78,16 @@ QUERY_ROUNDS = [
     ),
     (
         "round_05_window_functions",
+        "round_05",
         [
-            "Rank customers by total spend and show their percentile",
+            "Rank regions by total revenue and show their percentile",
             "What is the running total of revenue by order date?",
             "Show month-over-month revenue growth rate for 2023",
         ],
     ),
     (
         "round_06_conditional_logic",
+        "round_06",
         [
             "What percentage of orders were placed on weekends?",
             "How many orders had a revenue above the 90th percentile?",
@@ -70,82 +96,87 @@ QUERY_ROUNDS = [
     ),
     (
         "round_07_multi_step_reasoning",
+        "round_07",
         [
             "Which product category had the fastest revenue growth from 2022 to 2023?",
-            "Find customers who placed orders in both 2022 and 2023",
+            "Which regions had orders in both 2022 and 2023?",
             "Show the top category per region by total revenue",
         ],
     ),
     (
         "round_08_adversarial_duckdb",
+        "round_08",
         [
-            "What is the correlation between order quantity and revenue?",
-            "List the bottom 10% of customers by order frequency",
+            "What is the correlation between unit price and revenue?",
+            "List the bottom 10% of sales reps by order frequency",
             "Which day of the week generates the most revenue on average?",
         ],
     ),
     (
         "round_09_self_joins",
+        "round_09",
         [
-            "Find customers who have placed more than one order and show their order count",
-            "Which customers placed a repeat order within 30 days of their previous order?",
-            "Show pairs of orders from the same customer where the second order was higher value than the first",
+            "Which sales reps have placed more than one order and what is their order count?",
+            "Which sales reps had orders in consecutive months?",
+            "Show pairs of orders from the same sales rep where the second order was higher value than the first",
         ],
     ),
     (
         "round_10_subqueries_ctes",
+        "round_10",
         [
             "Find orders where the revenue is above the average revenue for that product category",
-            "Show customers whose total spend is above the average customer spend",
-            "Which customers placed their first order in 2023 and are still active in 2024?",
+            "Show regions whose total revenue is above the average region revenue",
+            "Which sales reps placed their first order in 2023 and also had orders in 2024?",
         ],
     ),
     (
         "round_11_aggregation_on_aggregation",
+        "round_11",
         [
-            "What is the average number of orders per customer?",
-            "What is the average order value per customer, and what is the average of those averages?",
-            "Show the distribution of order counts per customer (how many customers placed 1, 2, 3... orders)",
+            "What is the average number of orders per sales rep?",
+            "What is the average order value per sales rep, and what is the average of those averages?",
+            "Show the distribution of order counts per sales rep (how many reps placed 1, 2, 3... orders)",
         ],
     ),
-    # ------------------------------------------------------------------
-    # round_12 — multi-table: forces the agent to JOIN across the three
-    # seeded tables (sales1000, sales_rep_targets, product_metrics).
-    # Skip this round:
-    #   pytest tests/test_langgraph_query_rounds.py -k "not round_12" -v
-    # Run only this round:
-    #   pytest tests/test_langgraph_query_rounds.py -k round_12 -v
-    # ------------------------------------------------------------------
     (
         "round_12_multi_table",
+        "round_12",
         [
-            # sales1000 × sales_rep_targets
             "Which sales reps are below their annual quota? Show actual revenue vs quota and the gap.",
             "Rank sales reps by quota attainment (actual revenue / annual quota) within each region.",
             "What is the total quota gap across all regions combined?",
-            # sales1000 × product_metrics
             "Which products have a higher average unit price than the historical average in product_metrics?",
             "Show total revenue per product category and compare it to the baseline revenue in product_metrics.",
-            # sales1000 × sales_rep_targets × product_metrics (three-table)
             "For each sales rep, break down their revenue by product category and show what share of their quota each category contributes.",
             "Which sales reps below quota are selling the top-5 revenue products? Show the rep, region, quota gap, and the top product they sell.",
         ],
     ),
 ]
 
-# Flatten into (round_name, query_index, query) for parametrize
+# Register one pytest mark per round so -m round_NN works.
+# In pyproject.toml add:
+#   [tool.pytest.ini_options]
+#   markers = ["round_01: ...", "round_02: ...", ...]
+_ROUND_MARKS = {
+    mark: pytest.mark.__getattr__(mark)
+    for _, mark, _ in QUERY_ROUNDS
+}
+
+# Flatten into pytest.param objects, each decorated with its round mark.
 _ALL_QUERIES = [
     pytest.param(
         round_name,
         idx,
         query,
         id=f"{round_name}[q{idx}]",
+        marks=[_ROUND_MARKS[mark_label]],
     )
-    for round_name, queries in QUERY_ROUNDS
+    for round_name, mark_label, queries in QUERY_ROUNDS
     for idx, query in enumerate(queries, start=1)
 ]
 
-TOTAL_QUERIES = len(_ALL_QUERIES)  # 40
+TOTAL_QUERIES = len(_ALL_QUERIES)
 
 
 # ---------------------------------------------------------------------------
@@ -246,7 +277,6 @@ def _run_wait(thread_id: str, user_text: str) -> dict[str, Any]:
 
 
 def _assert_loaded(outputs: dict[str, Any], cmd: str) -> None:
-    """Assert the agent confirmed a successful load for the given command."""
     answer = _extract_last_ai_text(outputs)
     assert answer, f"No response for load command '{cmd}'. Outputs: {outputs}"
     ok = (
@@ -269,17 +299,11 @@ def thread_id() -> str:
 
 @pytest.fixture(scope="session", autouse=True)
 def loaded_datasets(thread_id: str) -> None:
-    """Load all three tables once per test session before any query runs.
-
-    sales_rep_targets and product_metrics are optional for rounds 01-11;
-    missing files produce a warning but do not abort the session so the
-    original 33 single-table queries still run.
-    """
-    # sales1000 is mandatory — fail fast if it can't be loaded
+    """Load all three tables once per session. sales_rep_targets and
+    product_metrics are best-effort so rounds 01-11 still run without them."""
     outputs = _run_wait(thread_id, LOAD_SALES)
     _assert_loaded(outputs, LOAD_SALES)
 
-    # Dimension tables are best-effort for single-table rounds
     for cmd in (LOAD_REP_TARGETS, LOAD_PROD_METRICS):
         try:
             outputs = _run_wait(thread_id, cmd)
@@ -329,11 +353,11 @@ def test_query(
 
 
 # ---------------------------------------------------------------------------
-# Sanity check: catalog shape
+# Sanity check
 # ---------------------------------------------------------------------------
 
 def test_query_catalog_is_complete() -> None:
     round_count = len(QUERY_ROUNDS)
-    query_count = sum(len(queries) for _, queries in QUERY_ROUNDS)
+    query_count = sum(len(queries) for _, _, queries in QUERY_ROUNDS)
     assert round_count == 12, f"Expected 12 rounds, found {round_count}"
     assert query_count == 40, f"Expected 40 total queries, found {query_count}"
