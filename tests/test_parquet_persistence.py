@@ -1,15 +1,21 @@
 """
 tests/test_parquet_persistence.py
 
-All tests share a single module-scoped in-memory DuckDB connection.
-The connection is created ONCE in _isolated_env and never reset mid-module.
-Parquets are written to the session PARQUET_STORE dir (set by conftest.py).
+Design
+------
+- _isolated_env (module, autouse): boots ONE shared :memory: connection for
+  TestParquetPersistence and TestColumnCatalog. Never torn down mid-module.
+- test_view_survives_connection_reset: fully self-contained using a
+  subprocess so it cannot corrupt the shared connection.
+- TestColumnCatalog: each test loads its own data into the shared connection.
 """
 from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 import pandas as pd
@@ -17,7 +23,7 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
-# Helper
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _make_sample_excel(path: Path) -> pd.DataFrame:
@@ -32,52 +38,33 @@ def _make_sample_excel(path: Path) -> pd.DataFrame:
     return df
 
 
-def _purge_agent():
-    for mod in [m for m in sys.modules if m.startswith("agent")]:
-        del sys.modules[mod]
-
-
-def _rewarm_memory():
-    """Purge agent.*, set DUCKDB_PATH=:memory:, create fresh connection."""
-    os.environ["DUCKDB_PATH"] = ":memory:"
-    _purge_agent()
-    import agent.database as db_mod
-    db_mod._conn = None
-    db_mod.get_connection()
-
-
 # ---------------------------------------------------------------------------
-# Module-level isolation
+# Module isolation: one shared :memory: connection for this whole module
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="module", autouse=True)
-def _isolated_env(tmp_path_factory):
-    """
-    - Force DUCKDB_PATH=:memory: for the whole module.
-    - Warm ONE shared connection.
-    - Pre-load 'demo' dataset so TestColumnCatalog always finds it,
-      even after test_view_survives_connection_reset re-warms the connection.
-    """
+def _isolated_env():
     prev_db = os.environ.get("DUCKDB_PATH")
-    _rewarm_memory()
+    os.environ["DUCKDB_PATH"] = ":memory:"
 
-    # Pre-load demo on the fresh connection
-    from agent.tools import load_file
-    demo_xl = tmp_path_factory.mktemp("demo_setup") / "demo.xlsx"
-    _make_sample_excel(demo_xl)
-    load_file.invoke({"path": str(demo_xl), "dataset_name": "demo"})
+    for mod in [m for m in sys.modules if m.startswith("agent")]:
+        del sys.modules[mod]
+
+    import agent.database as db_mod
+    db_mod._conn = None
+    db_mod.get_connection()   # warm once
 
     yield
 
-    # Teardown
     try:
-        import agent.database as db_mod
-        if db_mod._conn:
-            db_mod._conn.close()
-        db_mod._conn = None
+        import agent.database as db_mod2
+        if db_mod2._conn:
+            db_mod2._conn.close()
+        db_mod2._conn = None
     except Exception:
         pass
-    _purge_agent()
+    for mod in [m for m in sys.modules if m.startswith("agent")]:
+        del sys.modules[mod]
     if prev_db is not None:
         os.environ["DUCKDB_PATH"] = prev_db
     else:
@@ -85,7 +72,7 @@ def _isolated_env(tmp_path_factory):
 
 
 # ---------------------------------------------------------------------------
-# Parquet persistence tests
+# TestParquetPersistence
 # ---------------------------------------------------------------------------
 
 class TestParquetPersistence:
@@ -117,49 +104,59 @@ class TestParquetPersistence:
         assert row[0] == 5
 
     def test_view_survives_connection_reset(self, tmp_path):
-        """File-backed DB: view is restored via _auto_reattach_parquet on reconnect."""
-        file_db = tmp_path / "restart.duckdb"
-        prev_db = os.environ.get("DUCKDB_PATH")
-        os.environ["DUCKDB_PATH"] = str(file_db)
+        """
+        Run in a subprocess so it has its own process state and cannot
+        disturb the shared :memory: connection used by the rest of this module.
+        """
+        script = textwrap.dedent(f"""
+            import os, sys, pandas as pd
+            from pathlib import Path
 
-        _purge_agent()
-        try:
-            from agent.tools import load_file as lf, get_parquet_path
-            import agent.database as db2
-            db2._conn = None
-            db2.get_connection()
+            parquet_store = Path(r"{os.environ['PARQUET_STORE']}")
+            db_path = Path(r"{tmp_path}") / "restart.duckdb"
+            xl_path = Path(r"{tmp_path}") / "sales4.xlsx"
 
-            xl = tmp_path / "sales4.xlsx"
-            _make_sample_excel(xl)
-            lf.invoke({"path": str(xl), "dataset_name": "sales4"})
+            os.environ["PARQUET_STORE"] = str(parquet_store)
+            os.environ["DUCKDB_PATH"] = str(db_path)
+
+            # Write excel
+            df = pd.DataFrame({{
+                "order_id": [1,2,3,4,5],
+                "customer": ["Alice","Bob","Alice","Carol","Bob"],
+                "revenue": [120.5,340.0,88.75,210.0,560.25],
+                "order_date": ["2023-01-15","2023-03-22","2023-06-10","2024-01-05","2024-02-28"],
+                "category": ["A","B","A","C","B"],
+            }})
+            df.to_excel(xl_path, index=False)
+
+            from agent.tools import load_file
+            import agent.database as db_mod
+            db_mod._conn = None
+            result = load_file.invoke({{"path": str(xl_path), "dataset_name": "sales4"}})
+            assert "Successfully loaded" in result, result
+
+            # Verify parquet path is absolute and exists
+            pq = parquet_store / "sales4.parquet"
+            assert pq.exists(), f"Parquet missing: {{pq}}"
 
             # Simulate restart
-            if db2._conn:
-                db2._conn.close()
-            db2._conn = None
-            _purge_agent()
+            db_mod._conn.close()
+            db_mod._conn = None
 
-            from agent.database import get_connection as gc
-            conn = gc()   # triggers _auto_reattach_parquet
+            from agent.database import get_connection
+            conn = get_connection()  # triggers _auto_reattach_parquet
             row = conn.execute('SELECT COUNT(*) FROM "sales4"').fetchone()
-            assert row[0] == 5
-
-        finally:
-            try:
-                import agent.database as db_fin
-                if db_fin._conn:
-                    db_fin._conn.close()
-                db_fin._conn = None
-            except Exception:
-                pass
-            # Restore shared :memory: connection AND reload demo
-            _rewarm_memory()
-            from agent.tools import load_file as lf2
-            from agent.tools import get_parquet_path as gpp
-            demo_pq = gpp("demo")
-            if demo_pq.exists():
-                # Re-register the view on the fresh :memory: connection
-                lf2.invoke({"path": str(demo_pq), "dataset_name": "demo"})
+            assert row[0] == 5, f"Expected 5, got {{row[0]}}"
+            print("OK")
+        """)
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True, text=True
+        )
+        assert result.returncode == 0, (
+            f"Subprocess failed:\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}"
+        )
+        assert "OK" in result.stdout
 
     def test_date_columns_stored_as_native_type(self, tmp_path):
         from agent.tools import load_file, get_parquet_path
@@ -173,12 +170,18 @@ class TestParquetPersistence:
 
 
 # ---------------------------------------------------------------------------
-# Column catalog tests
-# 'demo' is guaranteed to exist: loaded in _isolated_env and reloaded in
-# test_view_survives_connection_reset's finally block.
+# TestColumnCatalog
+# Each test loads its own dataset to avoid dependency on test ordering.
 # ---------------------------------------------------------------------------
 
 class TestColumnCatalog:
+
+    @pytest.fixture(autouse=True)
+    def _load_demo(self, tmp_path):
+        from agent.tools import load_file
+        xl = tmp_path / "demo.xlsx"
+        _make_sample_excel(xl)
+        load_file.invoke({"path": str(xl), "dataset_name": "demo"})
 
     def test_column_catalog_rows_exist(self):
         from agent.database import get_connection
