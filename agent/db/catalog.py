@@ -32,12 +32,12 @@ def upsert_table_context(
     conn.execute(
         """
         INSERT INTO _table_context (dataset_name, summary, grain, tags, updated_at)
-        VALUES (?, ?, ?, ?, current_timestamp)
+        VALUES (?, ?, ?, ?, now())
         ON CONFLICT (dataset_name)
         DO UPDATE SET summary    = excluded.summary,
                       grain      = excluded.grain,
                       tags       = excluded.tags,
-                      updated_at = current_timestamp
+                      updated_at = now()
         """,
         [dataset_name, summary, grain, tags_json],
     )
@@ -154,9 +154,9 @@ def list_relationships(
     return [
         {
             "left_table":   r[0],
-            "left_column":  r[1],   # key used by tests
+            "left_column":  r[1],
             "right_table":  r[2],
-            "right_column": r[3],   # key used by tests
+            "right_column": r[3],
             "cardinality":  r[4],
             "description":  r[5],
         }
