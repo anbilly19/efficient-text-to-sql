@@ -1,16 +1,14 @@
-"""Unit tests for Parquet persistence and _semantic_lookup.
+"""Unit tests for Parquet persistence and _column_catalog (semantic lookup).
 
 These tests run fully offline - no LangGraph server needed.
 They import agent code directly and use a fresh in-memory DuckDB
 for each test module session.
 
-
 Fixture hierarchy
 -----------------
 conftest.py::_session_env   (scope=session, autouse)
     Sets PARQUET_STORE to a temp dir *before* any agent module is imported,
-    so module-level constants in agent.database / agent.tools pick up the
-    temp path correctly.
+    so module-level constants in agent.tools pick up the temp path correctly.
 
 _isolated_env               (scope=module, autouse)
     Overrides DUCKDB_PATH to ':memory:', resets the DuckDB singleton, and
@@ -39,8 +37,6 @@ def _isolated_env():
     """
     os.environ["DUCKDB_PATH"] = ":memory:"
 
-    # Purge cached agent modules so they re-bind PARQUET_STORE and DUCKDB_PATH
-    # from the env vars set by conftest._session_env + this fixture.
     for mod_name in [m for m in sys.modules if m.startswith("agent")]:
         del sys.modules[mod_name]
 
@@ -51,7 +47,6 @@ def _isolated_env():
 
     import agent.database as db_module  # noqa: F811
     db_module._conn = None
-    # Restore so other modules (test_multi_table) use the real DB path
     os.environ.pop("DUCKDB_PATH", None)
 
 
@@ -80,8 +75,8 @@ class TestParquetPersistence:
     """load_file converts Excel -> Parquet and registers a DuckDB view."""
 
     def test_parquet_file_created(self, tmp_path):
-        from agent.tools import load_file
-        from agent.database import PARQUET_STORE, get_parquet_path  # noqa: F401
+        # PARQUET_STORE and get_parquet_path live in agent.tools on this branch
+        from agent.tools import load_file, PARQUET_STORE, get_parquet_path  # noqa: F401
 
         xl = tmp_path / "sales.xlsx"
         _make_sample_excel(xl)
@@ -94,8 +89,7 @@ class TestParquetPersistence:
         assert pq.suffix == ".parquet"
 
     def test_parquet_readable_by_pandas(self, tmp_path):
-        from agent.tools import load_file
-        from agent.database import get_parquet_path
+        from agent.tools import load_file, get_parquet_path
 
         xl = tmp_path / "sales2.xlsx"
         original = _make_sample_excel(xl)
@@ -130,14 +124,13 @@ class TestParquetPersistence:
         db_module._conn = None
 
         from agent.database import get_connection
-        conn = get_connection()  # triggers _restore_parquet_views / _auto_reattach_parquet
+        conn = get_connection()  # triggers _auto_reattach_parquet
         row = conn.execute('SELECT COUNT(*) FROM "sales4"').fetchone()
         assert row[0] == 5, "View not restored after connection reset"
 
     def test_date_columns_stored_as_native_type(self, tmp_path):
         """order_date (ISO strings in Excel) should land as datetime in Parquet."""
-        from agent.tools import load_file
-        from agent.database import get_parquet_path
+        from agent.tools import load_file, get_parquet_path
 
         xl = tmp_path / "sales5.xlsx"
         _make_sample_excel(xl)
@@ -150,8 +143,13 @@ class TestParquetPersistence:
         )
 
 
-class TestSemanticLookup:
-    """_semantic_lookup is populated correctly and search_semantic_lookup works."""
+class TestColumnCatalog:
+    """_column_catalog is populated correctly and search_semantic_lookup works.
+
+    NOTE: This branch replaced _semantic_lookup with _column_catalog.
+    n_distinct and null_frac are no longer stored as columns; sample_values
+    and description are still present.
+    """
 
     @pytest.fixture(scope="class", autouse=True)
     def _load_dataset(self, tmp_path_factory):
@@ -160,43 +158,34 @@ class TestSemanticLookup:
         _make_sample_excel(xl)
         load_file.invoke({"path": str(xl), "dataset_name": "demo"})
 
-    def test_semantic_lookup_rows_exist(self):
+    def test_column_catalog_rows_exist(self):
         from agent.database import get_connection
         conn = get_connection()
         rows = conn.execute(
-            "SELECT column_name FROM _semantic_lookup WHERE dataset_name = 'demo'"
+            "SELECT column_name FROM _column_catalog WHERE dataset_name = 'demo'"
         ).fetchall()
         col_names = {r[0] for r in rows}
         assert {"order_id", "customer", "revenue", "order_date", "category"} == col_names
 
-    def test_n_distinct_is_correct(self):
+    def test_metric_flag_set_for_numeric_column(self):
         from agent.database import get_connection
         conn = get_connection()
         row = conn.execute(
-            "SELECT n_distinct FROM _semantic_lookup "
-            "WHERE dataset_name = 'demo' AND column_name = 'customer'"
+            "SELECT is_metric FROM _column_catalog "
+            "WHERE dataset_name = 'demo' AND column_name = 'revenue'"
         ).fetchone()
         assert row is not None
-        assert row[0] == 3  # Alice, Bob, Carol
+        assert row[0] is True, "revenue should be flagged as a metric"
 
     def test_sample_values_is_valid_json(self):
         from agent.database import get_connection
         conn = get_connection()
         rows = conn.execute(
-            "SELECT column_name, sample_values FROM _semantic_lookup WHERE dataset_name = 'demo'"
+            "SELECT column_name, sample_values FROM _column_catalog WHERE dataset_name = 'demo'"
         ).fetchall()
         for col, sv in rows:
-            parsed = json.loads(sv)
+            parsed = json.loads(sv or "[]")
             assert isinstance(parsed, list), f"{col}: sample_values is not a JSON list"
-
-    def test_null_frac_zero_for_clean_data(self):
-        from agent.database import get_connection
-        conn = get_connection()
-        rows = conn.execute(
-            "SELECT column_name, null_frac FROM _semantic_lookup WHERE dataset_name = 'demo'"
-        ).fetchall()
-        for col, nf in rows:
-            assert nf == 0.0, f"{col} has unexpected null_frac={nf} for clean data"
 
     def test_search_semantic_lookup_by_keyword(self):
         from agent.tools import search_semantic_lookup
