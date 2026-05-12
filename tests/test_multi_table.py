@@ -3,18 +3,18 @@ tests/test_multi_table.py
 --------------------------
 Integration tests for multi-table queries.
 
-Pre-requisites (run once):
-    python scripts/generate_test_data.py   # writes data/sales_rep_targets.xlsx + product_metrics.xlsx
-    python scripts/seed_multi_table.py     # loads them into DuckDB, registers joins
+All column names in sales1000 are snake_case:
+  order_id, order_date, sales_rep, region, product, category,
+  quantity, unit_price, total_revenue
 
-Run the whole file:
-    pytest tests/test_multi_table.py -v
+Pre-requisites (run once):
+    python scripts/generate_test_data.py
+    python scripts/seed_multi_table.py
 """
 from __future__ import annotations
 
 import json
 import os
-import sys
 
 import pytest
 
@@ -29,24 +29,12 @@ from agent.db.catalog import list_relationships
 
 @pytest.fixture(scope="module", autouse=True)
 def _reconnect_real_db():
-    """Ensure this module connects to the real on-disk DuckDB, not :memory:.
-
-    conftest._session_env sets PARQUET_STORE to a temp dir but does NOT
-    override DUCKDB_PATH, so the real DB path is used.  However if another
-    module previously set DUCKDB_PATH=:memory: (e.g. test_parquet_persistence)
-    that env var may still be set.  We explicitly clear it here so
-    get_connection() falls back to _DEFAULT_DB_PATH.
-    """
+    """Ensure this module uses the real on-disk DuckDB, not :memory:."""
     prev = os.environ.pop("DUCKDB_PATH", None)
-
-    # Reset singleton so we get a fresh connection to the real DB.
     import agent.database as db_module
     db_module._conn = None
-
     yield
-
-    # Restore after module.
-    import agent.database as db_m  # noqa: F811
+    import agent.database as db_m
     db_m._conn = None
     if prev is not None:
         os.environ["DUCKDB_PATH"] = prev
@@ -61,10 +49,7 @@ def conn():
 def require_tables(conn):
     """Skip the whole module if seed tables are missing."""
     registered = {
-        r[0]
-        for r in conn.execute(
-            "SELECT dataset_name FROM _data_registry"
-        ).fetchall()
+        r[0] for r in conn.execute("SELECT dataset_name FROM _data_registry").fetchall()
     }
     missing = {"sales1000", "sales_rep_targets", "product_metrics"} - registered
     if missing:
@@ -79,7 +64,6 @@ def require_tables(conn):
 # ---------------------------------------------------------------------------
 
 class TestRelationships:
-    """Verify the _relationships registry is correctly populated."""
 
     def test_at_least_four_relationships(self):
         rels = list_relationships()
@@ -88,14 +72,14 @@ class TestRelationships:
     def test_sales_rep_join_key_registered(self):
         rels = list_relationships()
         pairs = {(r["left_column"], r["right_column"]) for r in rels}
-        assert ("Sales Rep", "sales_rep") in pairs or ("sales_rep", "Sales Rep") in pairs, (
+        assert ("sales_rep", "sales_rep") in pairs, (
             f"sales_rep join key missing. Registered pairs: {pairs}"
         )
 
     def test_region_join_key_registered(self):
         rels = list_relationships()
         pairs = {(r["left_column"], r["right_column"]) for r in rels}
-        assert ("Region", "region") in pairs or ("region", "Region") in pairs, (
+        assert ("region", "region") in pairs, (
             f"region join key missing. Registered pairs: {pairs}"
         )
 
@@ -122,7 +106,6 @@ class TestRelationships:
         )
 
     def test_relationships_scoped_to_tables(self):
-        """list_relationships(tables=[...]) returns only relevant rows."""
         rels = list_relationships(tables=["sales1000", "sales_rep_targets"])
         tables_seen = {r["left_table"] for r in rels} | {r["right_table"] for r in rels}
         assert "product_metrics" not in tables_seen, (
@@ -135,13 +118,10 @@ class TestRelationships:
 # ---------------------------------------------------------------------------
 
 class TestSchemaContext:
-    """Verify schema context is correctly scoped per query."""
 
     def test_includes_relationships_block(self):
         ctx = get_schema_context(["sales1000", "sales_rep_targets"])
-        assert "Relationships" in ctx or "relationships" in ctx.lower(), (
-            "Schema context must include a Relationships block"
-        )
+        assert "Relationships" in ctx or "relationships" in ctx.lower()
 
     def test_scoped_to_requested_tables(self):
         ctx = get_schema_context(["sales1000"])
@@ -159,20 +139,19 @@ class TestSchemaContext:
 # ---------------------------------------------------------------------------
 
 class TestRepTargetsJoin:
-    """Queries joining sales1000 (fact) to sales_rep_targets (dimension)."""
 
     QUOTA_SQL = """
         SELECT
-            s."Sales Rep"                                      AS sales_rep,
-            s."Region"                                         AS region,
-            SUM(s."Total Revenue")                             AS actual_revenue,
+            s.sales_rep,
+            s.region,
+            SUM(s.total_revenue)                             AS actual_revenue,
             t.quota_usd,
-            ROUND(SUM(s."Total Revenue") / t.quota_usd, 4)    AS attainment
+            ROUND(SUM(s.total_revenue) / t.quota_usd, 4)    AS attainment
         FROM sales1000 s
         JOIN sales_rep_targets t
-          ON s."Sales Rep" = t.sales_rep
-         AND s."Region"    = t.region
-        GROUP BY s."Sales Rep", s."Region", t.quota_usd
+          ON s.sales_rep = t.sales_rep
+         AND s.region    = t.region
+        GROUP BY s.sales_rep, s.region, t.quota_usd
         ORDER BY attainment DESC
     """
 
@@ -182,9 +161,7 @@ class TestRepTargetsJoin:
 
     def test_no_fanout(self, conn):
         result = json.loads(run_sql.invoke({"query": self.QUOTA_SQL}))
-        target_rows = conn.execute(
-            "SELECT COUNT(*) FROM sales_rep_targets"
-        ).fetchone()[0]
+        target_rows = conn.execute("SELECT COUNT(*) FROM sales_rep_targets").fetchone()[0]
         assert result["metadata"]["row_count"] <= target_rows, (
             f"Fan-out detected: {result['metadata']['row_count']} > {target_rows}"
         )
@@ -198,22 +175,20 @@ class TestRepTargetsJoin:
     def test_attainment_varies_across_reps(self):
         result = json.loads(run_sql.invoke({"query": self.QUOTA_SQL}))
         attainments = {float(row["attainment"]) for row in result["rows"]}
-        assert len(attainments) > 1, (
-            "All attainment values identical -- quota may be derived directly from actuals"
-        )
+        assert len(attainments) > 1, "All attainment values identical"
 
     def test_below_quota_filter(self):
         sql = """
             SELECT
                 t.sales_rep, t.region,
-                SUM(s."Total Revenue") AS actual,
+                SUM(s.total_revenue) AS actual,
                 t.quota_usd
             FROM sales1000 s
             JOIN sales_rep_targets t
-              ON s."Sales Rep" = t.sales_rep
-             AND s."Region"    = t.region
+              ON s.sales_rep = t.sales_rep
+             AND s.region    = t.region
             GROUP BY t.sales_rep, t.region, t.quota_usd
-            HAVING SUM(s."Total Revenue") < t.quota_usd
+            HAVING SUM(s.total_revenue) < t.quota_usd
             ORDER BY actual ASC
         """
         result = run_sql.invoke({"query": sql})
@@ -223,20 +198,20 @@ class TestRepTargetsJoin:
         sql = """
             WITH ranked AS (
                 SELECT
-                    s."Sales Rep"                                          AS sales_rep,
-                    s."Region"                                             AS region,
-                    SUM(s."Total Revenue")                                 AS actual,
+                    s.sales_rep,
+                    s.region,
+                    SUM(s.total_revenue)                              AS actual,
                     t.quota_usd,
-                    ROUND(SUM(s."Total Revenue") / t.quota_usd, 4)        AS attainment,
+                    ROUND(SUM(s.total_revenue) / t.quota_usd, 4)     AS attainment,
                     ROW_NUMBER() OVER (
-                        PARTITION BY s."Region"
-                        ORDER BY SUM(s."Total Revenue") / t.quota_usd DESC
+                        PARTITION BY s.region
+                        ORDER BY SUM(s.total_revenue) / t.quota_usd DESC
                     ) AS rn
                 FROM sales1000 s
                 JOIN sales_rep_targets t
-                  ON s."Sales Rep" = t.sales_rep
-                 AND s."Region"    = t.region
-                GROUP BY s."Sales Rep", s."Region", t.quota_usd
+                  ON s.sales_rep = t.sales_rep
+                 AND s.region    = t.region
+                GROUP BY s.sales_rep, s.region, t.quota_usd
             )
             SELECT sales_rep, region, actual, quota_usd, attainment
             FROM ranked WHERE rn = 1
@@ -245,19 +220,18 @@ class TestRepTargetsJoin:
         result = run_sql.invoke({"query": sql})
         assert not result.startswith("ERROR"), f"Top-rep query failed: {result}"
         parsed = json.loads(result)
-        regions = {row["region"] for row in parsed["rows"]}
-        assert len(regions) >= 1
+        assert len({row["region"] for row in parsed["rows"]}) >= 1
 
     def test_quota_gap_ordered(self):
         sql = """
             SELECT
                 t.sales_rep,
                 t.region,
-                t.quota_usd - SUM(s."Total Revenue") AS quota_gap
+                t.quota_usd - SUM(s.total_revenue) AS quota_gap
             FROM sales1000 s
             JOIN sales_rep_targets t
-              ON s."Sales Rep" = t.sales_rep
-             AND s."Region"    = t.region
+              ON s.sales_rep = t.sales_rep
+             AND s.region    = t.region
             GROUP BY t.sales_rep, t.region, t.quota_usd
             ORDER BY quota_gap DESC
             LIMIT 10
@@ -271,41 +245,39 @@ class TestRepTargetsJoin:
 # ---------------------------------------------------------------------------
 
 class TestProductMetricsJoin:
-    """Queries joining sales1000 (fact) to product_metrics (dimension)."""
 
     def test_revenue_vs_avg_cost(self):
         sql = """
             SELECT
-                s."Product Name",
-                s."Category",
-                SUM(s."Total Revenue")    AS total_revenue,
+                s.product,
+                s.category,
+                SUM(s.total_revenue)  AS total_revenue,
                 p.unit_cost_usd,
-                SUM(s."Quantity Ordered") AS units_sold
+                SUM(s.quantity)       AS units_sold
             FROM sales1000 s
             JOIN product_metrics p
-              ON s."Product Name" = p.product_name
-             AND s."Category"     = p.category
-            GROUP BY s."Product Name", s."Category", p.unit_cost_usd
+              ON s.product  = p.product
+             AND s.category = p.category
+            GROUP BY s.product, s.category, p.unit_cost_usd
             ORDER BY total_revenue DESC
             LIMIT 10
         """
         result = run_sql.invoke({"query": sql})
         assert not result.startswith("ERROR"), f"Query failed: {result}"
-        parsed = json.loads(result)
-        assert parsed["metadata"]["row_count"] >= 1
+        assert json.loads(result)["metadata"]["row_count"] >= 1
 
     def test_above_avg_cost_products(self):
         sql = """
             SELECT
-                s."Product Name",
-                s."Unit Price",
+                s.product,
+                s.unit_price,
                 p.unit_cost_usd,
-                s."Unit Price" - p.unit_cost_usd AS cost_margin
+                s.unit_price - p.unit_cost_usd AS cost_margin
             FROM sales1000 s
             JOIN product_metrics p
-              ON s."Product Name" = p.product_name
-             AND s."Category"     = p.category
-            WHERE s."Unit Price" > p.unit_cost_usd
+              ON s.product  = p.product
+             AND s.category = p.category
+            WHERE s.unit_price > p.unit_cost_usd
             ORDER BY cost_margin DESC
             LIMIT 10
         """
@@ -317,27 +289,24 @@ class TestProductMetricsJoin:
             SELECT COUNT(*) AS n
             FROM sales1000 s
             LEFT JOIN product_metrics p
-              ON s."Product Name" = p.product_name
-             AND s."Category"     = p.category
+              ON s.product  = p.product
+             AND s.category = p.category
         """
         fact_count = conn.execute("SELECT COUNT(*) FROM sales1000").fetchone()[0]
         result = json.loads(run_sql.invoke({"query": sql}))
-        joined_count = result["rows"][0]["n"]
-        assert int(joined_count) == fact_count, (
-            f"Fan-out: fact={fact_count}, joined={joined_count}"
-        )
+        assert int(result["rows"][0]["n"]) == fact_count, "Fan-out detected"
 
     def test_top_categories_by_margin_proxy(self):
         sql = """
             SELECT
-                s."Category",
-                ROUND(SUM(s."Total Revenue") / SUM(s."Quantity Ordered"), 2) AS revenue_per_unit,
-                AVG(p.unit_cost_usd)                                           AS avg_cost
+                s.category,
+                ROUND(SUM(s.total_revenue) / SUM(s.quantity), 2) AS revenue_per_unit,
+                AVG(p.unit_cost_usd)                               AS avg_cost
             FROM sales1000 s
             JOIN product_metrics p
-              ON s."Product Name" = p.product_name
-             AND s."Category"     = p.category
-            GROUP BY s."Category"
+              ON s.product  = p.product
+             AND s.category = p.category
+            GROUP BY s.category
             ORDER BY revenue_per_unit DESC
         """
         result = run_sql.invoke({"query": sql})
@@ -353,49 +322,43 @@ class TestThreeTableJoin:
     def test_rep_category_attainment(self):
         sql = """
             SELECT
-                s."Sales Rep"                                                  AS sales_rep,
-                s."Region"                                                     AS region,
-                s."Category",
-                SUM(s."Total Revenue")                                          AS cat_revenue,
+                s.sales_rep,
+                s.region,
+                s.category,
+                SUM(s.total_revenue)                              AS cat_revenue,
                 t.quota_usd,
-                ROUND(SUM(s."Total Revenue") / t.quota_usd, 4)                AS cat_attainment,
-                p.unit_cost_usd                                                AS product_cost
+                ROUND(SUM(s.total_revenue) / t.quota_usd, 4)     AS cat_attainment,
+                p.unit_cost_usd                                   AS product_cost
             FROM sales1000 s
             JOIN sales_rep_targets t
-              ON s."Sales Rep" = t.sales_rep
-             AND s."Region"    = t.region
+              ON s.sales_rep = t.sales_rep
+             AND s.region    = t.region
             JOIN product_metrics p
-              ON s."Product Name" = p.product_name
-             AND s."Category"     = p.category
-            GROUP BY s."Sales Rep", s."Region", s."Category", t.quota_usd, p.unit_cost_usd
+              ON s.product  = p.product
+             AND s.category = p.category
+            GROUP BY s.sales_rep, s.region, s.category, t.quota_usd, p.unit_cost_usd
             ORDER BY cat_attainment DESC
             LIMIT 20
         """
         result = run_sql.invoke({"query": sql})
         assert not result.startswith("ERROR"), f"Three-table query failed: {result}"
-        parsed = json.loads(result)
-        assert parsed["metadata"]["row_count"] >= 1
+        assert json.loads(result)["metadata"]["row_count"] >= 1
 
     def test_underperforming_reps_on_high_revenue_products(self):
         sql = """
             WITH rep_actual AS (
-                SELECT
-                    s."Sales Rep" AS sales_rep,
-                    s."Region"    AS region,
-                    SUM(s."Total Revenue") AS actual
-                FROM sales1000 s
-                GROUP BY s."Sales Rep", s."Region"
+                SELECT sales_rep, region, SUM(total_revenue) AS actual
+                FROM sales1000
+                GROUP BY sales_rep, region
             ),
             top_products AS (
-                SELECT product_name, category
+                SELECT product, category
                 FROM product_metrics
                 ORDER BY unit_cost_usd DESC
                 LIMIT 5
             )
             SELECT
-                ra.sales_rep,
-                ra.region,
-                ra.actual,
+                ra.sales_rep, ra.region, ra.actual,
                 t.quota_usd,
                 t.quota_usd - ra.actual AS gap
             FROM rep_actual ra
@@ -407,9 +370,9 @@ class TestThreeTableJoin:
                   SELECT 1
                   FROM sales1000 s2
                   JOIN top_products tp
-                    ON s2."Product Name" = tp.product_name
-                   AND s2."Category"     = tp.category
-                  WHERE s2."Sales Rep" = ra.sales_rep
+                    ON s2.product  = tp.product
+                   AND s2.category = tp.category
+                  WHERE s2.sales_rep = ra.sales_rep
               )
             ORDER BY gap DESC
         """
@@ -418,29 +381,26 @@ class TestThreeTableJoin:
 
 
 # ---------------------------------------------------------------------------
-# Regression: single-table queries
+# Single-table regression
 # ---------------------------------------------------------------------------
 
 class TestSingleTableRegression:
 
     def test_sales1000_aggregate(self):
         sql = """
-            SELECT "Region", SUM("Total Revenue") AS total
+            SELECT region, SUM(total_revenue) AS total
             FROM sales1000
-            GROUP BY "Region"
+            GROUP BY region
             ORDER BY total DESC
         """
         result = run_sql.invoke({"query": sql})
         assert not result.startswith("ERROR"), f"Single-table query failed: {result}"
-        parsed = json.loads(result)
-        assert parsed["metadata"]["row_count"] >= 1
+        assert json.loads(result)["metadata"]["row_count"] >= 1
 
     def test_sales_rep_targets_standalone(self):
-        sql = "SELECT * FROM sales_rep_targets ORDER BY quota_usd DESC LIMIT 5"
-        result = run_sql.invoke({"query": sql})
+        result = run_sql.invoke({"query": "SELECT * FROM sales_rep_targets ORDER BY quota_usd DESC LIMIT 5"})
         assert not result.startswith("ERROR"), f"Targets standalone query failed: {result}"
 
     def test_product_metrics_standalone(self):
-        sql = "SELECT * FROM product_metrics ORDER BY unit_cost_usd DESC LIMIT 5"
-        result = run_sql.invoke({"query": sql})
+        result = run_sql.invoke({"query": "SELECT * FROM product_metrics ORDER BY unit_cost_usd DESC LIMIT 5"})
         assert not result.startswith("ERROR"), f"Product metrics standalone query failed: {result}"
