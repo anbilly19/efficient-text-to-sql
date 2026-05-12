@@ -8,9 +8,15 @@ import requests
 
 LANGGRAPH_API_URL = os.getenv("LANGGRAPH_API_URL", "http://127.0.0.1:2024").rstrip("/")
 ASSISTANT_ID = os.getenv("ASSISTANT_ID", "fe096781-5601-53d2-b2f6-0d3403f7e9ca")
-LOAD_COMMAND = os.getenv("LOAD_COMMAND", "load data/sample_sales_1000.xlsx as sales1000")
+
+# Load commands issued once per session before any query runs.
+# Override any individual command via env vars if the filenames differ.
+LOAD_SALES       = os.getenv("LOAD_SALES",       "load data/sample_sales_1000.xlsx as sales1000")
+LOAD_REP_TARGETS = os.getenv("LOAD_REP_TARGETS", "load data/sales_rep_targets.xlsx as sales_rep_targets")
+LOAD_PROD_METRICS = os.getenv("LOAD_PROD_METRICS", "load data/product_metrics.xlsx as product_metrics")
+
 REQUEST_TIMEOUT = float(os.getenv("TEST_REQUEST_TIMEOUT", "120"))
-POLL_SECONDS = float(os.getenv("TEST_POLL_SECONDS", "0.5"))
+POLL_SECONDS    = float(os.getenv("TEST_POLL_SECONDS", "0.5"))
 
 
 QUERY_ROUNDS = [
@@ -105,9 +111,6 @@ QUERY_ROUNDS = [
     # ------------------------------------------------------------------
     # round_12 — multi-table: forces the agent to JOIN across the three
     # seeded tables (sales1000, sales_rep_targets, product_metrics).
-    # Pre-requisite:
-    #   load data/sales_rep_targets.xlsx as sales_rep_targets
-    #   load data/product_metrics.xlsx as product_metrics
     # Skip this round:
     #   pytest tests/test_langgraph_query_rounds.py -k "not round_12" -v
     # Run only this round:
@@ -242,6 +245,19 @@ def _run_wait(thread_id: str, user_text: str) -> dict[str, Any]:
     raise LangGraphTestError(f"Run request failed for thread {thread_id}: {last_error}")
 
 
+def _assert_loaded(outputs: dict[str, Any], cmd: str) -> None:
+    """Assert the agent confirmed a successful load for the given command."""
+    answer = _extract_last_ai_text(outputs)
+    assert answer, f"No response for load command '{cmd}'. Outputs: {outputs}"
+    ok = (
+        "successfully loaded" in answer.lower()
+        or "you can now ask questions" in answer.lower()
+        or "already loaded" in answer.lower()
+        or "table is ready" in answer.lower()
+    )
+    assert ok, f"Load did not succeed for '{cmd}'.\nAnswer: {answer}"
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -252,13 +268,28 @@ def thread_id() -> str:
 
 
 @pytest.fixture(scope="session", autouse=True)
-def loaded_dataset(thread_id: str) -> None:
-    outputs = _run_wait(thread_id, LOAD_COMMAND)
-    answer = _extract_last_ai_text(outputs)
-    assert answer, f"No response returned for load command. Outputs: {outputs}"
-    assert "successfully loaded" in answer.lower() or "you can now ask questions" in answer.lower(), (
-        f"Dataset load did not succeed. Answer: {answer}\nOutputs: {outputs}"
-    )
+def loaded_datasets(thread_id: str) -> None:
+    """Load all three tables once per test session before any query runs.
+
+    sales_rep_targets and product_metrics are optional for rounds 01-11;
+    missing files produce a warning but do not abort the session so the
+    original 33 single-table queries still run.
+    """
+    # sales1000 is mandatory — fail fast if it can't be loaded
+    outputs = _run_wait(thread_id, LOAD_SALES)
+    _assert_loaded(outputs, LOAD_SALES)
+
+    # Dimension tables are best-effort for single-table rounds
+    for cmd in (LOAD_REP_TARGETS, LOAD_PROD_METRICS):
+        try:
+            outputs = _run_wait(thread_id, cmd)
+            _assert_loaded(outputs, cmd)
+        except AssertionError as exc:
+            import warnings
+            warnings.warn(
+                f"Optional table load skipped (round_12 will likely fail):\n{exc}",
+                stacklevel=1,
+            )
 
 
 _query_counter: dict[str, int] = {"n": 0}
@@ -274,7 +305,7 @@ def test_query(
     query_index: int,
     query: str,
     thread_id: str,
-    loaded_dataset: None,
+    loaded_datasets: None,
 ) -> None:
     _query_counter["n"] += 1
     n = _query_counter["n"]
