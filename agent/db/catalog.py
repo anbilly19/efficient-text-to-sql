@@ -1,8 +1,8 @@
 """
-db/catalog.py — High-level helpers for the three metadata tables that power
+db/catalog.py -- High-level helpers for the three metadata tables that power
 multi-table support:  _column_catalog, _relationships, _table_context.
 
-All write operations are idempotent (ON CONFLICT … DO UPDATE) so they can be
+All write operations are idempotent (ON CONFLICT ... DO UPDATE) so they can be
 called during re-ingestion without leaving stale data.
 """
 from __future__ import annotations
@@ -127,7 +127,11 @@ def list_relationships(
     tables: list[str] | None = None,
     conn: duckdb.DuckDBPyConnection | None = None,
 ) -> list[dict]:
-    """Return all relationships, optionally filtered to a list of table names."""
+    """Return all relationships, optionally filtered to a list of table names.
+
+    Returns dicts with keys:
+        left_table, left_column, right_table, right_column, cardinality, description
+    """
     conn = conn or get_connection()
     if tables:
         rows = conn.execute(
@@ -149,20 +153,20 @@ def list_relationships(
         ).fetchall()
     return [
         {
-            "left_table": r[0],
-            "left_column": r[1],
-            "right_table": r[2],
-            "right_column": r[3],
-            "cardinality": r[4],
-            "description": r[5],
+            "left_table":   r[0],
+            "left_column":  r[1],   # key used by tests
+            "right_table":  r[2],
+            "right_column": r[3],   # key used by tests
+            "cardinality":  r[4],
+            "description":  r[5],
         }
         for r in rows
     ]
 
 
 def validate_join_in_sql(sql: str, conn: duckdb.DuckDBPyConnection | None = None) -> list[str]:
-    """Best-effort check: return a list of warning strings for JOIN patterns
-    whose key pairs are NOT registered in _relationships.
+    """Best-effort check: return warning strings for JOIN patterns whose key
+    pairs are NOT registered in _relationships.
 
     Only catches simple  t1.col = t2.col  patterns in ON clauses.
     Returns [] when the SQL is clean (or the heuristic cannot parse it).
@@ -171,16 +175,14 @@ def validate_join_in_sql(sql: str, conn: duckdb.DuckDBPyConnection | None = None
     conn = conn or get_connection()
     warnings: list[str] = []
 
-    # Collect all known join pairs (both directions)
     rels = conn.execute(
         "SELECT left_table, left_column, right_table, right_column FROM _relationships"
     ).fetchall()
     known: set[tuple[str, str, str, str]] = set()
     for lt, lc, rt, rc in rels:
         known.add((lt, lc, rt, rc))
-        known.add((rt, rc, lt, lc))  # bidirectional
+        known.add((rt, rc, lt, lc))
 
-    # Find ON clause patterns like:  tbl1.col1 = tbl2.col2
     on_pattern = re.compile(
         r'(?:^|\s)ON\s+([\w"`]+)\.([\w"`]+)\s*=\s*([\w"`]+)\.([\w"`]+)',
         re.IGNORECASE | re.MULTILINE,
