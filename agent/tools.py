@@ -459,6 +459,11 @@ def load_file(path: str, dataset_name: str) -> str:
     col_count = len(df.columns)
 
     # ── 4. Update _data_registry (store absolute path for restart resilience) ───
+    # NOTE: use now() instead of current_timestamp in the ON CONFLICT clause.
+    # DuckDB resolves bare identifiers in ON CONFLICT SET against the target
+    # table's column list first; on an old .duckdb file that lacks ingested_at,
+    # `current_timestamp` is mis-bound as a column name and throws a Binder
+    # Error.  now() is always resolved as a function call, regardless of schema.
     try:
         conn.execute(
             """
@@ -470,7 +475,7 @@ def load_file(path: str, dataset_name: str) -> str:
                 source_file   = excluded.source_file,
                 row_count     = excluded.row_count,
                 column_count  = excluded.column_count,
-                ingested_at   = current_timestamp
+                ingested_at   = now()
             """,
             [dataset_name, str(parquet_path.resolve()), str(file_path), row_count, col_count],
         )
