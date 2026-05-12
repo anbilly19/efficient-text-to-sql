@@ -13,6 +13,8 @@ Run the whole file:
 from __future__ import annotations
 
 import json
+import os
+import sys
 
 import pytest
 
@@ -24,6 +26,31 @@ from agent.db.catalog import list_relationships
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module", autouse=True)
+def _reconnect_real_db():
+    """Ensure this module connects to the real on-disk DuckDB, not :memory:.
+
+    conftest._session_env sets PARQUET_STORE to a temp dir but does NOT
+    override DUCKDB_PATH, so the real DB path is used.  However if another
+    module previously set DUCKDB_PATH=:memory: (e.g. test_parquet_persistence)
+    that env var may still be set.  We explicitly clear it here so
+    get_connection() falls back to _DEFAULT_DB_PATH.
+    """
+    prev = os.environ.pop("DUCKDB_PATH", None)
+
+    # Reset singleton so we get a fresh connection to the real DB.
+    import agent.database as db_module
+    db_module._conn = None
+
+    yield
+
+    # Restore after module.
+    import agent.database as db_m  # noqa: F811
+    db_m._conn = None
+    if prev is not None:
+        os.environ["DUCKDB_PATH"] = prev
+
 
 @pytest.fixture(scope="module")
 def conn():
@@ -60,8 +87,6 @@ class TestRelationships:
 
     def test_sales_rep_join_key_registered(self):
         rels = list_relationships()
-        # list_relationships returns dicts with keys left_column / right_column
-        # The fact-table column is "Sales Rep" (quoted); the dim column is sales_rep
         pairs = {(r["left_column"], r["right_column"]) for r in rels}
         assert ("Sales Rep", "sales_rep") in pairs or ("sales_rep", "Sales Rep") in pairs, (
             f"sales_rep join key missing. Registered pairs: {pairs}"
@@ -76,7 +101,6 @@ class TestRelationships:
 
     def test_product_join_key_registered(self):
         rels = list_relationships()
-        # Accept either direction and any casing
         all_cols = {
             c.lower()
             for r in rels
@@ -120,7 +144,6 @@ class TestSchemaContext:
         )
 
     def test_scoped_to_requested_tables(self):
-        """annual_quota / quota_usd only exist in sales_rep_targets."""
         ctx = get_schema_context(["sales1000"])
         assert "quota" not in ctx.lower(), (
             "Quota column from sales_rep_targets leaked into sales1000-only context"
@@ -133,20 +156,10 @@ class TestSchemaContext:
 
 # ---------------------------------------------------------------------------
 # sales1000 x sales_rep_targets
-# (fact columns are Title Case; dim columns are snake_case)
 # ---------------------------------------------------------------------------
 
 class TestRepTargetsJoin:
-    """Queries joining sales1000 (fact) to sales_rep_targets (dimension).
-
-    Column name reference
-    ---------------------
-    sales1000 fact-table columns (Title Case, must be double-quoted):
-      "Sales Rep", "Region", "Total Revenue"
-
-    sales_rep_targets dim-table columns (snake_case, no quoting needed):
-      sales_rep, region, quota_usd
-    """
+    """Queries joining sales1000 (fact) to sales_rep_targets (dimension)."""
 
     QUOTA_SQL = """
         SELECT
@@ -258,19 +271,9 @@ class TestRepTargetsJoin:
 # ---------------------------------------------------------------------------
 
 class TestProductMetricsJoin:
-    """Queries joining sales1000 (fact) to product_metrics (dimension).
-
-    Column name reference
-    ---------------------
-    sales1000 fact-table columns (Title Case, double-quoted):
-      "Product Name", "Category", "Total Revenue", "Quantity Ordered", "Unit Price"
-
-    product_metrics dim-table columns (snake_case):
-      product_name, category, unit_cost_usd
-    """
+    """Queries joining sales1000 (fact) to product_metrics (dimension)."""
 
     def test_revenue_vs_avg_cost(self):
-        """Compare line-item revenue against product-level unit cost."""
         sql = """
             SELECT
                 s."Product Name",
@@ -292,7 +295,6 @@ class TestProductMetricsJoin:
         assert parsed["metadata"]["row_count"] >= 1
 
     def test_above_avg_cost_products(self):
-        """Orders where the unit price paid exceeds the product's sourcing cost."""
         sql = """
             SELECT
                 s."Product Name",
@@ -326,7 +328,6 @@ class TestProductMetricsJoin:
         )
 
     def test_top_categories_by_margin_proxy(self):
-        """Revenue per unit vs. sourcing cost -- rough margin proxy per category."""
         sql = """
             SELECT
                 s."Category",
@@ -344,14 +345,12 @@ class TestProductMetricsJoin:
 
 
 # ---------------------------------------------------------------------------
-# Three-table: sales1000 x sales_rep_targets x product_metrics
+# Three-table
 # ---------------------------------------------------------------------------
 
 class TestThreeTableJoin:
-    """Queries that touch all three tables simultaneously."""
 
     def test_rep_category_attainment(self):
-        """Per rep+region+category: actual revenue, quota share, attainment."""
         sql = """
             SELECT
                 s."Sales Rep"                                                  AS sales_rep,
@@ -378,7 +377,6 @@ class TestThreeTableJoin:
         assert parsed["metadata"]["row_count"] >= 1
 
     def test_underperforming_reps_on_high_revenue_products(self):
-        """Reps below quota who sell high-revenue products -- coaching targets."""
         sql = """
             WITH rep_actual AS (
                 SELECT
@@ -420,14 +418,12 @@ class TestThreeTableJoin:
 
 
 # ---------------------------------------------------------------------------
-# Regression: single-table queries still work after multi-table wiring
+# Regression: single-table queries
 # ---------------------------------------------------------------------------
 
 class TestSingleTableRegression:
-    """Ensure multi-table wiring doesn't break existing single-table paths."""
 
     def test_sales1000_aggregate(self):
-        # "Total Revenue" is a Title Case column in the fact table
         sql = """
             SELECT "Region", SUM("Total Revenue") AS total
             FROM sales1000
@@ -440,13 +436,11 @@ class TestSingleTableRegression:
         assert parsed["metadata"]["row_count"] >= 1
 
     def test_sales_rep_targets_standalone(self):
-        # quota_usd is the column name in the independently generated dim table
         sql = "SELECT * FROM sales_rep_targets ORDER BY quota_usd DESC LIMIT 5"
         result = run_sql.invoke({"query": sql})
         assert not result.startswith("ERROR"), f"Targets standalone query failed: {result}"
 
     def test_product_metrics_standalone(self):
-        # unit_cost_usd is the column name in product_metrics
         sql = "SELECT * FROM product_metrics ORDER BY unit_cost_usd DESC LIMIT 5"
         result = run_sql.invoke({"query": sql})
         assert not result.startswith("ERROR"), f"Product metrics standalone query failed: {result}"

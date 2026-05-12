@@ -3,26 +3,38 @@
 scripts/seed_multi_table.py
 
 One-shot seeder that:
-  1. Loads the three Excel tables into DuckDB via load_file.
-  2. Registers every table in _data_registry.
-  3. Indexes all columns in _column_catalog.
-  4. Purges ALL inferred relationships for the three tables, then registers
-     the four authoritative join pairs (no junk pairs from auto-detection).
+  1. Forces PARQUET_STORE to the canonical .local/parquet directory so the
+     parquet files are ALWAYS written there, regardless of any PARQUET_STORE
+     env var that may be set by pytest or a shell session.
+  2. Loads the three Excel tables into DuckDB via load_file.
+  3. Purges ALL inferred relationships for the three tables.
+  4. Registers the four authoritative join pairs.
   5. Upserts _table_context summaries.
 
 Usage:
-    # First generate the Excel files:
-    python scripts/generate_test_data.py
-
-    # Then seed (can be re-run safely -- all ops are idempotent):
-    python scripts/seed_multi_table.py
+    python scripts/generate_test_data.py   # only once
+    python scripts/seed_multi_table.py     # idempotent, re-run any time
 """
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 TABLES = ["sales1000", "sales_rep_targets", "product_metrics"]
+
+# ---------------------------------------------------------------------------
+# CRITICAL: force PARQUET_STORE to the canonical location BEFORE any agent
+# module is imported, so load_file always writes to .local/parquet/ and the
+# stored parquet_path in _data_registry is stable across test runs.
+# ---------------------------------------------------------------------------
+_CANONICAL_PARQUET_STORE = ROOT / ".local" / "parquet"
+os.environ["PARQUET_STORE"] = str(_CANONICAL_PARQUET_STORE)
+
+# Purge any already-imported agent modules so they re-bind to the new env var.
+for _mod in [m for m in sys.modules if m.startswith("agent")]:
+    del sys.modules[_mod]
 
 
 def main() -> None:
@@ -50,12 +62,13 @@ def main() -> None:
 
         row_count = conn.execute(f'SELECT COUNT(*) FROM "{dataset_name}"').fetchone()[0]
         col_count = len(conn.execute(f'PRAGMA table_info("{dataset_name}")').fetchall())
-        parquet_path = str(ROOT / ".local" / "parquet" / f"{dataset_name}.parquet")
+        parquet_path = str(_CANONICAL_PARQUET_STORE / f"{dataset_name}.parquet")
         conn.execute(
             """
             INSERT INTO _data_registry (dataset_name, parquet_path, row_count, column_count)
             VALUES (?, ?, ?, ?)
             ON CONFLICT (dataset_name) DO UPDATE SET
+                parquet_path = excluded.parquet_path,
                 row_count    = excluded.row_count,
                 column_count = excluded.column_count
             """,
@@ -64,11 +77,7 @@ def main() -> None:
         index_table_schema(conn, dataset_name)
 
     # ------------------------------------------------------------------
-    # 2. Purge ALL inferred relationships for these three tables.
-    #    infer_and_register_relationships (called by load_file) produces
-    #    false positives when column names match by coincidence
-    #    (e.g. 'order_date' or 'category' exist in multiple tables).
-    #    Only the four authoritative pairs registered below should survive.
+    # 2. Purge inferred relationships (auto-detected junk) for these tables
     # ------------------------------------------------------------------
     print("\nPurging inferred relationships for seeded tables...")
     conn.execute(
@@ -82,11 +91,6 @@ def main() -> None:
 
     # ------------------------------------------------------------------
     # 3. Register the four authoritative join pairs
-    #
-    # sales1000 columns are Title Case  ("Sales Rep", "Region",
-    #                                    "Product Name", "Category")
-    # dim-table columns are snake_case  (sales_rep, region,
-    #                                    product_name, category)
     # ------------------------------------------------------------------
     join_pairs = [
         ("sales1000", "Sales Rep",    "sales_rep_targets", "sales_rep",    "many-to-one", "Sales rep name join"),
@@ -102,43 +106,28 @@ def main() -> None:
     # 4. Upsert _table_context summaries
     # ------------------------------------------------------------------
     contexts = [
-        (
-            "sales1000",
-            "Individual sales transactions. One row per order line.",
-            "order_line",
-            ["fact", "transactions", "sales"],
-        ),
-        (
-            "sales_rep_targets",
-            "Management quotas per (sales_rep, region) pair. One row per rep-region.",
-            "sales_rep x region",
-            ["dimension", "quota", "targets"],
-        ),
-        (
-            "product_metrics",
-            "Product catalogue with sourcing costs. One row per product.",
-            "product",
-            ["dimension", "product", "cost"],
-        ),
+        ("sales1000",         "Individual sales transactions. One row per order line.",             "order_line",        ["fact", "transactions", "sales"]),
+        ("sales_rep_targets", "Management quotas per (sales_rep, region) pair.",                   "sales_rep x region", ["dimension", "quota", "targets"]),
+        ("product_metrics",   "Product catalogue with sourcing costs. One row per product.",        "product",           ["dimension", "product", "cost"]),
     ]
     for dataset_name, summary, grain, tags in contexts:
         upsert_table_context(dataset_name, summary, grain, tags)
         print(f"  context upserted: {dataset_name}")
 
     print("\nSeed complete. Tables registered:")
-    rows = conn.execute(
+    for name, rc, cc in conn.execute(
         "SELECT dataset_name, row_count, column_count FROM _data_registry ORDER BY dataset_name"
-    ).fetchall()
-    for name, rc, cc in rows:
+    ).fetchall():
         print(f"  {name}: {rc} rows, {cc} columns")
 
     print("\nRelationships registered:")
-    rels = conn.execute(
+    for lt, lc, rt, rc, card in conn.execute(
         "SELECT left_table, left_column, right_table, right_column, cardinality "
         "FROM _relationships ORDER BY relationship_id"
-    ).fetchall()
-    for lt, lc, rt, rc, card in rels:
+    ).fetchall():
         print(f"  {lt}.{lc!r} -> {rt}.{rc!r}  ({card})")
+
+    print(f"\nParquets written to: {_CANONICAL_PARQUET_STORE}")
 
 
 if __name__ == "__main__":

@@ -1,54 +1,46 @@
 """Session-level test configuration.
 
-Sets PARQUET_STORE to a temp dir before any agent module is imported so that
-test_parquet_persistence.py writes its parquets into an isolated location.
+Sets PARQUET_STORE to a temp dir so that test_parquet_persistence.py writes
+its parquets into an isolated location that is cleaned up after the session.
 
-test_multi_table.py connects to the REAL on-disk DuckDB (seeded by
-scripts/seed_multi_table.py) and must NOT have its parquets deleted between
-runs -- the seed script owns those files.
+IMPORTANT
+---------
+We do NOT purge agent.* from sys.modules here. Doing so resets _conn to None
+and forces a fresh get_connection() call during the test session, which (in
+combination with PARQUET_STORE pointing at the temp dir) would cause
+load_file to write the seed parquets into the temp dir -- then teardown
+deletes them and the next run breaks.
+
+Instead we rely on _get_parquet_store() reading the env var at call-time
+(fixed in agent/tools.py) so the override is always respected without
+needing a module purge.
+
+test_multi_table.py has its own module-scoped fixture that resets _conn so
+it reconnects to the real on-disk DB without disturbing the parquet paths
+stored in _data_registry.
 """
 from __future__ import annotations
 
 import os
 import shutil
-import sys
 
 import pytest
 
 
 @pytest.fixture(scope="session", autouse=True)
 def _session_env(tmp_path_factory):
-    """Set PARQUET_STORE to a session-scoped temp dir.
+    """Point PARQUET_STORE at a throwaway temp dir for the whole session.
 
-    We set the env var first, THEN purge agent.* from sys.modules so that
-    any already-imported agent module is re-imported against the patched env.
-
-    DUCKDB_PATH is intentionally NOT overridden here so that
-    test_multi_table.py can connect to the real seeded database.
-    test_parquet_persistence.py overrides it to ':memory:' via its own
-    _isolated_env fixture.
+    test_parquet_persistence.py picks this up via _get_parquet_store() and
+    writes its own parquets there. test_multi_table.py uses the real DB whose
+    views point at .local/parquet/ (written by the seed script).
     """
     parquet_dir = tmp_path_factory.mktemp("parquet_store_session")
     os.environ["PARQUET_STORE"] = str(parquet_dir)
 
-    # Purge agent modules so they re-import with the new PARQUET_STORE env var.
-    for mod_name in [m for m in sys.modules if m.startswith("agent")]:
-        del sys.modules[mod_name]
-
     yield parquet_dir
 
-    # ------------------------------------------------------------------
-    # Teardown: only clean up the session temp dir we created.
-    # Do NOT touch .local/parquet/ -- those belong to the seed script and
-    # must persist across test runs so _auto_reattach_parquet can find them.
-    # ------------------------------------------------------------------
-
-    try:
-        import agent.database as _db
-        _db._conn = None
-    except Exception:
-        pass
-
+    # Teardown: delete only the session temp dir. Never touch .local/parquet/.
     if parquet_dir.exists():
         shutil.rmtree(parquet_dir, ignore_errors=True)
 
