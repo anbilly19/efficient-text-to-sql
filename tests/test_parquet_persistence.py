@@ -17,51 +17,6 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
-# Module-level isolation fixture
-# ---------------------------------------------------------------------------
-
-@pytest.fixture(scope="module", autouse=True)
-def _isolated_env(tmp_path_factory):
-    """
-    1. Force DUCKDB_PATH=:memory:
-    2. Purge agent.* modules ONCE
-    3. Warm up a single connection that all tests in this module share
-    4. Teardown: close + purge again so the next module starts clean
-    """
-    # Step 1 — must happen before any agent import
-    prev_db = os.environ.get("DUCKDB_PATH")
-    os.environ["DUCKDB_PATH"] = ":memory:"
-
-    # Step 2 — fresh import of agent.database with :memory:
-    for mod in [m for m in sys.modules if m.startswith("agent")]:
-        del sys.modules[mod]
-
-    # Step 3 — create & warm the shared connection
-    import agent.database as db_mod
-    db_mod._conn = None
-    db_mod.get_connection()           # creates the :memory: DB + metadata tables
-
-    yield
-
-    # Step 4 — teardown
-    import agent.database as db_mod2  # re-import in case it changed
-    if db_mod2._conn is not None:
-        try:
-            db_mod2._conn.close()
-        except Exception:
-            pass
-    db_mod2._conn = None
-
-    for mod in [m for m in sys.modules if m.startswith("agent")]:
-        del sys.modules[mod]
-
-    if prev_db is not None:
-        os.environ["DUCKDB_PATH"] = prev_db
-    else:
-        os.environ.pop("DUCKDB_PATH", None)
-
-
-# ---------------------------------------------------------------------------
 # Helper
 # ---------------------------------------------------------------------------
 
@@ -77,9 +32,60 @@ def _make_sample_excel(path: Path) -> pd.DataFrame:
     return df
 
 
+def _purge_agent():
+    for mod in [m for m in sys.modules if m.startswith("agent")]:
+        del sys.modules[mod]
+
+
+def _rewarm_memory():
+    """Purge agent.*, set DUCKDB_PATH=:memory:, create fresh connection."""
+    os.environ["DUCKDB_PATH"] = ":memory:"
+    _purge_agent()
+    import agent.database as db_mod
+    db_mod._conn = None
+    db_mod.get_connection()
+
+
+# ---------------------------------------------------------------------------
+# Module-level isolation
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module", autouse=True)
+def _isolated_env(tmp_path_factory):
+    """
+    - Force DUCKDB_PATH=:memory: for the whole module.
+    - Warm ONE shared connection.
+    - Pre-load 'demo' dataset so TestColumnCatalog always finds it,
+      even after test_view_survives_connection_reset re-warms the connection.
+    """
+    prev_db = os.environ.get("DUCKDB_PATH")
+    _rewarm_memory()
+
+    # Pre-load demo on the fresh connection
+    from agent.tools import load_file
+    demo_xl = tmp_path_factory.mktemp("demo_setup") / "demo.xlsx"
+    _make_sample_excel(demo_xl)
+    load_file.invoke({"path": str(demo_xl), "dataset_name": "demo"})
+
+    yield
+
+    # Teardown
+    try:
+        import agent.database as db_mod
+        if db_mod._conn:
+            db_mod._conn.close()
+        db_mod._conn = None
+    except Exception:
+        pass
+    _purge_agent()
+    if prev_db is not None:
+        os.environ["DUCKDB_PATH"] = prev_db
+    else:
+        os.environ.pop("DUCKDB_PATH", None)
+
+
 # ---------------------------------------------------------------------------
 # Parquet persistence tests
-# All use the shared :memory: connection — never reset _conn between them.
 # ---------------------------------------------------------------------------
 
 class TestParquetPersistence:
@@ -90,8 +96,7 @@ class TestParquetPersistence:
         _make_sample_excel(xl)
         result = load_file.invoke({"path": str(xl), "dataset_name": "sales"})
         assert "Successfully loaded" in result, result
-        pq = get_parquet_path("sales")
-        assert pq.exists(), f"Parquet not found: {pq}"
+        assert get_parquet_path("sales").exists()
 
     def test_parquet_readable_by_pandas(self, tmp_path):
         from agent.tools import load_file, get_parquet_path
@@ -103,48 +108,39 @@ class TestParquetPersistence:
         assert len(loaded) == len(original)
 
     def test_duckdb_view_queryable(self, tmp_path):
-        """View is queryable on the same shared connection."""
         from agent.tools import load_file
         from agent.database import get_connection
         xl = tmp_path / "sales3.xlsx"
         _make_sample_excel(xl)
         load_file.invoke({"path": str(xl), "dataset_name": "sales3"})
-        # get_connection() returns the SAME :memory: instance — no reset
         row = get_connection().execute('SELECT COUNT(*) FROM "sales3"').fetchone()
         assert row[0] == 5
 
     def test_view_survives_connection_reset(self, tmp_path):
-        """With a file-backed DB the view is restored via _auto_reattach_parquet."""
-        import agent.database as db_mod
-        from agent.tools import load_file, get_parquet_path
-
+        """File-backed DB: view is restored via _auto_reattach_parquet on reconnect."""
         file_db = tmp_path / "restart.duckdb"
         prev_db = os.environ.get("DUCKDB_PATH")
         os.environ["DUCKDB_PATH"] = str(file_db)
 
-        # Give this sub-test its own fresh file DB
-        db_mod._conn = None
-        for mod in [m for m in sys.modules if m.startswith("agent")]:
-            del sys.modules[mod]
-
+        _purge_agent()
         try:
-            from agent.tools import load_file as lf  # noqa: F811
+            from agent.tools import load_file as lf, get_parquet_path
             import agent.database as db2
+            db2._conn = None
+            db2.get_connection()
 
             xl = tmp_path / "sales4.xlsx"
             _make_sample_excel(xl)
             lf.invoke({"path": str(xl), "dataset_name": "sales4"})
-            pq = get_parquet_path("sales4")
 
-            # Simulate restart: close and reset
+            # Simulate restart
             if db2._conn:
                 db2._conn.close()
             db2._conn = None
-            for mod in [m for m in sys.modules if m.startswith("agent")]:
-                del sys.modules[mod]
+            _purge_agent()
 
             from agent.database import get_connection as gc
-            conn = gc()   # _auto_reattach_parquet runs here
+            conn = gc()   # triggers _auto_reattach_parquet
             row = conn.execute('SELECT COUNT(*) FROM "sales4"').fetchone()
             assert row[0] == 5
 
@@ -156,15 +152,14 @@ class TestParquetPersistence:
                 db_fin._conn = None
             except Exception:
                 pass
-            for mod in [m for m in sys.modules if m.startswith("agent")]:
-                del sys.modules[mod]
-            # Restore :memory: for remaining tests in this module
-            os.environ["DUCKDB_PATH"] = ":memory:"
-            if prev_db is not None:
-                pass   # leave :memory: — remaining tests need it
-            import agent.database as db_restore
-            db_restore._conn = None
-            db_restore.get_connection()   # re-warm :memory:
+            # Restore shared :memory: connection AND reload demo
+            _rewarm_memory()
+            from agent.tools import load_file as lf2
+            from agent.tools import get_parquet_path as gpp
+            demo_pq = gpp("demo")
+            if demo_pq.exists():
+                # Re-register the view on the fresh :memory: connection
+                lf2.invoke({"path": str(demo_pq), "dataset_name": "demo"})
 
     def test_date_columns_stored_as_native_type(self, tmp_path):
         from agent.tools import load_file, get_parquet_path
@@ -179,17 +174,11 @@ class TestParquetPersistence:
 
 # ---------------------------------------------------------------------------
 # Column catalog tests
-# Load 'demo' once at class scope, query the shared connection.
+# 'demo' is guaranteed to exist: loaded in _isolated_env and reloaded in
+# test_view_survives_connection_reset's finally block.
 # ---------------------------------------------------------------------------
 
 class TestColumnCatalog:
-
-    @pytest.fixture(scope="class", autouse=True)
-    def _load_demo(self, tmp_path_factory):
-        from agent.tools import load_file
-        xl = tmp_path_factory.mktemp("demo_data") / "demo.xlsx"
-        _make_sample_excel(xl)
-        load_file.invoke({"path": str(xl), "dataset_name": "demo"})
 
     def test_column_catalog_rows_exist(self):
         from agent.database import get_connection
@@ -229,7 +218,9 @@ class TestColumnCatalog:
 
     def test_search_semantic_lookup_no_match_returns_empty(self):
         from agent.tools import search_semantic_lookup
-        assert json.loads(search_semantic_lookup.invoke({"query": "zzznomatchxxx", "dataset": "demo"})) == []
+        assert json.loads(
+            search_semantic_lookup.invoke({"query": "zzznomatchxxx", "dataset": "demo"})
+        ) == []
 
 
 class TestSchemaLookupToolInSuite:
