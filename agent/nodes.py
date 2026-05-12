@@ -254,8 +254,6 @@ _SCHEMA_PATTERNS = [
     re.compile(r"\bshow\s+(?:me\s+)?(?:all\s+)?(?:available\s+)?tables?\b", re.IGNORECASE),
 ]
 
-# META intent: questions about agent state — loaded tables, access, capabilities.
-# Answered deterministically from _data_registry; never sent to the LLM planner.
 _META_PATTERNS = [
     re.compile(r"\b(?:do\s+you\s+have|have\s+you\s+(?:got|loaded)|is\s+there|can\s+you\s+(?:see|access|use))\b", re.IGNORECASE),
     re.compile(r"\b(?:access\s+to|loaded|available|registered)\b", re.IGNORECASE),
@@ -284,12 +282,10 @@ def _detect_schema_intent(text: str) -> bool:
 
 
 def _detect_meta_intent(text: str) -> bool:
-    """True when the user is asking about agent state / loaded tables."""
     return any(p.search(text) for p in _META_PATTERNS)
 
 
 def _build_meta_reply(query: str, all_tables: list[str]) -> str:
-    """Answer a META question directly from _data_registry — no LLM needed."""
     conn = get_connection()
     query_lower = query.lower()
 
@@ -299,7 +295,6 @@ def _build_meta_reply(query: str, all_tables: list[str]) -> str:
             "`load file at <path> as <name>`"
         )
 
-    # Check if the user is asking about a specific table by name
     mentioned = [t for t in all_tables if t.lower() in query_lower]
 
     if mentioned:
@@ -320,7 +315,6 @@ def _build_meta_reply(query: str, all_tables: list[str]) -> str:
                 lines.append(f"❌ **{t}** is not currently loaded.")
         return "\n".join(lines)
 
-    # Generic "what tables do you have?" type question
     rows = conn.execute(
         "SELECT dataset_name, row_count, column_count, ingested_at "
         "FROM _data_registry ORDER BY ingested_at"
@@ -365,6 +359,129 @@ def _resolve_user_query(state: AnalyticsState) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Verifier helper: semantic gap detection
+# ---------------------------------------------------------------------------
+
+# Stopwords to exclude from concept extraction
+_QUERY_STOPWORDS = {
+    "what", "show", "list", "give", "find", "from", "that", "this", "with",
+    "have", "does", "each", "many", "much", "more", "most", "last", "year",
+    "month", "week", "date", "time", "when", "where", "which", "the", "per",
+    "and", "for", "all", "total", "annual", "revenue", "sales", "data",
+    "table", "column", "value", "number", "count", "average", "mean",
+    "group", "order", "sort", "filter", "between", "above", "below",
+}
+
+
+def _extract_select_columns(sql: str) -> set[str]:
+    """Extract bare column names / aliases from the SELECT clause of a SQL string."""
+    # Grab everything between SELECT and FROM
+    m = re.search(r'\bSELECT\b(.+?)\bFROM\b', sql, re.IGNORECASE | re.DOTALL)
+    if not m:
+        return set()
+    select_clause = m.group(1)
+    tokens: set[str] = set()
+    for part in select_clause.split(","):
+        part = part.strip()
+        # If there's an AS alias, take the alias; otherwise take the last word/quoted token
+        alias_m = re.search(r'\bAS\s+"?([\w\s]+)"?\s*$', part, re.IGNORECASE)
+        if alias_m:
+            tokens.add(alias_m.group(1).strip().lower().replace('"', ''))
+        else:
+            # Take last identifier (strip table.prefix)
+            bare = re.sub(r'^.*\.', '', part)  # remove table prefix
+            bare = re.sub(r'["\s]', '', bare).lower()
+            if bare:
+                tokens.add(bare)
+    return tokens
+
+
+def _detect_semantic_gaps(
+    user_query: str,
+    sql: str,
+    table_names: list[str],
+) -> str:
+    """
+    Compare concept keywords in the user question against the columns that
+    actually appear in the executed SQL's SELECT clause.
+
+    Returns a warning string (non-empty) if a meaningful concept from the
+    user question has no matching column in either the catalog or the SQL
+    result — meaning the LLM silently dropped a requested dimension.
+
+    Returns empty string when everything checks out.
+    """
+    conn = get_connection()
+
+    # All known column names across the queried tables (lowercased, normalised)
+    catalog_cols: set[str] = set()
+    for tbl in table_names:
+        try:
+            rows = conn.execute(
+                "SELECT column_name FROM _column_catalog WHERE dataset_name = ?",
+                [tbl],
+            ).fetchall()
+            for (col,) in rows:
+                # Normalise: lowercase + strip spaces/underscores for fuzzy match
+                catalog_cols.add(col.lower())
+                catalog_cols.add(col.lower().replace(" ", "").replace("_", ""))
+        except Exception:
+            pass
+
+    # Concept keywords the user mentioned (4+ chars, not stopwords)
+    user_concepts = [
+        w for w in re.findall(r'[a-zA-Z]{4,}', user_query.lower())
+        if w not in _QUERY_STOPWORDS
+    ]
+
+    # Columns actually used in the SELECT
+    sql_cols = _extract_select_columns(sql)
+
+    gaps: list[str] = []
+    for concept in user_concepts:
+        concept_norm = concept.replace(" ", "").replace("_", "")
+        # Check if concept maps to any known catalog column
+        in_catalog = any(
+            concept_norm in c.replace(" ", "").replace("_", "")
+            or c.replace(" ", "").replace("_", "") in concept_norm
+            for c in catalog_cols
+        )
+        if not in_catalog:
+            # Concept not in catalog at all — user may have requested a
+            # dimension that genuinely doesn't exist in the data
+            gaps.append(
+                f'  ⚠️  Concept "{concept}" was requested but no matching column exists '
+                f'in the loaded table(s): {table_names}. '
+                f'Available columns: {sorted(catalog_cols)[:10]}'
+            )
+        else:
+            # Concept IS in catalog — check if it made it into the SQL result
+            in_sql = any(
+                concept_norm in c.replace(" ", "").replace("_", "")
+                or c.replace(" ", "").replace("_", "") in concept_norm
+                for c in sql_cols
+            )
+            if not in_sql:
+                # Concept exists in schema but was silently dropped from the query
+                # Find the best-matching catalog column name to suggest
+                best = next(
+                    (
+                        c for c in catalog_cols
+                        if concept_norm in c.replace(" ", "").replace("_", "")
+                        or c.replace(" ", "").replace("_", "") in concept_norm
+                    ),
+                    None,
+                )
+                suggestion = f' (closest column: "{best}")' if best else ""
+                gaps.append(
+                    f'  ⚠️  Concept "{concept}" was requested but is not in the SQL result.'
+                    f'{suggestion} The query was answered on the available dimensions only.'
+                )
+
+    return "\n".join(gaps)
+
+
+# ---------------------------------------------------------------------------
 # Node: orchestrator
 # ---------------------------------------------------------------------------
 
@@ -403,14 +520,26 @@ def orchestrator(state: AnalyticsState) -> dict:
         else:
             row_count = state.last_query_metadata.get("row_count", "?")
             table_preview = _rows_to_markdown(state.last_query_result)
+            # Include any verifier gap warnings in the synthesis so the LLM
+            # can mention them naturally in the final answer.
+            gap_note = (
+                f"\n\nVerifier note: {state.verification_feedback}"
+                if state.verification_feedback
+                and state.verification_verdict == "warning"
+                and "⚠️" in state.verification_feedback
+                else ""
+            )
             synthesis_prompt = (
                 f"User question: {state.user_query}\n\n"
                 f"SQL executed: {state.last_sql}\n\n"
                 f"Row count: {row_count}\n\n"
                 f"Query results:\n{table_preview}\n\n"
-                "Write a clear, concise answer for the user. "
+                + (gap_note.lstrip() + "\n\n" if gap_note else "")
+                + "Write a clear, concise answer for the user. "
                 "If the result is a table, present it as markdown. "
                 "If it is a single value, describe it in plain English. "
+                "If there is a verifier note about a missing dimension, "
+                "mention it briefly at the end so the user knows what could not be answered.\n"
                 'Output ONLY this JSON: {"final_answer": "<your answer>"}'
             )
             response = _llm().invoke([HumanMessage(content=synthesis_prompt)])
@@ -452,9 +581,6 @@ def orchestrator(state: AnalyticsState) -> dict:
         return {**base_reset, "final_answer": reply, "messages": [AIMessage(content=reply)]}
 
     # ── Fast-path 3: META — agent-state questions ──────────────────────────
-    # Catches: "do you have access to X?", "is Y loaded?", "what tables do you have?",
-    # "can you see sales1000?", "what data is available?", etc.
-    # Answered deterministically from _data_registry — no LLM, no SQL plan.
     if _detect_meta_intent(current_query):
         reply = _build_meta_reply(current_query, all_tables)
         return {**base_reset, "final_answer": reply, "messages": [AIMessage(content=reply)]}
@@ -533,11 +659,9 @@ Output ONLY the JSON. No markdown, no explanation.
         return {**base_reset, "plan": plan}
 
     if intent == "meta":
-        # LLM was asked to answer but we prefer the deterministic version
         reply = _build_meta_reply(current_query, all_tables)
         return {**base_reset, "final_answer": reply, "messages": [AIMessage(content=reply)]}
 
-    # CHITCHAT
     reply = str(parsed.get("final_answer", "Hi! Ask a data question or load a file."))
     return {**base_reset, "final_answer": reply, "messages": [AIMessage(content=reply)]}
 
@@ -770,6 +894,7 @@ def verifier(state: AnalyticsState) -> dict:
     row_count = state.last_query_metadata.get("row_count", "unknown")
     table_preview = _rows_to_markdown(state.last_query_result)
 
+    # ── Cardinality check ──────────────────────────────────────────────────
     cardinality_warning = ""
     if not is_error and state.last_query_metadata:
         conn = get_connection()
@@ -794,6 +919,7 @@ def verifier(state: AnalyticsState) -> dict:
         except Exception:
             pass
 
+    # ── JOIN key check ─────────────────────────────────────────────────────
     join_warnings: list[str] = []
     if not is_error and state.last_sql and "JOIN" in state.last_sql.upper():
         try:
@@ -801,11 +927,35 @@ def verifier(state: AnalyticsState) -> dict:
         except Exception:
             pass
 
+    # ── Schema hint (for error correction) ────────────────────────────────
     schema_hint = ""
     most_recent = _most_recent_table()
     if most_recent:
         try:
             schema_hint = get_schema_context([most_recent])
+        except Exception:
+            pass
+
+    # ── Semantic gap detection (hallucinated / dropped dimensions) ─────────
+    # Runs only on successful queries so we don't double-report on errors.
+    semantic_gap_block = ""
+    if not is_error and state.last_sql and state.user_query:
+        try:
+            all_tables = _all_table_names()
+            gap_warnings = _detect_semantic_gaps(
+                state.user_query,
+                state.last_sql,
+                all_tables,
+            )
+            if gap_warnings:
+                semantic_gap_block = (
+                    "\n⚠️  SEMANTIC GAP DETECTED (dimension requested but missing from result):\n"
+                    + gap_warnings
+                    + "\n"
+                    "  → Set verdict=warning, do NOT set verdict=fail. "
+                    "The result is still valid for the dimensions that ARE present. "
+                    "Explain what was answered and what dimension is absent from the data.\n"
+                )
         except Exception:
             pass
 
@@ -833,9 +983,11 @@ def verifier(state: AnalyticsState) -> dict:
             f"First rows:\n{table_preview[:1500]}\n\n"
             + (f"{cardinality_warning}\n\n" if cardinality_warning else "")
             + join_warn_block
+            + semantic_gap_block
             + "Verify whether the SQL correctly answers the sub-task.\n"
             "- Correct → verdict=pass\n"
             "- Clear bug (wrong column, bad filter, JOIN fan-out, unregistered join key) → verdict=fail with corrected_sql\n"
+            "- Missing dimension (semantic gap warning above) → verdict=warning with feedback explaining what is present vs absent\n"
             "- Plausible but uncertain → verdict=warning (treated as pass)\n"
             "- Do NOT call any tools.\n"
             'Output ONLY: {"verdict": "pass|fail|warning", "feedback": "...", "corrected_sql": "(only if fail)"}'
