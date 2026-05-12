@@ -10,14 +10,54 @@ from typing import Optional
 import pandas as pd
 from langchain_core.tools import tool
 
-from agent.database import (
-    get_connection,
-    get_schema_context,
-    get_table_summaries,
-    index_table_schema,
-    infer_and_register_relationships,
-    register_relationship,
-)
+# ---------------------------------------------------------------------------
+# Lazy database accessors
+# Do NOT do `from agent.database import get_connection` at module level.
+# That binds to the module object that existed at import time. If tests
+# purge and re-import agent.database, the bound name becomes stale and
+# load_file ends up writing views onto a different connection than the one
+# the caller later queries.
+#
+# Instead, always go through the live sys.modules entry at call-time.
+# ---------------------------------------------------------------------------
+
+import sys as _sys
+
+
+def _db():
+    """Return the live agent.database module."""
+    return _sys.modules["agent.database"]
+
+
+def get_connection():
+    return _db().get_connection()
+
+
+def get_schema_context(table_names):
+    return _db().get_schema_context(table_names)
+
+
+def get_table_summaries():
+    return _db().get_table_summaries()
+
+
+def index_table_schema(conn, dataset_name):
+    return _db().index_table_schema(conn, dataset_name)
+
+
+def infer_and_register_relationships(conn, new_table):
+    return _db().infer_and_register_relationships(conn, new_table)
+
+
+def register_relationship(conn, left_table, left_column, right_table, right_column,
+                          cardinality="many-to-one", description=None):
+    return _db().register_relationship(
+        conn, left_table, left_column, right_table, right_column, cardinality, description
+    )
+
+
+# Ensure agent.database is imported (it always will be, but be explicit).
+import agent.database as _agent_database  # noqa: F401, E402
 
 # ---------------------------------------------------------------------------
 # Parquet storage
@@ -28,13 +68,7 @@ _DEFAULT_PARQUET_STORE = _PROJECT_ROOT / ".local" / "parquet"
 
 
 def _get_parquet_store() -> Path:
-    """Return the active PARQUET_STORE path, reading the env var at call-time.
-
-    During tests, conftest.py sets PARQUET_STORE to a tmp_path *before* any
-    agent module is imported. Reading the env var here (rather than at module
-    import time) ensures the test-injected value is always respected even when
-    sys.modules caching would otherwise serve a stale constant.
-    """
+    """Return the active PARQUET_STORE path, reading the env var at call-time."""
     env = os.environ.get("PARQUET_STORE")
     return Path(env) if env else _DEFAULT_PARQUET_STORE
 
@@ -45,11 +79,6 @@ def get_parquet_path(dataset_name: str) -> Path:
 
 
 class _LazyParquetStore:
-    """Proxy that forwards Path operations to _get_parquet_store() at call-time.
-
-    Kept for any code that does `from agent.tools import PARQUET_STORE` and
-    uses it like a Path (e.g. PARQUET_STORE / name, PARQUET_STORE.mkdir()).
-    """
     def __truediv__(self, other):   return _get_parquet_store() / other
     def __str__(self):              return str(_get_parquet_store())
     def __repr__(self):             return repr(_get_parquet_store())
@@ -376,9 +405,6 @@ def lookup_semantic(term: str) -> str:
 def search_semantic_lookup(query: str, dataset: Optional[str] = None) -> str:
     """Search _column_catalog for columns matching a keyword or description.
 
-    Useful for finding which column(s) across any loaded table represent a
-    business concept (e.g. 'revenue', 'customer id', 'date of order').
-
     Args:
         query: Keyword or phrase to search for in column names and descriptions.
         dataset: Optional table name to restrict the search.
@@ -449,11 +475,9 @@ def load_file(path: str, dataset_name: str) -> str:
     file_path = file_path.resolve()
 
     suffix = file_path.suffix.lower()
-    # Resolve store at call-time so PARQUET_STORE env override is always respected.
     parquet_store = _get_parquet_store()
     parquet_path = parquet_store / f"{dataset_name}.parquet"
 
-    # ── 1. Read source ───────────────────────────────────────────────────────────────────────────────────
     try:
         if suffix in (".xlsx", ".xls"):
             df = pd.read_excel(file_path)
@@ -468,14 +492,12 @@ def load_file(path: str, dataset_name: str) -> str:
     except Exception as exc:
         return f"ERROR reading file: {exc}"
 
-    # ── 2. Persist as Parquet ───────────────────────────────────────────────────────────────────
     try:
         parquet_store.mkdir(parents=True, exist_ok=True)
         df.to_parquet(parquet_path, index=False, engine="pyarrow")
     except Exception as exc:
         return f"ERROR writing Parquet: {exc}"
 
-    # ── 3. Register as a DuckDB VIEW ──────────────────────────────────────────
     try:
         conn.execute(
             f'CREATE OR REPLACE VIEW "{dataset_name}" AS '
@@ -487,7 +509,6 @@ def load_file(path: str, dataset_name: str) -> str:
     row_count = len(df)
     col_count = len(df.columns)
 
-    # ── 4. Update _data_registry ─────────────────────────────────────────────────────
     try:
         conn.execute(
             """
@@ -506,20 +527,17 @@ def load_file(path: str, dataset_name: str) -> str:
     except Exception as exc:
         return f"File loaded but registry update failed: {exc}"
 
-    # ── 5. Index schema into _column_catalog ─────────────────────────────────
     try:
         index_table_schema(conn, dataset_name)
     except Exception as exc:
         return f"File loaded but column catalog indexing failed: {exc}"
 
-    # ── 6. Auto-detect join relationships ──────────────────────────────────────
     inferred = []
     try:
         inferred = infer_and_register_relationships(conn, dataset_name)
     except Exception:
         pass
 
-    # ── 7. Seed _table_context with a minimal summary ──────────────────────────
     try:
         existing = conn.execute(
             "SELECT 1 FROM _table_context WHERE dataset_name = ?", [dataset_name]
