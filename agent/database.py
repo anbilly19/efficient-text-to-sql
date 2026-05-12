@@ -88,7 +88,6 @@ def _ensure_metadata_tables(conn: duckdb.DuckDBPyConnection) -> None:
             column_count  INTEGER
         )
     """)
-    # Migration: add columns introduced after the initial schema
     _add_column_if_missing(conn, "_data_registry", "ingested_at",
                            "TIMESTAMP DEFAULT current_timestamp")
     _add_column_if_missing(conn, "_data_registry", "row_count",   "BIGINT")
@@ -171,12 +170,7 @@ def _ensure_metadata_tables(conn: duckdb.DuckDBPyConnection) -> None:
 # ---------------------------------------------------------------------------
 
 def _auto_reattach_parquet(conn: duckdb.DuckDBPyConnection) -> None:
-    """Re-create views for all registered Parquet files on startup.
-
-    This means analysts never need to re-upload files after a process restart.
-    Missing Parquet files are skipped silently (the registry entry is retained
-    so the user can re-ingest if needed).
-    """
+    """Re-create views for all registered Parquet files on startup."""
     rows = conn.execute(
         "SELECT dataset_name, parquet_path FROM _data_registry"
     ).fetchall()
@@ -332,7 +326,7 @@ def register_relationship(
         ON CONFLICT (left_table, left_column, right_table, right_column)
         DO UPDATE SET cardinality = excluded.cardinality,
                       description = excluded.description,
-                      added_at    = current_timestamp
+                      added_at    = now()
         """,
         [left_table, left_column, right_table, right_column, cardinality, description],
     )
@@ -349,7 +343,12 @@ def register_relationship(
 # ---------------------------------------------------------------------------
 
 def get_schema_context(table_names: list[str]) -> str:
-    """Return a compact schema block for the given tables."""
+    """Return a schema block for the given tables with all column names
+    double-quoted so the LLM uses them verbatim in generated SQL.
+
+    CRITICAL: column names are shown in double-quotes exactly as they must
+    appear in DuckDB SQL.  The LLM must copy them character-for-character.
+    """
     conn = get_connection()
     lines = []
     for tbl in table_names:
@@ -358,30 +357,39 @@ def get_schema_context(table_names: list[str]) -> str:
             [tbl],
         ).fetchone()
         summary = ctx[0] if ctx and ctx[0] else ""
-        grain = ctx[1] if ctx and ctx[1] else ""
-        lines.append(f"## Table: {tbl}")
+        grain   = ctx[1] if ctx and ctx[1] else ""
+
+        lines.append(f'## Table: "{tbl}"')
+        lines.append(
+            '-- RULE: use ONLY the column names listed below, '
+            'exactly as quoted.  Do NOT invent, abbreviate, or rename any column.'
+        )
         if summary:
             lines.append(f"Summary: {summary}")
         if grain:
             lines.append(f"Grain: {grain}")
+
         cols = conn.execute(
-            "SELECT column_name, column_type, is_metric, is_dimension, is_join_key, description, sample_values "
+            "SELECT column_name, column_type, is_metric, is_dimension, "
+            "is_join_key, description, sample_values "
             "FROM _column_catalog WHERE dataset_name = ? ORDER BY column_name",
             [tbl],
         ).fetchall()
-        for col_name, col_type, is_metric, is_dim, is_jk, desc, samples in cols:
-            flags = []
-            if is_metric:
-                flags.append("metric")
-            if is_dim:
-                flags.append("dimension")
-            if is_jk:
-                flags.append("join_key")
-            flag_str = ", ".join(flags)
-            desc_str = f" — {desc}" if desc else ""
-            lines.append(f"  {col_name} ({col_type}) [{flag_str}]{desc_str}")
-            if samples and samples != "[]":
-                lines.append(f"    samples: {samples}")
+
+        if not cols:
+            lines.append("  (no columns indexed — re-ingest the table)")
+        else:
+            for col_name, col_type, is_metric, is_dim, is_jk, desc, samples in cols:
+                flags = []
+                if is_metric:    flags.append("metric")
+                if is_dim:       flags.append("dimension")
+                if is_jk:        flags.append("join_key")
+                flag_str = ", ".join(flags)
+                desc_str = f" — {desc}" if desc else ""
+                # Column name is always double-quoted so the LLM copies it verbatim
+                lines.append(f'  "{col_name}" ({col_type}) [{flag_str}]{desc_str}')
+                if samples and samples != "[]":
+                    lines.append(f"    samples: {samples}")
         lines.append("")
 
     if len(table_names) > 1:
@@ -394,9 +402,10 @@ def get_schema_context(table_names: list[str]) -> str:
             [table_names, table_names],
         ).fetchall()
         if rels:
-            lines.append("## Relationships")
+            lines.append("## Relationships (authoritative join keys — use ONLY these pairs)")
             for lt, lc, rt, rc, card in rels:
-                lines.append(f"  {lt}.{lc} → {rt}.{rc}  ({card})")
+                # Both sides quoted for clarity
+                lines.append(f'  "{lt}"."{lc}" → "{rt}"."{rc}"  ({card})')
 
     return "\n".join(lines)
 
