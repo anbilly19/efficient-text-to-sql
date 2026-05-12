@@ -1,26 +1,15 @@
 """Unit tests for Parquet persistence and _semantic_lookup.
 
-These tests run fully offline - no LangGraph server needed.
+These tests run fully offline – no LangGraph server needed.
 They import agent code directly and use a fresh in-memory DuckDB
 for each test module session.
-
-
-Fixture hierarchy
------------------
-conftest.py::_session_env   (scope=session, autouse)
-    Sets PARQUET_STORE + DUCKDB_PATH *before* any agent module is
-    imported, so module-level constants in agent.database / agent.tools
-    pick up the temp paths correctly.
-
-_isolated_env               (scope=module, autouse)
-    Resets the DuckDB singleton (_conn = None) at the start of this
-    module so TestParquetPersistence and TestSemanticLookup each get a
-    clean in-memory database.
 """
 from __future__ import annotations
 
+import importlib
 import json
-import sys
+import os
+import tempfile
 from pathlib import Path
 
 import pandas as pd
@@ -28,23 +17,28 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
-# Module-level isolation -- reset the singleton once for the whole module.
-# The heavy env-var patching is done by conftest._session_env already.
+# Patch the singleton connection before any agent module is imported so every
+# test gets a clean in-memory DuckDB and an isolated Parquet store.
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="module", autouse=True)
-def _isolated_env():
-    """Reset the DuckDB connection singleton before this test module runs."""
-    # Purge cached agent modules so they re-bind PARQUET_STORE from the env
-    # vars set by conftest._session_env.
-    for mod_name in [m for m in sys.modules if m.startswith("agent")]:
-        del sys.modules[mod_name]
+def _isolated_env(tmp_path_factory):
+    """Point PARQUET_STORE and DUCKDB_PATH at temp dirs for the whole module."""
+    parquet_dir = tmp_path_factory.mktemp("parquet_store")
+    os.environ["PARQUET_STORE"] = str(parquet_dir)
+    os.environ["DUCKDB_PATH"] = ":memory:"
 
+    # Force re-import of agent modules so they pick up the env vars fresh.
+    for mod_name in list(m for m in list(__import__("sys").modules) if m.startswith("agent")):
+        del __import__("sys").modules[mod_name]
+
+    # Also reset the connection singleton if already created.
     import agent.database as db_module
     db_module._conn = None
 
-    yield
+    yield parquet_dir
 
+    # Teardown: reset singleton for other test modules.
     import agent.database as db_module  # noqa: F811
     db_module._conn = None
 
@@ -56,11 +50,11 @@ def _isolated_env():
 def _make_sample_excel(path: Path) -> pd.DataFrame:
     """Write a tiny sales DataFrame to an Excel file and return it."""
     df = pd.DataFrame({
-        "order_id":   [1, 2, 3, 4, 5],
-        "customer":   ["Alice", "Bob", "Alice", "Carol", "Bob"],
-        "revenue":    [120.5, 340.0, 88.75, 210.0, 560.25],
-        "order_date": ["2023-01-15", "2023-03-22", "2023-06-10", "2024-01-05", "2024-02-28"],
-        "category":   ["A", "B", "A", "C", "B"],
+        "order_id":    [1, 2, 3, 4, 5],
+        "customer":    ["Alice", "Bob", "Alice", "Carol", "Bob"],
+        "revenue":     [120.5, 340.0, 88.75, 210.0, 560.25],
+        "order_date":  ["2023-01-15", "2023-03-22", "2023-06-10", "2024-01-05", "2024-02-28"],
+        "category":    ["A", "B", "A", "C", "B"],
     })
     df.to_excel(path, index=False)
     return df
@@ -71,11 +65,11 @@ def _make_sample_excel(path: Path) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 class TestParquetPersistence:
-    """load_file converts Excel -> Parquet and registers a DuckDB view."""
+    """load_file converts Excel → Parquet and registers a DuckDB view."""
 
-    def test_parquet_file_created(self, tmp_path):
+    def test_parquet_file_created(self, _isolated_env, tmp_path):
         from agent.tools import load_file
-        from agent.database import PARQUET_STORE, get_parquet_path  # noqa: F401
+        from agent.database import PARQUET_STORE, get_parquet_path
 
         xl = tmp_path / "sales.xlsx"
         _make_sample_excel(xl)
@@ -87,7 +81,7 @@ class TestParquetPersistence:
         assert pq.exists(), f"Parquet file not found at {pq}"
         assert pq.suffix == ".parquet"
 
-    def test_parquet_readable_by_pandas(self, tmp_path):
+    def test_parquet_readable_by_pandas(self, _isolated_env, tmp_path):
         from agent.tools import load_file
         from agent.database import get_parquet_path
 
@@ -100,7 +94,7 @@ class TestParquetPersistence:
         assert list(loaded.columns) == list(original.columns)
         assert len(loaded) == len(original)
 
-    def test_duckdb_view_queryable(self, tmp_path):
+    def test_duckdb_view_queryable(self, _isolated_env, tmp_path):
         from agent.tools import load_file
         from agent.database import get_connection
 
@@ -112,7 +106,7 @@ class TestParquetPersistence:
         row = conn.execute('SELECT COUNT(*) FROM "sales3"').fetchone()
         assert row[0] == 5
 
-    def test_view_survives_connection_reset(self, tmp_path):
+    def test_view_survives_connection_reset(self, _isolated_env, tmp_path):
         """Simulate a server restart: reset singleton, reconnect, view still works."""
         from agent.tools import load_file
         import agent.database as db_module
@@ -129,7 +123,7 @@ class TestParquetPersistence:
         row = conn.execute('SELECT COUNT(*) FROM "sales4"').fetchone()
         assert row[0] == 5, "View not restored after connection reset"
 
-    def test_date_columns_stored_as_native_type(self, tmp_path):
+    def test_date_columns_stored_as_native_type(self, _isolated_env, tmp_path):
         """order_date (ISO strings in Excel) should land as TIMESTAMP or DATE in Parquet."""
         from agent.tools import load_file
         from agent.database import get_parquet_path
@@ -149,13 +143,13 @@ class TestSemanticLookup:
     """_semantic_lookup is populated correctly and search_semantic_lookup works."""
 
     @pytest.fixture(scope="class", autouse=True)
-    def _load_dataset(self, tmp_path_factory):
+    def _load_dataset(self, _isolated_env, tmp_path_factory):
         from agent.tools import load_file
         xl = tmp_path_factory.mktemp("sl_data") / "demo.xlsx"
         _make_sample_excel(xl)
         load_file.invoke({"path": str(xl), "dataset_name": "demo"})
 
-    def test_semantic_lookup_rows_exist(self):
+    def test_semantic_lookup_rows_exist(self, _isolated_env):
         from agent.database import get_connection
         conn = get_connection()
         rows = conn.execute(
@@ -164,7 +158,7 @@ class TestSemanticLookup:
         col_names = {r[0] for r in rows}
         assert {"order_id", "customer", "revenue", "order_date", "category"} == col_names
 
-    def test_n_distinct_is_correct(self):
+    def test_n_distinct_is_correct(self, _isolated_env):
         from agent.database import get_connection
         conn = get_connection()
         row = conn.execute(
@@ -174,7 +168,7 @@ class TestSemanticLookup:
         assert row is not None
         assert row[0] == 3  # Alice, Bob, Carol
 
-    def test_sample_values_is_valid_json(self):
+    def test_sample_values_is_valid_json(self, _isolated_env):
         from agent.database import get_connection
         conn = get_connection()
         rows = conn.execute(
@@ -184,7 +178,7 @@ class TestSemanticLookup:
             parsed = json.loads(sv)
             assert isinstance(parsed, list), f"{col}: sample_values is not a JSON list"
 
-    def test_null_frac_zero_for_clean_data(self):
+    def test_null_frac_zero_for_clean_data(self, _isolated_env):
         from agent.database import get_connection
         conn = get_connection()
         rows = conn.execute(
@@ -193,21 +187,21 @@ class TestSemanticLookup:
         for col, nf in rows:
             assert nf == 0.0, f"{col} has unexpected null_frac={nf} for clean data"
 
-    def test_search_semantic_lookup_by_keyword(self):
+    def test_search_semantic_lookup_by_keyword(self, _isolated_env):
         from agent.tools import search_semantic_lookup
         raw = search_semantic_lookup.invoke({"query": "revenue", "dataset": "demo"})
         results = json.loads(raw)
         assert len(results) >= 1
         assert any(r["column"] == "revenue" for r in results)
 
-    def test_search_semantic_lookup_no_dataset_filter(self):
+    def test_search_semantic_lookup_no_dataset_filter(self, _isolated_env):
         from agent.tools import search_semantic_lookup
         raw = search_semantic_lookup.invoke({"query": "customer"})
         results = json.loads(raw)
         assert len(results) >= 1
         assert all("column" in r and "dataset" in r for r in results)
 
-    def test_search_semantic_lookup_no_match_returns_empty(self):
+    def test_search_semantic_lookup_no_match_returns_empty(self, _isolated_env):
         from agent.tools import search_semantic_lookup
         raw = search_semantic_lookup.invoke({"query": "zzznomatchxxx", "dataset": "demo"})
         results = json.loads(raw)
