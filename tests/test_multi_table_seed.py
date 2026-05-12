@@ -3,21 +3,19 @@ tests/test_multi_table_seed.py
 -------------------------------
 Unit tests for scripts/generate_product_metrics.py.
 
-Tests are fully self-contained: no database, no agent, no API key, no
-sales1000 file required.  The generator creates the DataFrame in memory;
-we validate its structure and values directly.
+Fully self-contained: no database, no agent, no API key.
+The generator is called with a real or synthetic source xlsx;
+we validate structure, internal consistency, and independence from
+the raw sales figures.
 
-Run the whole file:
+Run all:
     pytest tests/test_multi_table_seed.py -v
 
 Run a single class:
     pytest tests/test_multi_table_seed.py::TestSchema -v
-
-Run a single test:
-    pytest tests/test_multi_table_seed.py::TestValues::test_all_revenue_positive -v
-
-Run with stdout:
-    pytest tests/test_multi_table_seed.py -v -s
+    pytest tests/test_multi_table_seed.py::TestValues -v
+    pytest tests/test_multi_table_seed.py::TestIndependence -v
+    pytest tests/test_multi_table_seed.py::TestFileGeneration -v
 """
 
 from __future__ import annotations
@@ -25,6 +23,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -33,12 +32,36 @@ import generate_product_metrics as gpm
 
 
 # ---------------------------------------------------------------------------
-# Fixture: build the DataFrame once per module
+# Synthetic source fixture — a minimal xlsx with known products/categories
 # ---------------------------------------------------------------------------
 
+SYNTH_ROWS = [
+    {"Product Name": "Widget A", "Category": "Electronics",  "Unit Price": 99.99,  "Quantity": 3, "Total Revenue": 299.97},
+    {"Product Name": "Widget A", "Category": "Electronics",  "Unit Price": 99.99,  "Quantity": 1, "Total Revenue":  99.99},
+    {"Product Name": "Gadget B", "Category": "Electronics",  "Unit Price": 49.50,  "Quantity": 2, "Total Revenue":  99.00},
+    {"Product Name": "Shirt C",  "Category": "Clothing",     "Unit Price": 29.99,  "Quantity": 5, "Total Revenue": 149.95},
+    {"Product Name": "Shirt C",  "Category": "Clothing",     "Unit Price": 29.99,  "Quantity": 2, "Total Revenue":  59.98},
+    {"Product Name": "Book D",   "Category": "Books",        "Unit Price": 14.99,  "Quantity": 4, "Total Revenue":  59.96},
+]
+EXPECTED_PAIRS = {
+    ("Widget A", "Electronics"),
+    ("Gadget B", "Electronics"),
+    ("Shirt C",  "Clothing"),
+    ("Book D",   "Books"),
+}
+
+
 @pytest.fixture(scope="module")
-def df() -> pd.DataFrame:
-    return pd.DataFrame(gpm.ROWS, columns=gpm.COLUMNS)
+def src_xlsx(tmp_path_factory) -> Path:
+    p = tmp_path_factory.mktemp("data") / "sales.xlsx"
+    pd.DataFrame(SYNTH_ROWS).to_excel(p, index=False)
+    return p
+
+
+@pytest.fixture(scope="module")
+def df(src_xlsx, tmp_path_factory) -> pd.DataFrame:
+    out = tmp_path_factory.mktemp("out") / "product_metrics.xlsx"
+    return gpm.generate(src_xlsx, out)
 
 
 # ---------------------------------------------------------------------------
@@ -46,32 +69,18 @@ def df() -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 class TestSchema:
-    """Run: pytest tests/test_multi_table_seed.py::TestSchema -v"""
-
-    EXPECTED_COLUMNS = [
-        "product", "category",
-        "total_revenue", "total_units", "order_count",
-        "avg_unit_price", "avg_order_value",
-    ]
-
     def test_all_columns_present(self, df):
-        assert list(df.columns) == self.EXPECTED_COLUMNS
+        assert list(df.columns) == gpm.COLUMNS
 
-    def test_no_null_values(self, df):
-        nulls = df.isnull().sum()
-        assert nulls.sum() == 0, f"Unexpected nulls:\n{nulls[nulls > 0]}"
+    def test_no_nulls(self, df):
+        assert df.isnull().sum().sum() == 0
 
-    def test_product_category_unique(self, df):
-        """(product, category) must be the composite PK."""
-        dupes = df.duplicated(subset=["product", "category"])
-        assert not dupes.any(), (
-            f"Duplicate (product, category) rows:\n{df[dupes]}"
-        )
+    def test_product_category_is_pk(self, df):
+        assert not df.duplicated(subset=["product", "category"]).any()
 
-    def test_minimum_row_count(self, df):
-        """At least 20 products across at least 3 categories."""
-        assert len(df) >= 20
-        assert df["category"].nunique() >= 3
+    def test_correct_pairs_extracted(self, df):
+        found = set(zip(df["product"], df["category"]))
+        assert found == EXPECTED_PAIRS
 
 
 # ---------------------------------------------------------------------------
@@ -79,74 +88,70 @@ class TestSchema:
 # ---------------------------------------------------------------------------
 
 class TestValues:
-    """Run: pytest tests/test_multi_table_seed.py::TestValues -v"""
+    def test_list_price_positive(self, df):
+        assert (df["list_price"] > 0).all()
 
-    def test_all_revenue_positive(self, df):
-        assert (df["total_revenue"] > 0).all()
+    def test_prior_units_positive(self, df):
+        assert (df["prior_units"] > 0).all()
 
-    def test_all_units_positive(self, df):
-        assert (df["total_units"] > 0).all()
+    def test_prior_orders_positive(self, df):
+        assert (df["prior_orders"] > 0).all()
 
-    def test_all_order_counts_positive(self, df):
-        assert (df["order_count"] > 0).all()
-
-    def test_avg_unit_price_positive(self, df):
-        assert (df["avg_unit_price"] > 0).all()
-
-    def test_avg_order_value_gte_avg_unit_price(self, df):
-        """avg_order_value >= avg_unit_price (multi-unit orders drive this up)."""
-        assert (df["avg_order_value"] >= df["avg_unit_price"]).all(), (
-            df[df["avg_order_value"] < df["avg_unit_price"]][["product", "avg_unit_price", "avg_order_value"]]
-        )
-
-    def test_units_gte_order_count(self, df):
-        """total_units >= order_count (each order has at least 1 unit)."""
-        assert (df["total_units"] >= df["order_count"]).all()
+    def test_prior_revenue_positive(self, df):
+        assert (df["prior_revenue"] > 0).all()
 
     def test_avg_order_value_consistent(self, df):
-        """avg_order_value ≈ total_revenue / order_count (within 1%)."""
-        computed = df["total_revenue"] / df["order_count"]
-        ratio = (df["avg_order_value"] / computed).clip(lower=0)
-        assert ((ratio - 1).abs() < 0.01).all(), (
-            "avg_order_value inconsistent with total_revenue / order_count"
+        """avg_order_value == prior_revenue / prior_orders within 1 cent."""
+        computed = (df["prior_revenue"] / df["prior_orders"]).round(2)
+        diff = (df["avg_order_value"] - computed).abs()
+        assert (diff < 0.02).all(), df[["product", "avg_order_value"]][diff >= 0.02]
+
+    def test_prior_units_gte_prior_orders(self, df):
+        assert (df["prior_units"] >= df["prior_orders"]).all()
+
+    def test_list_price_in_category_band(self, df):
+        for _, row in df.iterrows():
+            lo, hi = gpm._PRICE_BANDS.get(row["category"], gpm._DEFAULT_BAND)
+            assert lo <= row["list_price"] <= hi, (
+                f"{row['product']} ({row['category']}): "
+                f"list_price {row['list_price']} outside [{lo}, {hi}]"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Independence — values must NOT equal naive GROUP BY on sales1000
+# ---------------------------------------------------------------------------
+
+class TestIndependence:
+    """The whole point of Option A: catalogue values differ from sales actuals."""
+
+    def test_list_price_not_equal_to_sales_unit_price(self, df, src_xlsx):
+        """list_price should not equal the avg unit price from the sales file."""
+        raw = pd.read_excel(src_xlsx)
+        raw = gpm._normalise(raw)
+        # need unit_price col — map from source
+        raw = raw.rename(columns={c: "unit_price" for c in raw.columns
+                                   if c.strip().lower() in ("unit price", "price")})
+        if "unit_price" not in raw.columns:
+            pytest.skip("unit_price column not found in synthetic source")
+        avg_prices = (
+            raw.groupby(["product", "category"])["unit_price"]
+            .mean().round(2).reset_index()
+            .rename(columns={"unit_price": "sales_avg_price"})
         )
+        merged = df.merge(avg_prices, on=["product", "category"])
+        # At least some rows must differ (they're from independent RNG)
+        diffs = (merged["list_price"] != merged["sales_avg_price"]).sum()
+        assert diffs > 0, "list_price is identical to sales avg price for all products"
 
-
-# ---------------------------------------------------------------------------
-# Specific products
-# ---------------------------------------------------------------------------
-
-class TestSpotCheck:
-    """Run: pytest tests/test_multi_table_seed.py::TestSpotCheck -v"""
-
-    def _get(self, df: pd.DataFrame, product: str, category: str) -> pd.Series:
-        row = df[(df["product"] == product) & (df["category"] == category)]
-        assert len(row) == 1, f"Expected exactly 1 row for ({product}, {category})"
-        return row.iloc[0]
-
-    def test_keyboard_present(self, df):
-        row = self._get(df, "Keyboard", "Electronics")
-        assert row["total_revenue"] > 0
-
-    def test_mouse_present(self, df):
-        row = self._get(df, "Mouse", "Electronics")
-        assert row["avg_unit_price"] > 0
-
-    def test_tshirt_present(self, df):
-        row = self._get(df, "T-Shirt", "Clothing")
-        assert row["total_units"] >= row["order_count"]
-
-    def test_jeans_present(self, df):
-        row = self._get(df, "Jeans", "Clothing")
-        assert abs(row["avg_order_value"] / (row["total_revenue"] / row["order_count"]) - 1) < 0.01
-
-    def test_laptop_is_highest_avg_price_in_electronics(self, df):
-        elec = df[df["category"] == "Electronics"]
-        assert elec.loc[elec["avg_unit_price"].idxmax(), "product"] == "Laptop"
-
-    def test_bicycle_is_highest_revenue_in_sports(self, df):
-        sports = df[df["category"] == "Sports"]
-        assert sports.loc[sports["total_revenue"].idxmax(), "product"] == "Bicycle"
+    def test_reproducible(self, src_xlsx, tmp_path):
+        """Running generate() twice with the same src produces identical output."""
+        out1 = tmp_path / "pm1.xlsx"
+        out2 = tmp_path / "pm2.xlsx"
+        df1 = gpm.generate(src_xlsx, out1)
+        df2 = gpm.generate(src_xlsx, out2)
+        pd.testing.assert_frame_equal(df1.reset_index(drop=True),
+                                       df2.reset_index(drop=True))
 
 
 # ---------------------------------------------------------------------------
@@ -154,22 +159,22 @@ class TestSpotCheck:
 # ---------------------------------------------------------------------------
 
 class TestFileGeneration:
-    """Run: pytest tests/test_multi_table_seed.py::TestFileGeneration -v"""
+    def test_writes_xlsx(self, src_xlsx, tmp_path):
+        out = tmp_path / "pm.xlsx"
+        gpm.generate(src_xlsx, out)
+        assert out.exists() and out.stat().st_size > 0
 
-    def test_generate_writes_xlsx(self, tmp_path):
-        out = tmp_path / "product_metrics.xlsx"
-        gpm.generate(out)
+    def test_readable_back(self, src_xlsx, tmp_path):
+        out = tmp_path / "pm.xlsx"
+        gpm.generate(src_xlsx, out)
+        loaded = pd.read_excel(out)
+        assert list(loaded.columns) == gpm.COLUMNS
+
+    def test_creates_parent_dirs(self, src_xlsx, tmp_path):
+        out = tmp_path / "a" / "b" / "pm.xlsx"
+        gpm.generate(src_xlsx, out)
         assert out.exists()
-        assert out.stat().st_size > 0
 
-    def test_generated_file_is_readable(self, tmp_path):
-        out = tmp_path / "product_metrics.xlsx"
-        gpm.generate(out)
-        df_loaded = pd.read_excel(out)
-        assert list(df_loaded.columns) == gpm.COLUMNS
-        assert len(df_loaded) == len(gpm.ROWS)
-
-    def test_generate_creates_parent_dirs(self, tmp_path):
-        nested = tmp_path / "a" / "b" / "metrics.xlsx"
-        gpm.generate(nested)
-        assert nested.exists()
+    def test_missing_src_raises(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            gpm.generate(tmp_path / "nonexistent.xlsx", tmp_path / "out.xlsx")
