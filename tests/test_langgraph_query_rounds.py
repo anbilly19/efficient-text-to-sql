@@ -12,6 +12,12 @@ Skip multi-table rounds:
 
 All rounds:
     pytest tests/test_langgraph_query_rounds.py -v
+
+Note on customer queries
+------------------------
+Some queries intentionally reference 'customer', which is NOT a column in
+any loaded table. These are adversarial checks: the LLM should gracefully
+report that no customer column exists rather than hallucinating a result.
 """
 import os
 import time
@@ -35,8 +41,8 @@ POLL_SECONDS    = float(os.getenv("TEST_POLL_SECONDS", "0.5"))
 # ---------------------------------------------------------------------------
 # Query rounds
 # Each entry: (round_id, mark_label, [queries])
-# round_id   -> used in pytest param ids
-# mark_label -> used with -m flag for selective runs
+# Queries marked [ADVERSARIAL] intentionally use a non-existent column
+# (customer) to test graceful error handling in the LLM.
 # ---------------------------------------------------------------------------
 
 QUERY_ROUNDS = [
@@ -113,12 +119,14 @@ QUERY_ROUNDS = [
         ],
     ),
     (
-        "round_09_self_joins",
+        "round_09_adversarial_missing_column",
         "round_09",
         [
-            "Which sales reps have placed more than one order and what is their order count?",
-            "Which sales reps had orders in consecutive months?",
-            "Show pairs of orders from the same sales rep where the second order was higher value than the first",
+            # Valid queries
+            "Which sales reps have more than one order and what is their order count?",
+            "Show the top category per sales rep by total revenue",
+            # Adversarial: 'customer' does not exist -- LLM should report gracefully
+            "What are the top 5 customers by total spend?",
         ],
     ),
     (
@@ -127,7 +135,8 @@ QUERY_ROUNDS = [
         [
             "Find orders where the revenue is above the average revenue for that product category",
             "Show regions whose total revenue is above the average region revenue",
-            "Which sales reps placed their first order in 2023 and also had orders in 2024?",
+            # Adversarial: 'customer' does not exist
+            "Which customers placed their first order in 2023 and are still active in 2024?",
         ],
     ),
     (
@@ -136,7 +145,8 @@ QUERY_ROUNDS = [
         [
             "What is the average number of orders per sales rep?",
             "What is the average order value per sales rep, and what is the average of those averages?",
-            "Show the distribution of order counts per sales rep (how many reps placed 1, 2, 3... orders)",
+            # Adversarial: 'customer' does not exist
+            "Show the distribution of order counts per customer (how many customers placed 1, 2, 3... orders)",
         ],
     ),
     (
@@ -154,16 +164,11 @@ QUERY_ROUNDS = [
     ),
 ]
 
-# Register one pytest mark per round so -m round_NN works.
-# In pyproject.toml add:
-#   [tool.pytest.ini_options]
-#   markers = ["round_01: ...", "round_02: ...", ...]
 _ROUND_MARKS = {
     mark: pytest.mark.__getattr__(mark)
     for _, mark, _ in QUERY_ROUNDS
 }
 
-# Flatten into pytest.param objects, each decorated with its round mark.
 _ALL_QUERIES = [
     pytest.param(
         round_name,
@@ -299,8 +304,6 @@ def thread_id() -> str:
 
 @pytest.fixture(scope="session", autouse=True)
 def loaded_datasets(thread_id: str) -> None:
-    """Load all three tables once per session. sales_rep_targets and
-    product_metrics are best-effort so rounds 01-11 still run without them."""
     outputs = _run_wait(thread_id, LOAD_SALES)
     _assert_loaded(outputs, LOAD_SALES)
 
