@@ -18,6 +18,12 @@ import duckdb
 _conn: duckdb.DuckDBPyConnection | None = None
 _lock = threading.Lock()
 
+# Absolute path to the project root (parent of the agent/ package directory).
+# Anchoring here means the DB location is stable regardless of the working
+# directory at launch time (LangGraph Studio, VS Code, terminal, etc.).
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_DEFAULT_DB_PATH = _PROJECT_ROOT / ".local" / "duckdb" / "efficient-text-to-sql.duckdb"
+
 
 # ---------------------------------------------------------------------------
 # Connection
@@ -30,8 +36,8 @@ def get_connection() -> duckdb.DuckDBPyConnection:
         if _conn is None:
             db_path = os.getenv("DUCKDB_PATH")
             if not db_path:
-                os.makedirs("./.local/duckdb", exist_ok=True)
-                db_path = "./.local/duckdb/efficient-text-to-sql.duckdb"
+                _DEFAULT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+                db_path = str(_DEFAULT_DB_PATH)
             _conn = duckdb.connect(db_path)
             _ensure_metadata_tables(_conn)
             _auto_reattach_parquet(_conn)
@@ -240,7 +246,6 @@ def infer_and_register_relationships(conn: duckdb.DuckDBPyConnection, new_table:
         }
         for col_name, col_type in new_cols.items():
             if col_name in other_cols:
-                # Type compatibility: both strings, or both numeric
                 def _is_str(t: str) -> bool:
                     return any(x in t.upper() for x in ("VARCHAR", "TEXT", "CHAR"))
 
@@ -263,7 +268,6 @@ def infer_and_register_relationships(conn: duckdb.DuckDBPyConnection, new_table:
                             """,
                             [new_table, col_name, other_table, col_name],
                         )
-                        # Mark the column as a join key in both tables
                         conn.execute(
                             "UPDATE _column_catalog SET is_join_key = TRUE "
                             "WHERE dataset_name = ? AND column_name = ?",
@@ -308,7 +312,6 @@ def register_relationship(
         """,
         [left_table, left_column, right_table, right_column, cardinality, description],
     )
-    # Mark both columns as join keys
     for tbl, col in [(left_table, left_column), (right_table, right_column)]:
         conn.execute(
             "UPDATE _column_catalog SET is_join_key = TRUE "
@@ -361,7 +364,6 @@ def get_schema_context(table_names: list[str]) -> str:
                 lines.append(f"    samples: {samples}")
         lines.append("")
 
-    # Relationships among the selected tables
     if len(table_names) > 1:
         rels = conn.execute(
             """
