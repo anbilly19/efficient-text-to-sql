@@ -26,7 +26,7 @@ from agent.tools import (
     search_semantic_lookup,
 )
 from agent.database import get_connection, get_schema_context, get_table_summaries
-from agent.db.catalog import validate_join_in_sql
+from agent.db.catalog import validate_join_in_sql, list_relationships
 
 
 # ---------------------------------------------------------------------------
@@ -122,10 +122,56 @@ def _most_recent_table() -> str:
 
 
 def _select_relevant_tables(user_query: str, all_tables: list[str]) -> list[str]:
-    """Ask the LLM (cheaply) which subset of tables is needed for this query."""
+    """Select tables needed for *user_query* using _table_context keyword scoring.
+
+    Strategy (v1 — keyword pre-filter, same logic as tools/schema_tools.select_tables):
+      1. Load dataset_name + summary + tags from _table_context (via DuckDB).
+      2. Score each table by counting query-word hits in summary + tags.
+      3. Return tables with score > 0, or all tables when no hits.
+
+    This avoids an extra LLM call for simple table selection.  The interface
+    is intentionally swappable with a vector-embedding lookup in v2 without
+    changing any downstream code.
+    """
     if len(all_tables) <= 1:
         return all_tables
 
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT dr.dataset_name, tc.summary, tc.tags "
+            "FROM _data_registry dr "
+            "LEFT JOIN _table_context tc ON tc.dataset_name = dr.dataset_name"
+        ).fetchall()
+    except Exception:
+        return all_tables
+
+    if not rows:
+        return all_tables
+
+    q_words = set(re.findall(r"[a-z]{3,}", user_query.lower()))
+
+    scored: list[tuple[int, str]] = []
+    for dataset_name, summary, tags_json in rows:
+        if dataset_name not in all_tables:
+            continue
+        text = " ".join([
+            dataset_name.lower(),
+            (summary or "").lower(),
+            " ".join(json.loads(tags_json) if tags_json else []).lower(),
+        ])
+        score = sum(1 for w in q_words if w in text)
+        scored.append((score, dataset_name))
+
+    selected = [name for score, name in scored if score > 0]
+    if not selected:
+        # No keyword hits — fall back to LLM for disambiguation
+        return _select_relevant_tables_llm(user_query, all_tables)
+    return selected
+
+
+def _select_relevant_tables_llm(user_query: str, all_tables: list[str]) -> list[str]:
+    """LLM fallback for table selection when keyword scoring yields no hits."""
     summaries = get_table_summaries()
     prompt = (
         f"The following tables are loaded in DuckDB:\n{summaries}\n\n"
@@ -163,14 +209,14 @@ def _get_date_cast_warnings(table_names: list[str]) -> str:
                     ).fetchone()
                     if sample and re.match(r"\d{4}-\d{2}-\d{2}", str(sample[0])):
                         warnings.append(
-                            f'  ⚠️  {table_name}."{col}" is VARCHAR storing dates (e.g. \'{sample[0]}\').'
+                            f'  \u26a0\ufe0f  {table_name}."{col}" is VARCHAR storing dates (e.g. \'{sample[0]}\').'
                             f' Always wrap: TRY_CAST("{col}" AS DATE)'
                         )
                 except Exception:
                     pass
             elif dtype.upper() in ("DATE", "TIMESTAMP", "TIMESTAMP WITH TIME ZONE"):
                 warnings.append(
-                    f'  ✅  {table_name}."{col}" is {dtype} — use YEAR/MONTH/DATE_TRUNC directly.'
+                    f'  \u2705  {table_name}."{col}" is {dtype} \u2014 use YEAR/MONTH/DATE_TRUNC directly.'
                 )
     return "\n".join(warnings)
 
@@ -307,12 +353,12 @@ def _build_meta_reply(query: str, all_tables: list[str]) -> str:
             ).fetchone()
             if row:
                 lines.append(
-                    f"✅ **{t}** is loaded — {row[0]:,} rows, {row[1]} columns "
+                    f"\u2705 **{t}** is loaded \u2014 {row[0]:,} rows, {row[1]} columns "
                     f"(source: `{Path(row[3]).name if row[3] else 'unknown'}`, "
                     f"ingested: {str(row[2])[:19]})"
                 )
             else:
-                lines.append(f"❌ **{t}** is not currently loaded.")
+                lines.append(f"\u274c **{t}** is not currently loaded.")
         return "\n".join(lines)
 
     rows = conn.execute(
@@ -321,7 +367,7 @@ def _build_meta_reply(query: str, all_tables: list[str]) -> str:
     ).fetchall()
     lines = [f"I have access to {len(rows)} table(s):\n"]
     for r in rows:
-        lines.append(f"  • **{r[0]}** — {r[1]:,} rows, {r[2]} columns (loaded {str(r[3])[:10]})")
+        lines.append(f"  \u2022 **{r[0]}** \u2014 {r[1]:,} rows, {r[2]} columns (loaded {str(r[3])[:10]})")
     lines.append(
         "\nAsk me anything about this data, or load more files with "
         "`load file at <path> as <name>`."
@@ -375,7 +421,6 @@ _QUERY_STOPWORDS = {
 
 def _extract_select_columns(sql: str) -> set[str]:
     """Extract bare column names / aliases from the SELECT clause of a SQL string."""
-    # Grab everything between SELECT and FROM
     m = re.search(r'\bSELECT\b(.+?)\bFROM\b', sql, re.IGNORECASE | re.DOTALL)
     if not m:
         return set()
@@ -383,13 +428,11 @@ def _extract_select_columns(sql: str) -> set[str]:
     tokens: set[str] = set()
     for part in select_clause.split(","):
         part = part.strip()
-        # If there's an AS alias, take the alias; otherwise take the last word/quoted token
         alias_m = re.search(r'\bAS\s+"?([\w\s]+)"?\s*$', part, re.IGNORECASE)
         if alias_m:
             tokens.add(alias_m.group(1).strip().lower().replace('"', ''))
         else:
-            # Take last identifier (strip table.prefix)
-            bare = re.sub(r'^.*\.', '', part)  # remove table prefix
+            bare = re.sub(r'^.*\.', '', part)
             bare = re.sub(r'["\s]', '', bare).lower()
             if bare:
                 tokens.add(bare)
@@ -407,13 +450,12 @@ def _detect_semantic_gaps(
 
     Returns a warning string (non-empty) if a meaningful concept from the
     user question has no matching column in either the catalog or the SQL
-    result — meaning the LLM silently dropped a requested dimension.
+    result.
 
     Returns empty string when everything checks out.
     """
     conn = get_connection()
 
-    # All known column names across the queried tables (lowercased, normalised)
     catalog_cols: set[str] = set()
     for tbl in table_names:
         try:
@@ -422,48 +464,39 @@ def _detect_semantic_gaps(
                 [tbl],
             ).fetchall()
             for (col,) in rows:
-                # Normalise: lowercase + strip spaces/underscores for fuzzy match
                 catalog_cols.add(col.lower())
                 catalog_cols.add(col.lower().replace(" ", "").replace("_", ""))
         except Exception:
             pass
 
-    # Concept keywords the user mentioned (4+ chars, not stopwords)
     user_concepts = [
         w for w in re.findall(r'[a-zA-Z]{4,}', user_query.lower())
         if w not in _QUERY_STOPWORDS
     ]
 
-    # Columns actually used in the SELECT
     sql_cols = _extract_select_columns(sql)
 
     gaps: list[str] = []
     for concept in user_concepts:
         concept_norm = concept.replace(" ", "").replace("_", "")
-        # Check if concept maps to any known catalog column
         in_catalog = any(
             concept_norm in c.replace(" ", "").replace("_", "")
             or c.replace(" ", "").replace("_", "") in concept_norm
             for c in catalog_cols
         )
         if not in_catalog:
-            # Concept not in catalog at all — user may have requested a
-            # dimension that genuinely doesn't exist in the data
             gaps.append(
-                f'  ⚠️  Concept "{concept}" was requested but no matching column exists '
+                f'  \u26a0\ufe0f  Concept "{concept}" was requested but no matching column exists '
                 f'in the loaded table(s): {table_names}. '
                 f'Available columns: {sorted(catalog_cols)[:10]}'
             )
         else:
-            # Concept IS in catalog — check if it made it into the SQL result
             in_sql = any(
                 concept_norm in c.replace(" ", "").replace("_", "")
                 or c.replace(" ", "").replace("_", "") in concept_norm
                 for c in sql_cols
             )
             if not in_sql:
-                # Concept exists in schema but was silently dropped from the query
-                # Find the best-matching catalog column name to suggest
                 best = next(
                     (
                         c for c in catalog_cols
@@ -474,11 +507,42 @@ def _detect_semantic_gaps(
                 )
                 suggestion = f' (closest column: "{best}")' if best else ""
                 gaps.append(
-                    f'  ⚠️  Concept "{concept}" was requested but is not in the SQL result.'
+                    f'  \u26a0\ufe0f  Concept "{concept}" was requested but is not in the SQL result.'
                     f'{suggestion} The query was answered on the available dimensions only.'
                 )
 
     return "\n".join(gaps)
+
+
+# ---------------------------------------------------------------------------
+# Helper: build relationships block for sql_writer prompt
+# ---------------------------------------------------------------------------
+
+def _build_relationships_block(table_names: list[str]) -> str:
+    """Return a formatted '## Relationships' block for the sql_writer prompt.
+
+    Always injected — even for single-table queries — so the LLM knows which
+    join paths exist if it needs to extend the query later.  Returns an empty
+    string when _relationships has no rows for the given tables (e.g. before
+    the seed script has been run).
+    """
+    try:
+        rels = list_relationships(tables=table_names)
+    except Exception:
+        return ""
+    if not rels:
+        return ""
+    lines = ["## Relationships (authoritative join keys — use ONLY these column pairs)"]
+    for r in rels:
+        cardinality = r.get("cardinality", "")
+        desc = r.get("description", "")
+        note = f"  # {desc}" if desc else ""
+        lines.append(
+            f"  {r['left_table']}.{r['left_column']} "
+            f"\u2192 {r['right_table']}.{r['right_column']}"
+            f" ({cardinality}){note}"
+        )
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -520,13 +584,11 @@ def orchestrator(state: AnalyticsState) -> dict:
         else:
             row_count = state.last_query_metadata.get("row_count", "?")
             table_preview = _rows_to_markdown(state.last_query_result)
-            # Include any verifier gap warnings in the synthesis so the LLM
-            # can mention them naturally in the final answer.
             gap_note = (
                 f"\n\nVerifier note: {state.verification_feedback}"
                 if state.verification_feedback
                 and state.verification_verdict == "warning"
-                and "⚠️" in state.verification_feedback
+                and "\u26a0\ufe0f" in state.verification_feedback
                 else ""
             )
             synthesis_prompt = (
@@ -614,9 +676,9 @@ Classify the user message into exactly ONE of these three intents:
    {{"intent": "chitchat", "final_answer": "<helpful reply>"}}
 
 Decision rules (apply in order):
-  • Any question referencing a table name OR asking about data/columns → ANALYTICS
-  • Any question about what the agent has loaded, can access, or can do → META
-  • Everything else → CHITCHAT
+  \u2022 Any question referencing a table name OR asking about data/columns \u2192 ANALYTICS
+  \u2022 Any question about what the agent has loaded, can access, or can do \u2192 META
+  \u2022 Everything else \u2192 CHITCHAT
 
 Output ONLY the JSON. No markdown, no explanation.
 """
@@ -685,9 +747,9 @@ def load_file_node(state: AnalyticsState) -> dict:
         dataset = Path(path).stem.replace(" ", "_").replace("-", "_").lower()
     result = load_file.invoke({"path": path, "dataset_name": dataset})
     reply = (
-        f"❌ Failed to load file: {result}"
+        f"\u274c Failed to load file: {result}"
         if result.startswith("ERROR")
-        else f"✅ {result}\n\nYou can now ask questions about the `{dataset}` table!"
+        else f"\u2705 {result}\n\nYou can now ask questions about the `{dataset}` table!"
     )
     return {
         "final_answer": reply,
@@ -746,6 +808,11 @@ def sql_writer(state: AnalyticsState) -> dict:
     cast_warnings = _get_date_cast_warnings(relevant_tables)
     varchar_date_cols = _get_varchar_date_columns_multi(relevant_tables)
 
+    # Always inject relationships — even single-table queries benefit from
+    # knowing which join paths exist, and the block is empty when none are
+    # registered (i.e. before seed_multi_table.py has been run).
+    relationships_block = _build_relationships_block(relevant_tables)
+
     keywords = [
         w
         for w in re.findall(r"[a-zA-Z]{4,}", state.user_query.lower())
@@ -770,7 +837,7 @@ def sql_writer(state: AnalyticsState) -> dict:
         lines = ["=== Semantic column hints ==="]
         for h in semantic_hits[:8]:
             lines.append(
-                f"  {h['dataset']}.{h['column']} ({h['type']}) — {h.get('description', '')}"
+                f"  {h['dataset']}.{h['column']} ({h['type']}) \u2014 {h.get('description', '')}"
             )
         semantic_context = "\n".join(lines)
 
@@ -793,6 +860,7 @@ def sql_writer(state: AnalyticsState) -> dict:
         f"User question: {state.user_query}\n\n"
         f"=== SCHEMA (use these table/column names verbatim) ===\n"
         f"{schema_context}\n\n"
+        + (f"{relationships_block}\n\n" if relationships_block else "")
         + (f"{semantic_context}\n\n" if semantic_context else "")
         + f"=== MANDATORY DATE COLUMN RULES ===\n"
         f"{cast_warnings if cast_warnings else '  (no date columns require special handling)'}\n\n"
@@ -912,8 +980,8 @@ def verifier(state: AnalyticsState) -> dict:
             result_rows = state.last_query_metadata.get("row_count", 0) or 0
             if max_fact_rows > 0 and result_rows > max_fact_rows * 2:
                 cardinality_warning = (
-                    f"⚠️  Result has {result_rows} rows but the largest source table has "
-                    f"{max_fact_rows} rows — possible JOIN fan-out (Cartesian product). "
+                    f"\u26a0\ufe0f  Result has {result_rows} rows but the largest source table has "
+                    f"{max_fact_rows} rows \u2014 possible JOIN fan-out (Cartesian product). "
                     "Verify GROUP BY and JOIN ON conditions."
                 )
         except Exception:
@@ -937,7 +1005,6 @@ def verifier(state: AnalyticsState) -> dict:
             pass
 
     # ── Semantic gap detection (hallucinated / dropped dimensions) ─────────
-    # Runs only on successful queries so we don't double-report on errors.
     semantic_gap_block = ""
     if not is_error and state.last_sql and state.user_query:
         try:
@@ -949,10 +1016,10 @@ def verifier(state: AnalyticsState) -> dict:
             )
             if gap_warnings:
                 semantic_gap_block = (
-                    "\n⚠️  SEMANTIC GAP DETECTED (dimension requested but missing from result):\n"
+                    "\n\u26a0\ufe0f  SEMANTIC GAP DETECTED (dimension requested but missing from result):\n"
                     + gap_warnings
                     + "\n"
-                    "  → Set verdict=warning, do NOT set verdict=fail. "
+                    "  \u2192 Set verdict=warning, do NOT set verdict=fail. "
                     "The result is still valid for the dimensions that ARE present. "
                     "Explain what was answered and what dimension is absent from the data.\n"
                 )
@@ -972,7 +1039,7 @@ def verifier(state: AnalyticsState) -> dict:
         join_warn_block = ""
         if join_warnings:
             join_warn_block = (
-                "\n⚠️  UNREGISTERED JOIN KEYS (must fix):\n"
+                "\n\u26a0\ufe0f  UNREGISTERED JOIN KEYS (must fix):\n"
                 + "\n".join(f"  - {w}" for w in join_warnings)
                 + "\n\n"
             )
@@ -985,10 +1052,10 @@ def verifier(state: AnalyticsState) -> dict:
             + join_warn_block
             + semantic_gap_block
             + "Verify whether the SQL correctly answers the sub-task.\n"
-            "- Correct → verdict=pass\n"
-            "- Clear bug (wrong column, bad filter, JOIN fan-out, unregistered join key) → verdict=fail with corrected_sql\n"
-            "- Missing dimension (semantic gap warning above) → verdict=warning with feedback explaining what is present vs absent\n"
-            "- Plausible but uncertain → verdict=warning (treated as pass)\n"
+            "- Correct \u2192 verdict=pass\n"
+            "- Clear bug (wrong column, bad filter, JOIN fan-out, unregistered join key) \u2192 verdict=fail with corrected_sql\n"
+            "- Missing dimension (semantic gap warning above) \u2192 verdict=warning with feedback explaining what is present vs absent\n"
+            "- Plausible but uncertain \u2192 verdict=warning (treated as pass)\n"
             "- Do NOT call any tools.\n"
             'Output ONLY: {"verdict": "pass|fail|warning", "feedback": "...", "corrected_sql": "(only if fail)"}'
         )
