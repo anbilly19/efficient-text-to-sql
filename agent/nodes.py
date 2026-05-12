@@ -26,6 +26,7 @@ from agent.tools import (
     search_semantic_lookup,
 )
 from agent.database import get_connection, get_schema_context, get_table_summaries
+from agent.db.catalog import validate_join_in_sql
 
 
 # ---------------------------------------------------------------------------
@@ -334,7 +335,7 @@ def orchestrator(state: AnalyticsState) -> dict:
         "error": "",
     }
 
-    # ── Synthesis: all steps complete ─────────────────────────────────────
+    # ── Synthesis: all steps complete ───────────────────────────────────────
     if state.plan and all(s.status in ("done", "failed") for s in state.plan):
         all_failed = all(s.status == "failed" for s in state.plan)
         if all_failed:
@@ -366,7 +367,7 @@ def orchestrator(state: AnalyticsState) -> dict:
             final = str(final_val).strip()
         return {**base_reset, "final_answer": final, "messages": [AIMessage(content=final)]}
 
-    # ── Fast-path: file load ───────────────────────────────────────────────
+    # ── Fast-path: file load ───────────────────────────────────────────
     load_match = _detect_load_intent(current_query)
     if load_match:
         return {
@@ -375,7 +376,7 @@ def orchestrator(state: AnalyticsState) -> dict:
             "load_file_dataset": load_match["dataset"],
         }
 
-    # ── Fast-path: schema / table listing questions ───────────────────────
+    # ── Fast-path: schema / table listing questions ───────────────────
     if _detect_schema_intent(current_query):
         query_lower = current_query.lower()
         target_table: str | None = None
@@ -395,7 +396,7 @@ def orchestrator(state: AnalyticsState) -> dict:
             reply = f"Here are all loaded tables:\n\n```\n{tables_summary}\n```"
         return {**base_reset, "final_answer": reply, "messages": [AIMessage(content=reply)]}
 
-    # ── LLM planning ──────────────────────────────────────────────────────
+    # ── LLM planning ────────────────────────────────────────────────
     ORCHESTRATOR_SYSTEM = f"""You are the Orchestrator of a DuckDB analytics agent.
 
 Loaded tables:
@@ -410,7 +411,9 @@ Classify the user message into exactly ONE intent:
    Then break the question into ordered steps.
    Step types: "profile" (explore a column) or "sql" (SELECT query).
    Every step description MUST name the exact table(s) involved.
-   For multi-table queries, state the join tables and join columns explicitly.
+   For multi-table queries, state the join tables and join columns explicitly,
+   using the authoritative column pairs from _relationships
+   (e.g. 'sales1000."Sales Rep" → sales_rep_targets.sales_rep').
    {{"intent": "analytics", "plan": [{{"id": 1, "type": "sql", "description": "..."}}]}}
 
 2. CHITCHAT – everything else (greetings, general knowledge, questions about the agent).
@@ -537,12 +540,12 @@ def sql_writer(state: AnalyticsState) -> dict:
     if not relevant_tables:
         relevant_tables = [_most_recent_table()] if _most_recent_table() else all_tables
 
-    # ── Build context ─────────────────────────────────────────────────────
+    # ── Build context ─────────────────────────────────────────────────
     schema_context = get_schema_context(relevant_tables)
     cast_warnings = _get_date_cast_warnings(relevant_tables)
     varchar_date_cols = _get_varchar_date_columns_multi(relevant_tables)
 
-    # ── Semantic hints ────────────────────────────────────────────────────
+    # ── Semantic hints ────────────────────────────────────────────────
     keywords = [
         w
         for w in re.findall(r"[a-zA-Z]{4,}", state.user_query.lower())
@@ -571,7 +574,7 @@ def sql_writer(state: AnalyticsState) -> dict:
             )
         semantic_context = "\n".join(lines)
 
-    # ── On retry, sanitize and re-use existing SQL ────────────────────────
+    # ── On retry, sanitize and re-use existing SQL ──────────────────────
     if state.retry_count > 0 and state.last_sql and state.last_sql.strip().upper().startswith("SELECT"):
         sql = _sanitize_sql(state.last_sql, varchar_date_cols)
         updated_plan = [
@@ -692,7 +695,7 @@ def verifier(state: AnalyticsState) -> dict:
     row_count = state.last_query_metadata.get("row_count", "unknown")
     table_preview = _rows_to_markdown(state.last_query_result)
 
-    # Cardinality guard: check result row_count against expected table sizes
+    # ── Cardinality guard ────────────────────────────────────────────────
     cardinality_warning = ""
     if not is_error and state.last_query_metadata:
         conn = get_connection()
@@ -717,6 +720,14 @@ def verifier(state: AnalyticsState) -> dict:
         except Exception:
             pass
 
+    # ── Relationship / join-key guard (multi-table) ─────────────────────
+    join_warnings: list[str] = []
+    if not is_error and state.last_sql and "JOIN" in state.last_sql.upper():
+        try:
+            join_warnings = validate_join_in_sql(state.last_sql)
+        except Exception:
+            pass
+
     schema_hint = ""
     most_recent = _most_recent_table()
     if most_recent:
@@ -735,15 +746,23 @@ def verifier(state: AnalyticsState) -> dict:
             'Output ONLY: {"verdict": "fail", "feedback": "<what was wrong>", "corrected_sql": "<fixed SQL>"}'
         )
     else:
+        join_warn_block = ""
+        if join_warnings:
+            join_warn_block = (
+                "\n⚠️  UNREGISTERED JOIN KEYS (must fix):\n"
+                + "\n".join(f"  - {w}" for w in join_warnings)
+                + "\n\n"
+            )
         prompt = (
             f"Sub-task: {step.description if step else 'unknown'}\n"
             f"SQL executed:\n{state.last_sql}\n\n"
             f"Row count: {row_count}\n"
             f"First rows:\n{table_preview[:1500]}\n\n"
             + (f"{cardinality_warning}\n\n" if cardinality_warning else "")
+            + join_warn_block
             + "Verify whether the SQL correctly answers the sub-task.\n"
             "- Correct → verdict=pass\n"
-            "- Clear bug (wrong column, bad filter, JOIN fan-out) → verdict=fail with corrected_sql\n"
+            "- Clear bug (wrong column, bad filter, JOIN fan-out, unregistered join key) → verdict=fail with corrected_sql\n"
             "- Plausible but uncertain → verdict=warning (treated as pass)\n"
             "- Do NOT call any tools.\n"
             'Output ONLY: {"verdict": "pass|fail|warning", "feedback": "...", "corrected_sql": "(only if fail)"}'
