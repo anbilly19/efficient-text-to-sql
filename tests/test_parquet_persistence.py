@@ -1,17 +1,13 @@
 """
 tests/test_parquet_persistence.py
 
-Key design invariant
---------------------
-Never del agent.* from sys.modules between tests.
-Doing so creates a second module object with its own _conn, so
-load_file (bound to module-A) writes a view on conn-A while the
-assertion imports get_connection from module-B and queries conn-B,
-which has no view.
-
-Instead: purge ONCE at module setup, then leave the module object
-alive for the entire module. Reset _conn = None per-test so each
-test gets a fresh :memory: DB but all code shares the same module.
+Key invariant
+-------------
+All code in this module accesses the DuckDB connection through the SAME
+agent.database module object. We never do `from agent.database import X`
+in test bodies -- we always go via the module reference stored in
+sys.modules["agent.database"] so that load_file and the assertions share
+exactly the same _conn singleton.
 """
 from __future__ import annotations
 
@@ -42,8 +38,18 @@ def _make_sample_excel(path: Path) -> pd.DataFrame:
     return df
 
 
+def _db():
+    """Return agent.database module -- always the live object in sys.modules."""
+    return sys.modules["agent.database"]
+
+
+def _tools():
+    """Return agent.tools module -- always the live object in sys.modules."""
+    return sys.modules["agent.tools"]
+
+
 # ---------------------------------------------------------------------------
-# Module fixture: purge agent.* ONCE, set env, import db_module for keeps.
+# Module fixture: purge agent.* ONCE, import fresh, leave alive forever.
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="module", autouse=True)
@@ -55,23 +61,24 @@ def _module_env(tmp_path_factory):
     os.environ["PARQUET_STORE"] = str(store)
     os.environ["DUCKDB_PATH"]   = ":memory:"
 
-    # ONE-TIME purge so the module re-imports with our env vars.
-    for mod in [m for m in sys.modules if m.startswith("agent")]:
-        del sys.modules[mod]
+    # Purge ONCE so agent.* re-imports with our env vars.
+    for mod in list(sys.modules):
+        if mod.startswith("agent"):
+            del sys.modules[mod]
 
-    # Import and keep alive for the whole module — do NOT purge again.
-    import agent.database as _db  # noqa: F401  (keeps reference in sys.modules)
+    # Import now -- these module objects stay in sys.modules for the whole run.
+    import agent.database  # noqa: F401
+    import agent.tools     # noqa: F401
 
     yield store
 
-    # Teardown: close conn and restore env
-    import agent.database as db_mod
-    if db_mod._conn is not None:
+    db = _db()
+    if db._conn is not None:
         try:
-            db_mod._conn.close()
+            db._conn.close()
         except Exception:
             pass
-        db_mod._conn = None
+        db._conn = None
 
     if prev_store is not None:
         os.environ["PARQUET_STORE"] = prev_store
@@ -84,25 +91,22 @@ def _module_env(tmp_path_factory):
 
 
 # ---------------------------------------------------------------------------
-# Per-test fixture: reset _conn on the SAME module object -> fresh :memory:
-# No module purge. No re-import. Same module, new connection.
+# Per-test: close + reset _conn on the live module, open a fresh :memory: DB.
+# NO sys.modules purge -- that would create a second module object.
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(autouse=True)
 def _fresh_conn(_module_env):
-    import agent.database as db_mod
-    # Close any previous connection
-    if db_mod._conn is not None:
+    db = _db()
+    if db._conn is not None:
         try:
-            db_mod._conn.close()
+            db._conn.close()
         except Exception:
             pass
-    db_mod._conn = None
-    # Warm a fresh :memory: connection
+    db._conn = None
     os.environ["DUCKDB_PATH"] = ":memory:"
-    db_mod.get_connection()
+    db.get_connection()   # warm once; all code in this test will reuse it
     yield
-    # Teardown: leave _conn open for next fixture cycle (it resets above)
 
 
 # ---------------------------------------------------------------------------
@@ -112,33 +116,34 @@ def _fresh_conn(_module_env):
 class TestParquetPersistence:
 
     def test_parquet_file_created(self, tmp_path):
-        from agent.tools import load_file, get_parquet_path
+        tools = _tools()
         xl = tmp_path / "sales.xlsx"
         _make_sample_excel(xl)
-        result = load_file.invoke({"path": str(xl), "dataset_name": "sales"})
+        result = tools.load_file.invoke({"path": str(xl), "dataset_name": "sales"})
         assert "Successfully loaded" in result, result
-        assert get_parquet_path("sales").exists()
+        assert tools.get_parquet_path("sales").exists()
 
     def test_parquet_readable_by_pandas(self, tmp_path):
-        from agent.tools import load_file, get_parquet_path
+        tools = _tools()
         xl = tmp_path / "sales2.xlsx"
         original = _make_sample_excel(xl)
-        load_file.invoke({"path": str(xl), "dataset_name": "sales2"})
-        loaded = pd.read_parquet(get_parquet_path("sales2"))
+        tools.load_file.invoke({"path": str(xl), "dataset_name": "sales2"})
+        loaded = pd.read_parquet(tools.get_parquet_path("sales2"))
         assert list(loaded.columns) == list(original.columns)
         assert len(loaded) == len(original)
 
     def test_duckdb_view_queryable(self, tmp_path):
-        from agent.tools import load_file
-        from agent.database import get_connection
+        tools = _tools()
         xl = tmp_path / "sales3.xlsx"
         _make_sample_excel(xl)
-        load_file.invoke({"path": str(xl), "dataset_name": "sales3"})
-        row = get_connection().execute('SELECT COUNT(*) FROM "sales3"').fetchone()
+        tools.load_file.invoke({"path": str(xl), "dataset_name": "sales3"})
+        # Use _db().get_connection() -- same module object as load_file used internally
+        row = _db().get_connection().execute('SELECT COUNT(*) FROM "sales3"').fetchone()
         assert row[0] == 5
 
     def test_view_survives_connection_reset(self, tmp_path):
-        """Subprocess owns its own process — cannot affect the shared module."""
+        """Subprocess: fully isolated process, cannot affect shared module."""
+        store = os.environ["PARQUET_STORE"]
         script = textwrap.dedent(f"""
             import os, sys
             import pandas as pd
@@ -167,7 +172,6 @@ class TestParquetPersistence:
             assert "Successfully loaded" in r, r
             assert (store / "sales4.parquet").exists()
 
-            # Simulate restart
             db_mod._conn.close()
             db_mod._conn = None
             from agent.database import get_connection
@@ -181,11 +185,11 @@ class TestParquetPersistence:
         assert "OK" in res.stdout
 
     def test_date_columns_stored_as_native_type(self, tmp_path):
-        from agent.tools import load_file, get_parquet_path
+        tools = _tools()
         xl = tmp_path / "sales5.xlsx"
         _make_sample_excel(xl)
-        load_file.invoke({"path": str(xl), "dataset_name": "sales5"})
-        schema = pd.read_parquet(get_parquet_path("sales5")).dtypes
+        tools.load_file.invoke({"path": str(xl), "dataset_name": "sales5"})
+        schema = pd.read_parquet(tools.get_parquet_path("sales5")).dtypes
         assert str(schema["order_date"]).startswith("datetime"), (
             f"Expected datetime, got: {schema['order_date']}"
         )
@@ -193,28 +197,24 @@ class TestParquetPersistence:
 
 # ---------------------------------------------------------------------------
 # TestColumnCatalog
-# _fresh_conn already resets per-test, so _load_demo just calls load_file.
 # ---------------------------------------------------------------------------
 
 class TestColumnCatalog:
 
     @pytest.fixture(autouse=True)
     def _load_demo(self, tmp_path):
-        from agent.tools import load_file
         xl = tmp_path / "demo.xlsx"
         _make_sample_excel(xl)
-        load_file.invoke({"path": str(xl), "dataset_name": "demo"})
+        _tools().load_file.invoke({"path": str(xl), "dataset_name": "demo"})
 
     def test_column_catalog_rows_exist(self):
-        from agent.database import get_connection
-        rows = get_connection().execute(
+        rows = _db().get_connection().execute(
             "SELECT column_name FROM _column_catalog WHERE dataset_name = 'demo'"
         ).fetchall()
         assert {r[0] for r in rows} == {"order_id", "customer", "revenue", "order_date", "category"}
 
     def test_metric_flag_set_for_numeric_column(self):
-        from agent.database import get_connection
-        row = get_connection().execute(
+        row = _db().get_connection().execute(
             "SELECT is_metric FROM _column_catalog "
             "WHERE dataset_name = 'demo' AND column_name = 'revenue'"
         ).fetchone()
@@ -222,34 +222,29 @@ class TestColumnCatalog:
         assert row[0] is True
 
     def test_sample_values_is_valid_json(self):
-        from agent.database import get_connection
-        rows = get_connection().execute(
+        rows = _db().get_connection().execute(
             "SELECT column_name, sample_values FROM _column_catalog WHERE dataset_name = 'demo'"
         ).fetchall()
         for col, sv in rows:
             assert isinstance(json.loads(sv or "[]"), list), f"{col}: not a JSON list"
 
     def test_search_semantic_lookup_by_keyword(self):
-        from agent.tools import search_semantic_lookup
-        results = json.loads(search_semantic_lookup.invoke({"query": "revenue", "dataset": "demo"}))
+        results = json.loads(_tools().search_semantic_lookup.invoke({"query": "revenue", "dataset": "demo"}))
         assert len(results) >= 1
         assert any(r["column"] == "revenue" for r in results)
 
     def test_search_semantic_lookup_no_dataset_filter(self):
-        from agent.tools import search_semantic_lookup
-        results = json.loads(search_semantic_lookup.invoke({"query": "customer"}))
+        results = json.loads(_tools().search_semantic_lookup.invoke({"query": "customer"}))
         assert len(results) >= 1
         assert all("column" in r and "dataset" in r for r in results)
 
     def test_search_semantic_lookup_no_match_returns_empty(self):
-        from agent.tools import search_semantic_lookup
         assert json.loads(
-            search_semantic_lookup.invoke({"query": "zzznomatchxxx", "dataset": "demo"})
+            _tools().search_semantic_lookup.invoke({"query": "zzznomatchxxx", "dataset": "demo"})
         ) == []
 
 
 class TestSchemaLookupToolInSuite:
 
     def test_search_semantic_lookup_in_sql_writer_tools(self):
-        from agent.tools import SQL_WRITER_TOOLS
-        assert "search_semantic_lookup" in [t.name for t in SQL_WRITER_TOOLS]
+        assert "search_semantic_lookup" in [t.name for t in _tools().SQL_WRITER_TOOLS]
