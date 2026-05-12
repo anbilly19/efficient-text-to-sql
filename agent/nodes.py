@@ -122,17 +122,7 @@ def _most_recent_table() -> str:
 
 
 def _select_relevant_tables(user_query: str, all_tables: list[str]) -> list[str]:
-    """Select tables needed for *user_query* using _table_context keyword scoring.
-
-    Strategy (v1 — keyword pre-filter, same logic as tools/schema_tools.select_tables):
-      1. Load dataset_name + summary + tags from _table_context (via DuckDB).
-      2. Score each table by counting query-word hits in summary + tags.
-      3. Return tables with score > 0, or all tables when no hits.
-
-    This avoids an extra LLM call for simple table selection.  The interface
-    is intentionally swappable with a vector-embedding lookup in v2 without
-    changing any downstream code.
-    """
+    """Select tables needed for *user_query* using _table_context keyword scoring."""
     if len(all_tables) <= 1:
         return all_tables
 
@@ -165,7 +155,6 @@ def _select_relevant_tables(user_query: str, all_tables: list[str]) -> list[str]
 
     selected = [name for score, name in scored if score > 0]
     if not selected:
-        # No keyword hits — fall back to LLM for disambiguation
         return _select_relevant_tables_llm(user_query, all_tables)
     return selected
 
@@ -309,6 +298,14 @@ _META_PATTERNS = [
     re.compile(r"\bare\s+(?:you|any\s+tables?)\s+(?:ready|set\s+up|configured)\b", re.IGNORECASE),
 ]
 
+# DuckDB "table not found" patterns — covers both quoted and unquoted identifiers
+_TABLE_NOT_FOUND_RE = re.compile(
+    r'(?:Table with name|Table|Catalog Error.*?table)\s+["\']?([\w]+)["\']?\s+does not exist'
+    r'|(?:relation|table)\s+["\']?([\w.]+)["\']?\s+does not exist'
+    r'|([\w"]+)\s+not exist',
+    re.IGNORECASE,
+)
+
 
 def _detect_load_intent(text: str) -> dict | None:
     for pattern in _LOAD_PATTERNS:
@@ -405,10 +402,77 @@ def _resolve_user_query(state: AnalyticsState) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Error message builder — table-not-found with loaded-table suggestions
+# ---------------------------------------------------------------------------
+
+def _build_table_not_found_message(error: str, sql: str, all_tables: list[str]) -> str | None:
+    """Return a rich user-facing message when DuckDB says a table does not exist.
+
+    Extracts the missing table name from the error string, lists all currently
+    loaded tables, and offers a concrete rename hint if the file was ingested
+    under a different alias.
+
+    Returns None when the error is not a table-not-found error so the caller
+    can fall through to the generic handler.
+    """
+    m = _TABLE_NOT_FOUND_RE.search(error)
+    if not m:
+        return None
+
+    # Pick the first non-None capture group — that's the unrecognised table name
+    missing = next((g.strip('"\' ') for g in m.groups() if g), None)
+    if not missing:
+        return None
+
+    # Collect loaded table info from the registry
+    conn = get_connection()
+    try:
+        reg_rows = conn.execute(
+            "SELECT dataset_name, source_file FROM _data_registry ORDER BY ingested_at"
+        ).fetchall()
+    except Exception:
+        reg_rows = []
+
+    loaded_lines = [
+        f"  • **{name}** (from `{Path(src).name if src else 'unknown'}`)"
+        for name, src in reg_rows
+    ] or ["  • *(no tables loaded)*"]
+
+    # Best-guess match: find a loaded table whose name is similar to the missing one
+    suggestion = ""
+    missing_lower = missing.lower().replace("_", "").replace("-", "")
+    for loaded_name, _ in reg_rows:
+        if (
+            loaded_name.lower().replace("_", "").replace("-", "") == missing_lower
+            or missing_lower in loaded_name.lower()
+            or loaded_name.lower() in missing_lower
+        ):
+            suggestion = (
+                f"\n💡 **Did you mean `{loaded_name}`?** "
+                f"The file was ingested as `{loaded_name}`, not `{missing}`.\n"
+                f"Edit your question to use `{loaded_name}` instead, or reload the file with:\n"
+                f"`load <file> as {missing}`"
+            )
+            break
+
+    lines = [
+        f"❌ **Table `{missing}` does not exist** in the current session.",
+        "",
+        "**Currently loaded tables:**",
+        *loaded_lines,
+        suggestion,
+        "",
+        "**To fix this:**",
+        f"- Replace `{missing}` in your question with one of the table names above, **or**",
+        f"- Reload your file under the expected name: `load <file> as {missing}`",
+    ]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Verifier helper: semantic gap detection
 # ---------------------------------------------------------------------------
 
-# Stopwords to exclude from concept extraction
 _QUERY_STOPWORDS = {
     "what", "show", "list", "give", "find", "from", "that", "this", "with",
     "have", "does", "each", "many", "much", "more", "most", "last", "year",
@@ -420,7 +484,6 @@ _QUERY_STOPWORDS = {
 
 
 def _extract_select_columns(sql: str) -> set[str]:
-    """Extract bare column names / aliases from the SELECT clause of a SQL string."""
     m = re.search(r'\bSELECT\b(.+?)\bFROM\b', sql, re.IGNORECASE | re.DOTALL)
     if not m:
         return set()
@@ -444,16 +507,6 @@ def _detect_semantic_gaps(
     sql: str,
     table_names: list[str],
 ) -> str:
-    """
-    Compare concept keywords in the user question against the columns that
-    actually appear in the executed SQL's SELECT clause.
-
-    Returns a warning string (non-empty) if a meaningful concept from the
-    user question has no matching column in either the catalog or the SQL
-    result.
-
-    Returns empty string when everything checks out.
-    """
     conn = get_connection()
 
     catalog_cols: set[str] = set()
@@ -519,13 +572,6 @@ def _detect_semantic_gaps(
 # ---------------------------------------------------------------------------
 
 def _build_relationships_block(table_names: list[str]) -> str:
-    """Return a formatted '## Relationships' block for the sql_writer prompt.
-
-    Always injected — even for single-table queries — so the LLM knows which
-    join paths exist if it needs to extend the query later.  Returns an empty
-    string when _relationships has no rows for the given tables (e.g. before
-    the seed script has been run).
-    """
     try:
         rels = list_relationships(tables=table_names)
     except Exception:
@@ -576,11 +622,16 @@ def orchestrator(state: AnalyticsState) -> dict:
         all_failed = all(s.status == "failed" for s in state.plan)
         if all_failed:
             err = state.error or "The query could not be executed."
-            final = (
-                f"I wasn't able to answer that question due to a SQL error:\n\n"
-                f"```\n{err.replace('ERROR: ', '').strip()}\n```\n\n"
-                "Could you rephrase, or check that the column names are correct?"
-            )
+            # ── Table-not-found: give a rich, actionable message ───────────
+            rich_msg = _build_table_not_found_message(err, state.last_sql, all_tables)
+            if rich_msg:
+                final = rich_msg
+            else:
+                final = (
+                    f"I wasn't able to answer that question due to a SQL error:\n\n"
+                    f"```\n{err.replace('ERROR: ', '').strip()}\n```\n\n"
+                    "Could you rephrase, or check that the column names are correct?"
+                )
         else:
             row_count = state.last_query_metadata.get("row_count", "?")
             table_preview = _rows_to_markdown(state.last_query_result)
@@ -807,10 +858,6 @@ def sql_writer(state: AnalyticsState) -> dict:
     schema_context = get_schema_context(relevant_tables)
     cast_warnings = _get_date_cast_warnings(relevant_tables)
     varchar_date_cols = _get_varchar_date_columns_multi(relevant_tables)
-
-    # Always inject relationships — even single-table queries benefit from
-    # knowing which join paths exist, and the block is empty when none are
-    # registered (i.e. before seed_multi_table.py has been run).
     relationships_block = _build_relationships_block(relevant_tables)
 
     keywords = [
@@ -1004,7 +1051,7 @@ def verifier(state: AnalyticsState) -> dict:
         except Exception:
             pass
 
-    # ── Semantic gap detection (hallucinated / dropped dimensions) ─────────
+    # ── Semantic gap detection ─────────────────────────────────────────────
     semantic_gap_block = ""
     if not is_error and state.last_sql and state.user_query:
         try:
