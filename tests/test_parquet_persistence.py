@@ -1,26 +1,22 @@
-"""Unit tests for Parquet persistence and _column_catalog (semantic lookup).
+"""
+tests/test_parquet_persistence.py
 
-These tests run fully offline - no LangGraph server needed.
-They import agent code directly and use a fresh in-memory DuckDB
-for each test module session.
+Unit tests for Parquet persistence and _column_catalog.
+Runs fully offline using a fresh in-memory DuckDB.
 
 Fixture hierarchy
 -----------------
-conftest.py::_session_env   (scope=session, autouse)
-    Sets PARQUET_STORE to a temp dir *before* any agent module is imported,
-    so module-level constants in agent.tools pick up the temp path correctly.
-    Deletes all parquet files on session teardown.
+conftest.py::_session_env   (session, autouse)
+    Sets PARQUET_STORE to a temp dir.
 
-_isolated_env               (scope=module, autouse)
-    Overrides DUCKDB_PATH to ':memory:', resets the DuckDB singleton, and
-    purges sys.modules so agent.database/tools re-bind against both patched
-    env vars for this module only.
+_isolated_env               (module, autouse)
+    Overrides DUCKDB_PATH to ':memory:', resets _conn singleton once,
+    then leaves it alone for the rest of the module so views persist.
 """
 from __future__ import annotations
 
 import json
 import os
-import shutil
 import sys
 from pathlib import Path
 
@@ -34,16 +30,20 @@ import pytest
 
 @pytest.fixture(scope="module", autouse=True)
 def _isolated_env():
-    """Override DUCKDB_PATH to in-memory and reset the connection singleton
-    so these tests never touch the real on-disk database.
+    """Point DUCKDB_PATH at ':memory:' and reset the singleton ONCE.
+    All tests in this module share the same in-memory connection so that
+    views created by load_file survive across test functions.
     """
     os.environ["DUCKDB_PATH"] = ":memory:"
 
+    # Purge once so agent.database re-imports with :memory:
     for mod_name in [m for m in sys.modules if m.startswith("agent")]:
         del sys.modules[mod_name]
 
     import agent.database as db_module
     db_module._conn = None
+    # Warm up the connection NOW so all tests share the same instance.
+    db_module.get_connection()
 
     yield
 
@@ -57,7 +57,6 @@ def _isolated_env():
 # ---------------------------------------------------------------------------
 
 def _make_sample_excel(path: Path) -> pd.DataFrame:
-    """Write a tiny sales DataFrame to an Excel file and return it."""
     df = pd.DataFrame({
         "order_id":   [1, 2, 3, 4, 5],
         "customer":   ["Alice", "Bob", "Alice", "Carol", "Bob"],
@@ -74,17 +73,14 @@ def _make_sample_excel(path: Path) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 class TestParquetPersistence:
-    """load_file converts Excel -> Parquet and registers a DuckDB view."""
 
     def test_parquet_file_created(self, tmp_path):
-        from agent.tools import load_file, PARQUET_STORE, get_parquet_path  # noqa: F401
+        from agent.tools import load_file, get_parquet_path
 
         xl = tmp_path / "sales.xlsx"
         _make_sample_excel(xl)
-
         result = load_file.invoke({"path": str(xl), "dataset_name": "sales"})
         assert "Successfully loaded" in result, f"Unexpected result: {result}"
-
         pq = get_parquet_path("sales")
         assert pq.exists(), f"Parquet file not found at {pq}"
         assert pq.suffix == ".parquet"
@@ -95,13 +91,13 @@ class TestParquetPersistence:
         xl = tmp_path / "sales2.xlsx"
         original = _make_sample_excel(xl)
         load_file.invoke({"path": str(xl), "dataset_name": "sales2"})
-
         pq = get_parquet_path("sales2")
         loaded = pd.read_parquet(pq)
         assert list(loaded.columns) == list(original.columns)
         assert len(loaded) == len(original)
 
     def test_duckdb_view_queryable(self, tmp_path):
+        """View must be queryable on the SAME connection used by load_file."""
         from agent.tools import load_file
         from agent.database import get_connection
 
@@ -109,18 +105,13 @@ class TestParquetPersistence:
         _make_sample_excel(xl)
         load_file.invoke({"path": str(xl), "dataset_name": "sales3"})
 
+        # Use the same connection -- do NOT reset _conn between calls.
         conn = get_connection()
         row = conn.execute('SELECT COUNT(*) FROM "sales3"').fetchone()
         assert row[0] == 5
 
     def test_view_survives_connection_reset(self, tmp_path):
-        """Simulate a server restart: _data_registry persists in a file DB so
-        _auto_reattach_parquet can rebuild the view on reconnect.
-
-        Uses a temp .duckdb file (not :memory:) so _data_registry survives
-        the singleton reset. The file DB and any parquet written here are
-        deleted in the finally block.
-        """
+        """Simulate restart with a file DB so _data_registry survives reset."""
         import agent.database as db_module
 
         file_db = tmp_path / "restart_test.duckdb"
@@ -138,22 +129,19 @@ class TestParquetPersistence:
             xl = tmp_path / "sales4.xlsx"
             _make_sample_excel(xl)
             load_file.invoke({"path": str(xl), "dataset_name": "sales4"})
-
-            # Remember parquet path before reset so we can delete it.
             pq_path = get_parquet_path("sales4")
 
-            # Simulate restart: drop singleton — file DB keeps _data_registry.
+            # Simulate restart
             db_module._conn = None
             for mod_name in [m for m in sys.modules if m.startswith("agent")]:
                 del sys.modules[mod_name]
 
             from agent.database import get_connection
-            conn = get_connection()  # triggers _auto_reattach_parquet from registry
+            conn = get_connection()  # triggers _auto_reattach_parquet
             row = conn.execute('SELECT COUNT(*) FROM "sales4"').fetchone()
             assert row[0] == 5, "View not restored after connection reset"
 
         finally:
-            # Close connection, delete temp .duckdb file and parquet.
             try:
                 import agent.database as db_m
                 if db_m._conn is not None:
@@ -161,39 +149,29 @@ class TestParquetPersistence:
                 db_m._conn = None
             except Exception:
                 pass
-
-            # Clean up temp file DB.
             for f in tmp_path.glob("restart_test.duckdb*"):
                 try:
                     f.unlink()
                 except Exception:
                     pass
-
-            # Clean up the parquet written for this test only.
             try:
                 if pq_path.exists():  # type: ignore[possibly-undefined]
                     pq_path.unlink()
             except Exception:
                 pass
-
-            # Restore :memory: and re-init singleton for subsequent tests.
             for mod_name in [m for m in sys.modules if m.startswith("agent")]:
                 del sys.modules[mod_name]
-            if prev_db_path is not None:
-                os.environ["DUCKDB_PATH"] = prev_db_path
-            else:
-                os.environ["DUCKDB_PATH"] = ":memory:"
+            os.environ["DUCKDB_PATH"] = prev_db_path if prev_db_path is not None else ":memory:"
             import agent.database as db_m  # noqa: F811
             db_m._conn = None
+            db_m.get_connection()  # re-warm the shared :memory: connection
 
     def test_date_columns_stored_as_native_type(self, tmp_path):
-        """order_date (ISO strings in Excel) should land as datetime in Parquet."""
         from agent.tools import load_file, get_parquet_path
 
         xl = tmp_path / "sales5.xlsx"
         _make_sample_excel(xl)
         load_file.invoke({"path": str(xl), "dataset_name": "sales5"})
-
         pq = get_parquet_path("sales5")
         schema = pd.read_parquet(pq).dtypes
         assert str(schema["order_date"]).startswith("datetime"), (
@@ -202,12 +180,6 @@ class TestParquetPersistence:
 
 
 class TestColumnCatalog:
-    """_column_catalog is populated correctly and search_semantic_lookup works.
-
-    NOTE: This branch replaced _semantic_lookup with _column_catalog.
-    n_distinct and null_frac are no longer stored as columns; sample_values
-    and description are still present.
-    """
 
     @pytest.fixture(scope="class", autouse=True)
     def _load_dataset(self, tmp_path_factory):
@@ -242,8 +214,7 @@ class TestColumnCatalog:
             "SELECT column_name, sample_values FROM _column_catalog WHERE dataset_name = 'demo'"
         ).fetchall()
         for col, sv in rows:
-            parsed = json.loads(sv or "[]")
-            assert isinstance(parsed, list), f"{col}: sample_values is not a JSON list"
+            assert isinstance(json.loads(sv or "[]"), list), f"{col}: sample_values not a JSON list"
 
     def test_search_semantic_lookup_by_keyword(self):
         from agent.tools import search_semantic_lookup
@@ -262,12 +233,10 @@ class TestColumnCatalog:
     def test_search_semantic_lookup_no_match_returns_empty(self):
         from agent.tools import search_semantic_lookup
         raw = search_semantic_lookup.invoke({"query": "zzznomatchxxx", "dataset": "demo"})
-        results = json.loads(raw)
-        assert results == []
+        assert json.loads(raw) == []
 
 
 class TestSchemaLookupToolInSuite:
-    """search_semantic_lookup is exposed in SQL_WRITER_TOOLS."""
 
     def test_search_semantic_lookup_in_sql_writer_tools(self):
         from agent.tools import SQL_WRITER_TOOLS, search_semantic_lookup
