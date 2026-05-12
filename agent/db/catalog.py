@@ -127,7 +127,12 @@ def list_relationships(
     tables: list[str] | None = None,
     conn: duckdb.DuckDBPyConnection | None = None,
 ) -> list[dict]:
-    """Return all relationships, optionally filtered to a list of table names.
+    """Return relationships, optionally scoped to a list of table names.
+
+    When *tables* is provided only rows where BOTH left_table AND right_table
+    are members of *tables* are returned.  This prevents unrelated tables from
+    leaking into a scoped query (e.g. asking for sales1000 + sales_rep_targets
+    must not return sales1000 <-> product_metrics rows).
 
     Returns dicts with keys:
         left_table, left_column, right_table, right_column, cardinality, description
@@ -138,7 +143,7 @@ def list_relationships(
             """
             SELECT left_table, left_column, right_table, right_column, cardinality, description
             FROM _relationships
-            WHERE left_table = ANY(?) OR right_table = ANY(?)
+            WHERE left_table = ANY(?) AND right_table = ANY(?)
             ORDER BY relationship_id
             """,
             [tables, tables],
