@@ -24,7 +24,9 @@ via its own _isolated_env fixture.
 from __future__ import annotations
 
 import os
+import shutil
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -48,9 +50,17 @@ def _session_env(tmp_path_factory):
 
     yield parquet_dir
 
-    # Teardown: reset the singleton so subsequent imports start fresh.
+    # Teardown: reset the singleton.
     try:
         import agent.database as _db
         _db._conn = None
     except Exception:
         pass
+
+    # Delete every .parquet file written during the session.
+    parquet_dir_path = Path(parquet_dir)
+    if parquet_dir_path.exists():
+        shutil.rmtree(parquet_dir_path, ignore_errors=True)
+
+    # Remove PARQUET_STORE from env so post-session imports use the real path.
+    os.environ.pop("PARQUET_STORE", None)

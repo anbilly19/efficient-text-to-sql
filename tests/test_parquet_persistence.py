@@ -9,6 +9,7 @@ Fixture hierarchy
 conftest.py::_session_env   (scope=session, autouse)
     Sets PARQUET_STORE to a temp dir *before* any agent module is imported,
     so module-level constants in agent.tools pick up the temp path correctly.
+    Deletes all parquet files on session teardown.
 
 _isolated_env               (scope=module, autouse)
     Overrides DUCKDB_PATH to ':memory:', resets the DuckDB singleton, and
@@ -19,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -115,29 +117,30 @@ class TestParquetPersistence:
         """Simulate a server restart: _data_registry persists in a file DB so
         _auto_reattach_parquet can rebuild the view on reconnect.
 
-        This test cannot use :memory: because resetting _conn destroys the
-        entire in-memory database including _data_registry. A temp .duckdb
-        file is used instead so the registry survives the singleton reset.
+        Uses a temp .duckdb file (not :memory:) so _data_registry survives
+        the singleton reset. The file DB and any parquet written here are
+        deleted in the finally block.
         """
         import agent.database as db_module
 
-        # Switch to a temp file DB just for this test.
         file_db = tmp_path / "restart_test.duckdb"
         prev_db_path = os.environ.get("DUCKDB_PATH")
         os.environ["DUCKDB_PATH"] = str(file_db)
 
-        # Purge singleton and modules so they bind against the new path.
         db_module._conn = None
         for mod_name in [m for m in sys.modules if m.startswith("agent")]:
             del sys.modules[mod_name]
 
         try:
-            from agent.tools import load_file
+            from agent.tools import load_file, get_parquet_path
             import agent.database as db_module  # noqa: F811
 
             xl = tmp_path / "sales4.xlsx"
             _make_sample_excel(xl)
             load_file.invoke({"path": str(xl), "dataset_name": "sales4"})
+
+            # Remember parquet path before reset so we can delete it.
+            pq_path = get_parquet_path("sales4")
 
             # Simulate restart: drop singleton — file DB keeps _data_registry.
             db_module._conn = None
@@ -150,9 +153,30 @@ class TestParquetPersistence:
             assert row[0] == 5, "View not restored after connection reset"
 
         finally:
-            # Restore :memory: for all subsequent tests.
-            import agent.database as db_m
-            db_m._conn = None
+            # Close connection, delete temp .duckdb file and parquet.
+            try:
+                import agent.database as db_m
+                if db_m._conn is not None:
+                    db_m._conn.close()
+                db_m._conn = None
+            except Exception:
+                pass
+
+            # Clean up temp file DB.
+            for f in tmp_path.glob("restart_test.duckdb*"):
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+
+            # Clean up the parquet written for this test only.
+            try:
+                if pq_path.exists():  # type: ignore[possibly-undefined]
+                    pq_path.unlink()
+            except Exception:
+                pass
+
+            # Restore :memory: and re-init singleton for subsequent tests.
             for mod_name in [m for m in sys.modules if m.startswith("agent")]:
                 del sys.modules[mod_name]
             if prev_db_path is not None:
