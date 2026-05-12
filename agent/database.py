@@ -102,13 +102,17 @@ def _ensure_metadata_tables(conn: duckdb.DuckDBPyConnection) -> None:
         )
     """)
 
+    # dataset_name uses '' as the sentinel for "applies to all tables".
+    # DuckDB does not support function expressions (e.g. COALESCE) inside a
+    # PRIMARY KEY definition, so we use NOT NULL DEFAULT '' and a UNIQUE
+    # constraint instead — semantically identical.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS _semantic_map (
             term          VARCHAR NOT NULL,
-            dataset_name  VARCHAR,        -- NULL = applies to all datasets
+            dataset_name  VARCHAR NOT NULL DEFAULT '',
             column_name   VARCHAR NOT NULL,
             description   VARCHAR,
-            PRIMARY KEY (term, COALESCE(dataset_name, ''))
+            UNIQUE (term, dataset_name)
         )
     """)
 
