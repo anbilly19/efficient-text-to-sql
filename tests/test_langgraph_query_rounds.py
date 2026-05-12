@@ -8,7 +8,7 @@ import requests
 
 LANGGRAPH_API_URL = os.getenv("LANGGRAPH_API_URL", "http://127.0.0.1:2024").rstrip("/")
 ASSISTANT_ID = os.getenv("ASSISTANT_ID", "fe096781-5601-53d2-b2f6-0d3403f7e9ca")
-LOAD_COMMAND = os.getenv("LOAD_COMMAND", "load sample_sales_1000.xlsx as sales1000")
+LOAD_COMMAND = os.getenv("LOAD_COMMAND", "load data/sample_sales_1000.xlsx as sales1000")
 REQUEST_TIMEOUT = float(os.getenv("TEST_REQUEST_TIMEOUT", "120"))
 POLL_SECONDS = float(os.getenv("TEST_POLL_SECONDS", "0.5"))
 
@@ -105,8 +105,10 @@ QUERY_ROUNDS = [
     # ------------------------------------------------------------------
     # round_12 — multi-table: forces the agent to JOIN across the three
     # seeded tables (sales1000, sales_rep_targets, product_metrics).
-    # Pre-requisite: python scripts/seed_multi_table.py
-    # Skip this round if the seed tables are absent:
+    # Pre-requisite:
+    #   load data/sales_rep_targets.xlsx as sales_rep_targets
+    #   load data/product_metrics.xlsx as product_metrics
+    # Skip this round:
     #   pytest tests/test_langgraph_query_rounds.py -k "not round_12" -v
     # Run only this round:
     #   pytest tests/test_langgraph_query_rounds.py -k round_12 -v
@@ -259,7 +261,6 @@ def loaded_dataset(thread_id: str) -> None:
     )
 
 
-# Counter shared across workers (single-process only; fine for sequential runs)
 _query_counter: dict[str, int] = {"n": 0}
 
 

@@ -1,11 +1,15 @@
-# REMOVED: this script materialised sales_rep_targets and product_metrics by
-# running GROUP BY against sales1000 at setup time, which is the wrong design.
+# This file has been superseded.
+# 
+# - To generate data/product_metrics.xlsx (standalone, no DB needed):
+#       python scripts/generate_product_metrics.py
 #
-# Additional tables must be independent data sources uploaded via the agent.
-# To generate independent test Excel files run:
+# - sales_rep_targets is derived from sales1000 inside the agent at load time
+#   via db/migrations/001_multi_table.sql — no manual seeding required.
 #
-#   python scripts/generate_test_data.py
-#
-# Then upload them:
-#   load file at data/sales_rep_targets.xlsx as sales_rep_targets
-#   load file at data/product_metrics.xlsx as product_metrics
+# This stub is kept to avoid import errors in any scripts that reference it.
+# It will be removed in a future cleanup commit.
+
+raise ImportError(
+    "seed_multi_table.py has been removed. "
+    "Use scripts/generate_product_metrics.py for product_metrics.xlsx generation."
+)

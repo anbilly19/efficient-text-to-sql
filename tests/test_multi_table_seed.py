@@ -1,363 +1,175 @@
 """
 tests/test_multi_table_seed.py
 -------------------------------
-Unit tests for scripts/seed_multi_table.py.
+Unit tests for scripts/generate_product_metrics.py.
 
-All tests run against an in-memory DuckDB fixture — no file I/O, no agent, no API key.
+Tests are fully self-contained: no database, no agent, no API key, no
+sales1000 file required.  The generator creates the DataFrame in memory;
+we validate its structure and values directly.
 
 Run the whole file:
     pytest tests/test_multi_table_seed.py -v
 
 Run a single class:
-    pytest tests/test_multi_table_seed.py::TestRepTargets -v
+    pytest tests/test_multi_table_seed.py::TestSchema -v
 
 Run a single test:
-    pytest tests/test_multi_table_seed.py::TestRepTargets::test_annual_quota_is_115_pct -v
+    pytest tests/test_multi_table_seed.py::TestValues::test_all_revenue_positive -v
 
 Run with stdout:
     pytest tests/test_multi_table_seed.py -v -s
 """
 
+from __future__ import annotations
+
 import sys
 from pathlib import Path
 
-import duckdb
+import pandas as pd
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
-import seed_multi_table as smt
+import generate_product_metrics as gpm
 
 
 # ---------------------------------------------------------------------------
-# Fixtures
+# Fixture: build the DataFrame once per module
 # ---------------------------------------------------------------------------
 
-MINI_SALES = [
-    ("ORD-001", "2024-01-10", "Alice Johnson", "North", "Keyboard", "Electronics", 2, 100.00, 200.00),
-    ("ORD-002", "2024-01-11", "Alice Johnson", "North", "Mouse",    "Electronics", 1,  50.00,  50.00),
-    ("ORD-003", "2024-01-12", "Bob Smith",     "South", "T-Shirt",  "Clothing",    3,  30.00,  90.00),
-    ("ORD-004", "2024-01-13", "Bob Smith",     "South", "Jeans",    "Clothing",    2,  60.00, 120.00),
-    ("ORD-005", "2024-01-14", "Carol White",   "East",  "Keyboard", "Electronics", 4, 100.00, 400.00),
-    ("ORD-006", "2024-01-15", "Carol White",   "East",  "T-Shirt",  "Clothing",    5,  30.00, 150.00),
-]
-
-COLUMNS = (
-    "order_id", "order_date", "Sales Rep", "Region",
-    "Product Name", "Category", "Quantity Ordered", "Unit Price", "Total Revenue"
-)
+@pytest.fixture(scope="module")
+def df() -> pd.DataFrame:
+    return pd.DataFrame(gpm.ROWS, columns=gpm.COLUMNS)
 
 
-@pytest.fixture
-def conn():
-    c = duckdb.connect(":memory:")
-    cols = ", ".join(f'"{col}" VARCHAR' if col not in ("Quantity Ordered",) else f'"{col}" INTEGER'
-                     for col in COLUMNS)
-    # Use the exact column names from sample_sales_1000.xlsx
-    c.execute("""
-        CREATE TABLE sales1000 (
-            order_id        VARCHAR,
-            order_date      VARCHAR,
-            "Sales Rep"     VARCHAR,
-            "Region"        VARCHAR,
-            "Product Name"  VARCHAR,
-            "Category"      VARCHAR,
-            "Quantity Ordered" INTEGER,
-            "Unit Price"    DOUBLE,
-            "Total Revenue" DOUBLE
+# ---------------------------------------------------------------------------
+# Schema
+# ---------------------------------------------------------------------------
+
+class TestSchema:
+    """Run: pytest tests/test_multi_table_seed.py::TestSchema -v"""
+
+    EXPECTED_COLUMNS = [
+        "product", "category",
+        "total_revenue", "total_units", "order_count",
+        "avg_unit_price", "avg_order_value",
+    ]
+
+    def test_all_columns_present(self, df):
+        assert list(df.columns) == self.EXPECTED_COLUMNS
+
+    def test_no_null_values(self, df):
+        nulls = df.isnull().sum()
+        assert nulls.sum() == 0, f"Unexpected nulls:\n{nulls[nulls > 0]}"
+
+    def test_product_category_unique(self, df):
+        """(product, category) must be the composite PK."""
+        dupes = df.duplicated(subset=["product", "category"])
+        assert not dupes.any(), (
+            f"Duplicate (product, category) rows:\n{df[dupes]}"
         )
-    """)
-    c.executemany("INSERT INTO sales1000 VALUES (?,?,?,?,?,?,?,?,?)", MINI_SALES)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS _data_registry (
-            dataset_name  VARCHAR NOT NULL PRIMARY KEY,
-            parquet_path  VARCHAR,
-            source_file   VARCHAR,
-            row_count     BIGINT,
-            column_count  INTEGER,
-            ingested_at   TIMESTAMP DEFAULT current_timestamp
+
+    def test_minimum_row_count(self, df):
+        """At least 20 products across at least 3 categories."""
+        assert len(df) >= 20
+        assert df["category"].nunique() >= 3
+
+
+# ---------------------------------------------------------------------------
+# Values
+# ---------------------------------------------------------------------------
+
+class TestValues:
+    """Run: pytest tests/test_multi_table_seed.py::TestValues -v"""
+
+    def test_all_revenue_positive(self, df):
+        assert (df["total_revenue"] > 0).all()
+
+    def test_all_units_positive(self, df):
+        assert (df["total_units"] > 0).all()
+
+    def test_all_order_counts_positive(self, df):
+        assert (df["order_count"] > 0).all()
+
+    def test_avg_unit_price_positive(self, df):
+        assert (df["avg_unit_price"] > 0).all()
+
+    def test_avg_order_value_gte_avg_unit_price(self, df):
+        """avg_order_value >= avg_unit_price (multi-unit orders drive this up)."""
+        assert (df["avg_order_value"] >= df["avg_unit_price"]).all(), (
+            df[df["avg_order_value"] < df["avg_unit_price"]][["product", "avg_unit_price", "avg_order_value"]]
         )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS _relationships (
-            id          INTEGER PRIMARY KEY,
-            left_table  VARCHAR,
-            left_col    VARCHAR,
-            right_table VARCHAR,
-            right_col   VARCHAR,
-            join_type   VARCHAR DEFAULT 'many-to-one'
+
+    def test_units_gte_order_count(self, df):
+        """total_units >= order_count (each order has at least 1 unit)."""
+        assert (df["total_units"] >= df["order_count"]).all()
+
+    def test_avg_order_value_consistent(self, df):
+        """avg_order_value ≈ total_revenue / order_count (within 1%)."""
+        computed = df["total_revenue"] / df["order_count"]
+        ratio = (df["avg_order_value"] / computed).clip(lower=0)
+        assert ((ratio - 1).abs() < 0.01).all(), (
+            "avg_order_value inconsistent with total_revenue / order_count"
         )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS _table_context (
-            table_name  VARCHAR PRIMARY KEY,
-            summary     VARCHAR,
-            tags        VARCHAR
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS _column_catalog (
-            table_name   VARCHAR,
-            column_name  VARCHAR,
-            is_metric    BOOLEAN DEFAULT FALSE,
-            is_dimension BOOLEAN DEFAULT FALSE,
-            is_join_key  BOOLEAN DEFAULT FALSE
-        )
-    """)
-    yield c
-    c.close()
-
-
-def _seed(c):
-    """Run all seed SQL statements against the given connection."""
-    c.execute(smt.SQL_REP_TARGETS)
-    c.execute(smt.SQL_PRODUCT_METRICS)
-    c.execute(smt.SQL_RELATIONSHIPS)
-    try:
-        c.execute(smt.REGISTRY_UPSERT)
-    except Exception:
-        pass
 
 
 # ---------------------------------------------------------------------------
-# Table existence
+# Specific products
 # ---------------------------------------------------------------------------
 
-class TestTableCreation:
-    """Run: pytest tests/test_multi_table_seed.py::TestTableCreation -v"""
+class TestSpotCheck:
+    """Run: pytest tests/test_multi_table_seed.py::TestSpotCheck -v"""
 
-    def test_sales_rep_targets_created(self, conn):
-        _seed(conn)
-        tables = {r[0] for r in conn.execute(
-            "SELECT table_name FROM information_schema.tables WHERE table_schema='main'"
-        ).fetchall()}
-        assert "sales_rep_targets" in tables
+    def _get(self, df: pd.DataFrame, product: str, category: str) -> pd.Series:
+        row = df[(df["product"] == product) & (df["category"] == category)]
+        assert len(row) == 1, f"Expected exactly 1 row for ({product}, {category})"
+        return row.iloc[0]
 
-    def test_product_metrics_created(self, conn):
-        _seed(conn)
-        tables = {r[0] for r in conn.execute(
-            "SELECT table_name FROM information_schema.tables WHERE table_schema='main'"
-        ).fetchall()}
-        assert "product_metrics" in tables
+    def test_keyboard_present(self, df):
+        row = self._get(df, "Keyboard", "Electronics")
+        assert row["total_revenue"] > 0
 
+    def test_mouse_present(self, df):
+        row = self._get(df, "Mouse", "Electronics")
+        assert row["avg_unit_price"] > 0
 
-# ---------------------------------------------------------------------------
-# Row counts
-# ---------------------------------------------------------------------------
+    def test_tshirt_present(self, df):
+        row = self._get(df, "T-Shirt", "Clothing")
+        assert row["total_units"] >= row["order_count"]
 
-class TestRowCounts:
-    """Run: pytest tests/test_multi_table_seed.py::TestRowCounts -v"""
+    def test_jeans_present(self, df):
+        row = self._get(df, "Jeans", "Clothing")
+        assert abs(row["avg_order_value"] / (row["total_revenue"] / row["order_count"]) - 1) < 0.01
 
-    def test_sales_rep_targets_row_count(self, conn):
-        _seed(conn)
-        count = conn.execute("SELECT COUNT(*) FROM sales_rep_targets").fetchone()[0]
-        assert count == 3  # Alice/North, Bob/South, Carol/East
+    def test_laptop_is_highest_avg_price_in_electronics(self, df):
+        elec = df[df["category"] == "Electronics"]
+        assert elec.loc[elec["avg_unit_price"].idxmax(), "product"] == "Laptop"
 
-    def test_product_metrics_row_count(self, conn):
-        _seed(conn)
-        count = conn.execute("SELECT COUNT(*) FROM product_metrics").fetchone()[0]
-        assert count == 4  # Keyboard/Electronics, Mouse/Electronics, T-Shirt/Clothing, Jeans/Clothing
+    def test_bicycle_is_highest_revenue_in_sports(self, df):
+        sports = df[df["category"] == "Sports"]
+        assert sports.loc[sports["total_revenue"].idxmax(), "product"] == "Bicycle"
 
 
 # ---------------------------------------------------------------------------
-# sales_rep_targets correctness
+# File generation
 # ---------------------------------------------------------------------------
 
-class TestRepTargets:
-    """Run: pytest tests/test_multi_table_seed.py::TestRepTargets -v"""
+class TestFileGeneration:
+    """Run: pytest tests/test_multi_table_seed.py::TestFileGeneration -v"""
 
-    def test_historical_revenue_alice(self, conn):
-        _seed(conn)
-        row = conn.execute("""
-            SELECT historical_revenue FROM sales_rep_targets
-            WHERE sales_rep = 'Alice Johnson' AND region = 'North'
-        """).fetchone()
-        assert row is not None
-        assert abs(row[0] - 250.0) < 0.01
+    def test_generate_writes_xlsx(self, tmp_path):
+        out = tmp_path / "product_metrics.xlsx"
+        gpm.generate(out)
+        assert out.exists()
+        assert out.stat().st_size > 0
 
-    def test_orders_count_bob(self, conn):
-        _seed(conn)
-        row = conn.execute("""
-            SELECT orders_count FROM sales_rep_targets
-            WHERE sales_rep = 'Bob Smith' AND region = 'South'
-        """).fetchone()
-        assert row is not None
-        assert row[0] == 2
+    def test_generated_file_is_readable(self, tmp_path):
+        out = tmp_path / "product_metrics.xlsx"
+        gpm.generate(out)
+        df_loaded = pd.read_excel(out)
+        assert list(df_loaded.columns) == gpm.COLUMNS
+        assert len(df_loaded) == len(gpm.ROWS)
 
-    def test_units_sold_carol(self, conn):
-        _seed(conn)
-        row = conn.execute("""
-            SELECT units_sold FROM sales_rep_targets
-            WHERE sales_rep = 'Carol White' AND region = 'East'
-        """).fetchone()
-        assert row is not None
-        assert row[0] == 9
-
-    def test_annual_quota_is_115_pct(self, conn):
-        _seed(conn)
-        rows = conn.execute(
-            "SELECT historical_revenue, annual_quota FROM sales_rep_targets"
-        ).fetchall()
-        assert len(rows) > 0
-        for hist, quota in rows:
-            assert abs(quota / hist - 1.15) < 0.001, f"Quota ratio wrong: {quota}/{hist}"
-
-    def test_avg_order_value_carol(self, conn):
-        _seed(conn)
-        row = conn.execute("""
-            SELECT avg_order_value FROM sales_rep_targets
-            WHERE sales_rep = 'Carol White' AND region = 'East'
-        """).fetchone()
-        assert row is not None
-        assert abs(row[0] - 275.0) < 0.01
-
-
-# ---------------------------------------------------------------------------
-# product_metrics correctness
-# ---------------------------------------------------------------------------
-
-class TestProductMetrics:
-    """Run: pytest tests/test_multi_table_seed.py::TestProductMetrics -v"""
-
-    def test_keyboard_revenue(self, conn):
-        _seed(conn)
-        row = conn.execute("""
-            SELECT total_revenue FROM product_metrics
-            WHERE product = 'Keyboard' AND category = 'Electronics'
-        """).fetchone()
-        assert row is not None
-        assert abs(row[0] - 600.0) < 0.01  # ORD-001 (200) + ORD-005 (400)
-
-    def test_tshirt_units(self, conn):
-        _seed(conn)
-        row = conn.execute("""
-            SELECT total_units FROM product_metrics
-            WHERE product = 'T-Shirt' AND category = 'Clothing'
-        """).fetchone()
-        assert row is not None
-        assert row[0] == 8  # ORD-003 (3) + ORD-006 (5)
-
-    def test_avg_unit_price_mouse(self, conn):
-        _seed(conn)
-        row = conn.execute("""
-            SELECT avg_unit_price FROM product_metrics
-            WHERE product = 'Mouse' AND category = 'Electronics'
-        """).fetchone()
-        assert row is not None
-        assert abs(row[0] - 50.0) < 0.01
-
-    def test_order_count_jeans(self, conn):
-        _seed(conn)
-        row = conn.execute("""
-            SELECT order_count FROM product_metrics
-            WHERE product = 'Jeans' AND category = 'Clothing'
-        """).fetchone()
-        assert row is not None
-        assert row[0] == 1
-
-
-# ---------------------------------------------------------------------------
-# _relationships registry
-# ---------------------------------------------------------------------------
-
-class TestRelationshipsRegistry:
-    """Run: pytest tests/test_multi_table_seed.py::TestRelationshipsRegistry -v"""
-
-    def test_row_count(self, conn):
-        _seed(conn)
-        count = conn.execute("SELECT COUNT(*) FROM _relationships").fetchone()[0]
-        assert count == 4
-
-    def test_expected_keys_present(self, conn):
-        _seed(conn)
-        rows = conn.execute(
-            "SELECT left_table, left_col, right_table, right_col FROM _relationships"
-        ).fetchall()
-        keys = {(r[0], r[1], r[2], r[3]) for r in rows}
-        assert ("sales1000", "Sales Rep",    "sales_rep_targets", "sales_rep") in keys
-        assert ("sales1000", "Region",        "sales_rep_targets", "region")    in keys
-        assert ("sales1000", "Product Name",  "product_metrics",   "product")   in keys
-        assert ("sales1000", "Category",      "product_metrics",   "category")  in keys
-
-    def test_idempotent(self, conn):
-        _seed(conn)
-        conn.execute(smt.SQL_RELATIONSHIPS)
-        count = conn.execute("SELECT COUNT(*) FROM _relationships").fetchone()[0]
-        assert count == 4
-
-
-# ---------------------------------------------------------------------------
-# Fan-out guards
-# ---------------------------------------------------------------------------
-
-class TestFanOut:
-    """Run: pytest tests/test_multi_table_seed.py::TestFanOut -v"""
-
-    def test_rep_targets_no_fanout(self, conn):
-        _seed(conn)
-        fact_count = conn.execute("SELECT COUNT(*) FROM sales1000").fetchone()[0]
-        joined = conn.execute("""
-            SELECT COUNT(*)
-            FROM sales1000 s
-            LEFT JOIN sales_rep_targets t
-              ON s."Sales Rep" = t.sales_rep AND s."Region" = t.region
-        """).fetchone()[0]
-        assert joined == fact_count, f"Fan-out: fact={fact_count}, joined={joined}"
-
-    def test_product_metrics_no_fanout(self, conn):
-        _seed(conn)
-        fact_count = conn.execute("SELECT COUNT(*) FROM sales1000").fetchone()[0]
-        joined = conn.execute("""
-            SELECT COUNT(*)
-            FROM sales1000 s
-            LEFT JOIN product_metrics p
-              ON s."Product Name" = p.product AND s."Category" = p.category
-        """).fetchone()[0]
-        assert joined == fact_count, f"Fan-out: fact={fact_count}, joined={joined}"
-
-    def test_quota_lookup_returns_value(self, conn):
-        _seed(conn)
-        rows = conn.execute("""
-            SELECT s.order_id, t.annual_quota
-            FROM sales1000 s
-            LEFT JOIN sales_rep_targets t
-              ON s."Sales Rep" = t.sales_rep AND s."Region" = t.region
-        """).fetchall()
-        for order_id, quota in rows:
-            assert quota is not None and quota > 0, f"{order_id} has null/zero quota"
-
-
-# ---------------------------------------------------------------------------
-# Idempotency
-# ---------------------------------------------------------------------------
-
-class TestIdempotency:
-    """Run: pytest tests/test_multi_table_seed.py::TestIdempotency -v"""
-
-    def test_full_reseed_idempotent(self, conn):
-        _seed(conn)
-        first = conn.execute("SELECT COUNT(*) FROM sales_rep_targets").fetchone()[0]
-        _seed(conn)
-        second = conn.execute("SELECT COUNT(*) FROM sales_rep_targets").fetchone()[0]
-        assert first == second
-
-    def test_product_metrics_reseed_idempotent(self, conn):
-        _seed(conn)
-        first = conn.execute("SELECT COUNT(*) FROM product_metrics").fetchone()[0]
-        _seed(conn)
-        second = conn.execute("SELECT COUNT(*) FROM product_metrics").fetchone()[0]
-        assert first == second
-
-
-# ---------------------------------------------------------------------------
-# Error handling
-# ---------------------------------------------------------------------------
-
-class TestErrorHandling:
-    """Run: pytest tests/test_multi_table_seed.py::TestErrorHandling -v"""
-
-    def test_missing_fact_table_raises(self, tmp_path):
-        db_path = str(tmp_path / "empty.duckdb")
-        with duckdb.connect(db_path) as c:
-            c.execute("CREATE TABLE dummy (x INT)")
-        with pytest.raises(RuntimeError, match="sales1000"):
-            smt.seed(db_path)
+    def test_generate_creates_parent_dirs(self, tmp_path):
+        nested = tmp_path / "a" / "b" / "metrics.xlsx"
+        gpm.generate(nested)
+        assert nested.exists()
