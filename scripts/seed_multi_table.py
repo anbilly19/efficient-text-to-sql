@@ -1,9 +1,22 @@
 #!/usr/bin/env python
 """
-scripts/seed_multi_table.py
+scripts/seed_multi_table.py  (idempotent)
 
-One-shot seeder (idempotent). Forces PARQUET_STORE to .local/parquet before
-importing any agent module so parquet paths in _data_registry are always stable.
+Column reference
+----------------
+sales1000:         order_id, order_date, sales_rep, region, product,
+                   category, quantity, unit_price, total_revenue
+sales_rep_targets: sales_rep, region, quota_usd, fte_headcount,
+                   territory_tier, manager, hired_date, last_review_score
+product_metrics:   product_name, category, unit_cost_usd, launch_year,
+                   lifecycle_stage, supplier, sku, reorder_point_units
+
+Join keys
+---------
+  sales1000.sales_rep  -> sales_rep_targets.sales_rep
+  sales1000.region     -> sales_rep_targets.region
+  sales1000.product    -> product_metrics.product_name   (different names!)
+  sales1000.category   -> product_metrics.category
 """
 from __future__ import annotations
 
@@ -28,9 +41,6 @@ def main() -> None:
 
     conn = get_connection()
 
-    # ------------------------------------------------------------------
-    # 1. Load source tables
-    # ------------------------------------------------------------------
     table_paths = {
         "sales1000":         ROOT / "data" / "sample_sales_1000.xlsx",
         "sales_rep_targets": ROOT / "data" / "sales_rep_targets.xlsx",
@@ -60,9 +70,6 @@ def main() -> None:
         )
         index_table_schema(conn, dataset_name)
 
-    # ------------------------------------------------------------------
-    # 2. Purge inferred relationships for these tables
-    # ------------------------------------------------------------------
     print("\nPurging inferred relationships for seeded tables...")
     conn.execute(
         """
@@ -73,27 +80,17 @@ def main() -> None:
         [TABLES, TABLES],
     )
 
-    # ------------------------------------------------------------------
-    # 3. Register the four authoritative join pairs (snake_case columns)
-    # sales1000 columns: order_id, order_date, sales_rep, region,
-    #                    product, category, quantity, unit_price, total_revenue
-    # sales_rep_targets: sales_rep, region, quota_usd, fte_headcount,
-    #                    territory_tier, manager, hired_date, last_review_score
-    # product_metrics:   product, category, unit_cost_usd  (or similar)
-    # ------------------------------------------------------------------
+    # sales1000.product -> product_metrics.product_name  (different column names)
     join_pairs = [
-        ("sales1000", "sales_rep", "sales_rep_targets", "sales_rep", "many-to-one", "Sales rep join"),
-        ("sales1000", "region",    "sales_rep_targets", "region",    "many-to-one", "Region join"),
-        ("sales1000", "product",   "product_metrics",   "product",   "many-to-one", "Product join"),
-        ("sales1000", "category",  "product_metrics",   "category",  "many-to-one", "Category join"),
+        ("sales1000", "sales_rep", "sales_rep_targets", "sales_rep",   "many-to-one", "Sales rep join"),
+        ("sales1000", "region",    "sales_rep_targets", "region",       "many-to-one", "Region join"),
+        ("sales1000", "product",   "product_metrics",   "product_name", "many-to-one", "Product join"),
+        ("sales1000", "category",  "product_metrics",   "category",     "many-to-one", "Category join"),
     ]
     for left_tbl, left_col, right_tbl, right_col, card, desc in join_pairs:
         register_relationship(conn, left_tbl, left_col, right_tbl, right_col, card, desc)
         print(f"  registered: {left_tbl}.{left_col} -> {right_tbl}.{right_col}")
 
-    # ------------------------------------------------------------------
-    # 4. Upsert _table_context summaries
-    # ------------------------------------------------------------------
     contexts = [
         ("sales1000",         "Individual sales transactions. One row per order line.",      "order_line",         ["fact", "transactions", "sales"]),
         ("sales_rep_targets", "Management quotas per (sales_rep, region) pair.",             "sales_rep x region", ["dimension", "quota", "targets"]),
@@ -103,20 +100,20 @@ def main() -> None:
         upsert_table_context(dataset_name, summary, grain, tags)
         print(f"  context upserted: {dataset_name}")
 
-    print("\nSeed complete. Tables registered:")
+    print("\nSeed complete.")
     for name, rc, cc in conn.execute(
         "SELECT dataset_name, row_count, column_count FROM _data_registry ORDER BY dataset_name"
     ).fetchall():
-        print(f"  {name}: {rc} rows, {cc} columns")
+        print(f"  {name}: {rc} rows, {cc} cols")
 
-    print("\nRelationships registered:")
+    print("\nRelationships:")
     for lt, lc, rt, rc_col, card in conn.execute(
         "SELECT left_table, left_column, right_table, right_column, cardinality "
         "FROM _relationships ORDER BY relationship_id"
     ).fetchall():
         print(f"  {lt}.{lc} -> {rt}.{rc_col}  ({card})")
 
-    print(f"\nParquets written to: {_CANONICAL_PARQUET_STORE}")
+    print(f"\nParquets at: {_CANONICAL_PARQUET_STORE}")
 
 
 if __name__ == "__main__":
