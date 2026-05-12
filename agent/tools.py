@@ -19,10 +19,15 @@ from agent.database import (
 )
 
 # ---------------------------------------------------------------------------
-# Parquet storage (kept here so tools.py controls the path)
+# Parquet storage
 # ---------------------------------------------------------------------------
 
-PARQUET_STORE = Path("./.local/parquet")
+# Anchored to the project root (parent of the agent/ package directory).
+# This matches the pattern used by database.py for _DEFAULT_DB_PATH and
+# ensures the path is stable regardless of the working directory at launch
+# time (LangGraph Studio, VS Code, terminal, etc.).
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PARQUET_STORE = _PROJECT_ROOT / ".local" / "parquet"
 
 
 def get_parquet_path(dataset_name: str) -> Path:
@@ -305,7 +310,6 @@ def lookup_semantic(term: str) -> str:
             [term],
         ).fetchone()
         if row:
-            # Also find matching columns across all tables
             cols = conn.execute(
                 "SELECT dataset_name, column_name, column_type, sample_values "
                 "FROM _column_catalog WHERE LOWER(column_name) LIKE LOWER(?)",
@@ -319,7 +323,6 @@ def lookup_semantic(term: str) -> str:
                     for r in cols
                 ],
             })
-        # Fallback: fuzzy column search across all tables
         cols = conn.execute(
             "SELECT dataset_name, column_name, column_type, description, sample_values "
             "FROM _column_catalog WHERE LOWER(column_name) LIKE LOWER(?)",
@@ -409,36 +412,41 @@ def load_file(path: str, dataset_name: str) -> str:
         dataset_name: Name to register the table / view as in DuckDB.
     """
     conn = get_connection()
+
+    # Resolve the source path: try as-is first, then relative to project root.
     file_path = Path(path)
     if not file_path.exists():
-        return f"ERROR: File not found at '{path}'"
+        file_path = _PROJECT_ROOT / path
+    if not file_path.exists():
+        return f"ERROR: File not found at '{path}' (also tried '{_PROJECT_ROOT / path}')"
+    file_path = file_path.resolve()
 
     suffix = file_path.suffix.lower()
     parquet_path = get_parquet_path(dataset_name)
 
-    # ── 1. Read source ────────────────────────────────────────────────────
+    # ── 1. Read source ────────────────────────────────────────────────────────────────
     try:
         if suffix in (".xlsx", ".xls"):
-            df = pd.read_excel(path)
+            df = pd.read_excel(file_path)
             df = _normalize_date_columns_df(df)
         elif suffix == ".csv":
-            df = pd.read_csv(path, low_memory=False)
+            df = pd.read_csv(file_path, low_memory=False)
             df = _normalize_date_columns_df(df)
         elif suffix == ".parquet":
-            df = pd.read_parquet(path)
+            df = pd.read_parquet(file_path)
         else:
             return f"ERROR: Unsupported file type '{suffix}'. Use .xlsx, .parquet, or .csv."
     except Exception as exc:
         return f"ERROR reading file: {exc}"
 
-    # ── 2. Persist as Parquet ─────────────────────────────────────────────
+    # ── 2. Persist as Parquet (absolute path stored in registry) ────────────────
     try:
         PARQUET_STORE.mkdir(parents=True, exist_ok=True)
         df.to_parquet(parquet_path, index=False, engine="pyarrow")
     except Exception as exc:
         return f"ERROR writing Parquet: {exc}"
 
-    # ── 3. Register as a DuckDB VIEW ─────────────────────────────────────
+    # ── 3. Register as a DuckDB VIEW ──────────────────────────────────────────
     try:
         conn.execute(
             f'CREATE OR REPLACE VIEW "{dataset_name}" AS '
@@ -450,7 +458,7 @@ def load_file(path: str, dataset_name: str) -> str:
     row_count = len(df)
     col_count = len(df.columns)
 
-    # ── 4. Update _data_registry ──────────────────────────────────────────
+    # ── 4. Update _data_registry (store absolute path for restart resilience) ───
     try:
         conn.execute(
             """
@@ -464,25 +472,25 @@ def load_file(path: str, dataset_name: str) -> str:
                 column_count  = excluded.column_count,
                 ingested_at   = current_timestamp
             """,
-            [dataset_name, str(parquet_path), str(file_path), row_count, col_count],
+            [dataset_name, str(parquet_path.resolve()), str(file_path), row_count, col_count],
         )
     except Exception as exc:
         return f"File loaded but registry update failed: {exc}"
 
-    # ── 5. Index schema into _column_catalog ─────────────────────────────
+    # ── 5. Index schema into _column_catalog ──────────────────────────────────
     try:
         index_table_schema(conn, dataset_name)
     except Exception as exc:
         return f"File loaded but column catalog indexing failed: {exc}"
 
-    # ── 6. Auto-detect join relationships ────────────────────────────────
+    # ── 6. Auto-detect join relationships ─────────────────────────────────────
     inferred = []
     try:
         inferred = infer_and_register_relationships(conn, dataset_name)
     except Exception:
         pass
 
-    # ── 7. Seed _table_context with a minimal summary ────────────────────
+    # ── 7. Seed _table_context with a minimal summary ──────────────────────────
     try:
         existing = conn.execute(
             "SELECT 1 FROM _table_context WHERE dataset_name = ?", [dataset_name]
