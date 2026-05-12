@@ -122,11 +122,7 @@ def _most_recent_table() -> str:
 
 
 def _select_relevant_tables(user_query: str, all_tables: list[str]) -> list[str]:
-    """Ask the LLM (cheaply) which subset of tables is needed for this query.
-
-    Returns the selected table names. Falls back to all tables if the call fails
-    or if there is only one table.
-    """
+    """Ask the LLM (cheaply) which subset of tables is needed for this query."""
     if len(all_tables) <= 1:
         return all_tables
 
@@ -142,7 +138,6 @@ def _select_relevant_tables(user_query: str, all_tables: list[str]) -> list[str]
         response = _llm().invoke([HumanMessage(content=prompt)])
         parsed = _try_parse_json(_extract_text(response.content)) or {}
         selected = parsed.get("tables", [])
-        # Validate returned names exist
         valid = [t for t in selected if t in all_tables]
         return valid if valid else all_tables
     except Exception:
@@ -150,7 +145,6 @@ def _select_relevant_tables(user_query: str, all_tables: list[str]) -> list[str]
 
 
 def _get_date_cast_warnings(table_names: list[str]) -> str:
-    """Emit per-column date-handling warnings for all given tables."""
     conn = get_connection()
     warnings: list[str] = []
     for table_name in table_names:
@@ -182,7 +176,6 @@ def _get_date_cast_warnings(table_names: list[str]) -> str:
 
 
 def _get_varchar_date_columns_multi(table_names: list[str]) -> dict[str, set[str]]:
-    """Return {table_name: {varchar_date_col, ...}} for all given tables."""
     conn = get_connection()
     result: dict[str, set[str]] = {}
     for table_name in table_names:
@@ -209,11 +202,10 @@ def _get_varchar_date_columns_multi(table_names: list[str]) -> dict[str, set[str
 
 
 def _sanitize_sql(sql: str, varchar_date_cols: dict[str, set[str]]) -> str:
-    """Apply automatic TRY_CAST rewrites for known VARCHAR date columns."""
     if not sql:
         return sql
     sql = re.sub(r'"(\w+)""', r'"\1"', sql)
-    sql = re.sub(r'""(\w+)"', r'"\1"', sql)
+    sql = re.sub(r'""\b(\w+)"', r'"\1"', sql)
     for _table, cols in varchar_date_cols.items():
         for col in cols:
             col_pattern = rf'(?:"?\w+"?\.)?\"?{re.escape(col)}\"?'
@@ -262,6 +254,17 @@ _SCHEMA_PATTERNS = [
     re.compile(r"\bshow\s+(?:me\s+)?(?:all\s+)?(?:available\s+)?tables?\b", re.IGNORECASE),
 ]
 
+# META intent: questions about agent state — loaded tables, access, capabilities.
+# Answered deterministically from _data_registry; never sent to the LLM planner.
+_META_PATTERNS = [
+    re.compile(r"\b(?:do\s+you\s+have|have\s+you\s+(?:got|loaded)|is\s+there|can\s+you\s+(?:see|access|use))\b", re.IGNORECASE),
+    re.compile(r"\b(?:access\s+to|loaded|available|registered)\b", re.IGNORECASE),
+    re.compile(r"\bwhat\s+(?:data|tables?|files?)\s+(?:do\s+you\s+have|are\s+(?:loaded|available))\b", re.IGNORECASE),
+    re.compile(r"\bwhich\s+tables?\s+(?:are|do\s+you)\b", re.IGNORECASE),
+    re.compile(r"\bwhat\s+can\s+you\s+(?:do|answer|query)\b", re.IGNORECASE),
+    re.compile(r"\bare\s+(?:you|any\s+tables?)\s+(?:ready|set\s+up|configured)\b", re.IGNORECASE),
+]
+
 
 def _detect_load_intent(text: str) -> dict | None:
     for pattern in _LOAD_PATTERNS:
@@ -278,6 +281,58 @@ def _detect_load_intent(text: str) -> dict | None:
 
 def _detect_schema_intent(text: str) -> bool:
     return any(p.search(text) for p in _SCHEMA_PATTERNS)
+
+
+def _detect_meta_intent(text: str) -> bool:
+    """True when the user is asking about agent state / loaded tables."""
+    return any(p.search(text) for p in _META_PATTERNS)
+
+
+def _build_meta_reply(query: str, all_tables: list[str]) -> str:
+    """Answer a META question directly from _data_registry — no LLM needed."""
+    conn = get_connection()
+    query_lower = query.lower()
+
+    if not all_tables:
+        return (
+            "No tables are loaded yet. Upload a file with:\n"
+            "`load file at <path> as <name>`"
+        )
+
+    # Check if the user is asking about a specific table by name
+    mentioned = [t for t in all_tables if t.lower() in query_lower]
+
+    if mentioned:
+        lines = []
+        for t in mentioned:
+            row = conn.execute(
+                "SELECT row_count, column_count, ingested_at, source_file "
+                "FROM _data_registry WHERE dataset_name = ?",
+                [t],
+            ).fetchone()
+            if row:
+                lines.append(
+                    f"✅ **{t}** is loaded — {row[0]:,} rows, {row[1]} columns "
+                    f"(source: `{Path(row[3]).name if row[3] else 'unknown'}`, "
+                    f"ingested: {str(row[2])[:19]})"
+                )
+            else:
+                lines.append(f"❌ **{t}** is not currently loaded.")
+        return "\n".join(lines)
+
+    # Generic "what tables do you have?" type question
+    rows = conn.execute(
+        "SELECT dataset_name, row_count, column_count, ingested_at "
+        "FROM _data_registry ORDER BY ingested_at"
+    ).fetchall()
+    lines = [f"I have access to {len(rows)} table(s):\n"]
+    for r in rows:
+        lines.append(f"  • **{r[0]}** — {r[1]:,} rows, {r[2]} columns (loaded {str(r[3])[:10]})")
+    lines.append(
+        "\nAsk me anything about this data, or load more files with "
+        "`load file at <path> as <name>`."
+    )
+    return "\n".join(lines)
 
 
 def _rows_to_markdown(rows_json: str) -> str:
@@ -335,7 +390,7 @@ def orchestrator(state: AnalyticsState) -> dict:
         "error": "",
     }
 
-    # ── Synthesis: all steps complete ───────────────────────────────────────
+    # ── Synthesis: all steps complete ──────────────────────────────────────
     if state.plan and all(s.status in ("done", "failed") for s in state.plan):
         all_failed = all(s.status == "failed" for s in state.plan)
         if all_failed:
@@ -367,7 +422,7 @@ def orchestrator(state: AnalyticsState) -> dict:
             final = str(final_val).strip()
         return {**base_reset, "final_answer": final, "messages": [AIMessage(content=final)]}
 
-    # ── Fast-path: file load ───────────────────────────────────────────
+    # ── Fast-path 1: file load ──────────────────────────────────────────────
     load_match = _detect_load_intent(current_query)
     if load_match:
         return {
@@ -376,7 +431,7 @@ def orchestrator(state: AnalyticsState) -> dict:
             "load_file_dataset": load_match["dataset"],
         }
 
-    # ── Fast-path: schema / table listing questions ───────────────────
+    # ── Fast-path 2: schema / column listing ───────────────────────────────
     if _detect_schema_intent(current_query):
         query_lower = current_query.lower()
         target_table: str | None = None
@@ -396,7 +451,15 @@ def orchestrator(state: AnalyticsState) -> dict:
             reply = f"Here are all loaded tables:\n\n```\n{tables_summary}\n```"
         return {**base_reset, "final_answer": reply, "messages": [AIMessage(content=reply)]}
 
-    # ── LLM planning ────────────────────────────────────────────────
+    # ── Fast-path 3: META — agent-state questions ──────────────────────────
+    # Catches: "do you have access to X?", "is Y loaded?", "what tables do you have?",
+    # "can you see sales1000?", "what data is available?", etc.
+    # Answered deterministically from _data_registry — no LLM, no SQL plan.
+    if _detect_meta_intent(current_query):
+        reply = _build_meta_reply(current_query, all_tables)
+        return {**base_reset, "final_answer": reply, "messages": [AIMessage(content=reply)]}
+
+    # ── LLM planning ───────────────────────────────────────────────────────
     ORCHESTRATOR_SYSTEM = f"""You are the Orchestrator of a DuckDB analytics agent.
 
 Loaded tables:
@@ -404,22 +467,31 @@ Loaded tables:
 
 Most recently loaded table: {most_recent or 'none'}
 
-Classify the user message into exactly ONE intent:
+Classify the user message into exactly ONE of these three intents:
 
-1. ANALYTICS – the question asks about data in the loaded tables.
-   First decide which tables are needed (may be more than one for JOIN queries).
-   Then break the question into ordered steps.
-   Step types: "profile" (explore a column) or "sql" (SELECT query).
-   Every step description MUST name the exact table(s) involved.
-   For multi-table queries, state the join tables and join columns explicitly,
-   using the authoritative column pairs from _relationships
-   (e.g. 'sales1000."Sales Rep" → sales_rep_targets.sales_rep').
+1. ANALYTICS — the question asks to compute, aggregate, filter, or retrieve data
+   from the loaded tables. This includes any question that would require SQL.
+   Decide which tables are needed, then produce an ordered plan.
+   Step types: "profile" (explore a column) | "sql" (SELECT query).
+   Every step description MUST name the exact table(s) and columns involved.
+   For multi-table queries, state the join tables and join column pairs explicitly
+   using the authoritative pairs from _relationships.
    {{"intent": "analytics", "plan": [{{"id": 1, "type": "sql", "description": "..."}}]}}
 
-2. CHITCHAT – everything else (greetings, general knowledge, questions about the agent).
+2. META — the user is asking about the agent's state: which tables are loaded,
+   whether a specific table or file is available, what the agent can do, or
+   how to use it. Do NOT classify these as chitchat.
+   {{"intent": "meta", "final_answer": "<answer using the loaded tables list above>"}}
+
+3. CHITCHAT — pure small talk, greetings, or questions completely unrelated to
+   data or the agent (e.g. "what is the capital of France?").
    {{"intent": "chitchat", "final_answer": "<helpful reply>"}}
 
-Decision rule: if the question references any loaded table or asks about data/columns, pick ANALYTICS.
+Decision rules (apply in order):
+  • Any question referencing a table name OR asking about data/columns → ANALYTICS
+  • Any question about what the agent has loaded, can access, or can do → META
+  • Everything else → CHITCHAT
+
 Output ONLY the JSON. No markdown, no explanation.
 """
 
@@ -446,6 +518,7 @@ Output ONLY the JSON. No markdown, no explanation.
         return {**base_reset, "final_answer": str(reply), "messages": [AIMessage(content=str(reply))]}
 
     intent = parsed.get("intent", "chitchat")
+
     if intent == "analytics":
         raw_steps = parsed.get("plan", [])
         if not raw_steps and most_recent:
@@ -459,6 +532,12 @@ Output ONLY the JSON. No markdown, no explanation.
         plan = [PlanStep(**step) for step in raw_steps]
         return {**base_reset, "plan": plan}
 
+    if intent == "meta":
+        # LLM was asked to answer but we prefer the deterministic version
+        reply = _build_meta_reply(current_query, all_tables)
+        return {**base_reset, "final_answer": reply, "messages": [AIMessage(content=reply)]}
+
+    # CHITCHAT
     reply = str(parsed.get("final_answer", "Hi! Ask a data question or load a file."))
     return {**base_reset, "final_answer": reply, "messages": [AIMessage(content=reply)]}
 
@@ -532,7 +611,6 @@ def sql_writer(state: AnalyticsState) -> dict:
     if step is None:
         return {"last_sql": "", "error": "No pending step found for sql_writer."}
 
-    # ── Select relevant tables for this step ─────────────────────────────
     all_tables = _all_table_names()
     relevant_tables = _select_relevant_tables(
         state.user_query + " " + step.description, all_tables
@@ -540,12 +618,10 @@ def sql_writer(state: AnalyticsState) -> dict:
     if not relevant_tables:
         relevant_tables = [_most_recent_table()] if _most_recent_table() else all_tables
 
-    # ── Build context ─────────────────────────────────────────────────
     schema_context = get_schema_context(relevant_tables)
     cast_warnings = _get_date_cast_warnings(relevant_tables)
     varchar_date_cols = _get_varchar_date_columns_multi(relevant_tables)
 
-    # ── Semantic hints ────────────────────────────────────────────────
     keywords = [
         w
         for w in re.findall(r"[a-zA-Z]{4,}", state.user_query.lower())
@@ -574,7 +650,6 @@ def sql_writer(state: AnalyticsState) -> dict:
             )
         semantic_context = "\n".join(lines)
 
-    # ── On retry, sanitize and re-use existing SQL ──────────────────────
     if state.retry_count > 0 and state.last_sql and state.last_sql.strip().upper().startswith("SELECT"):
         sql = _sanitize_sql(state.last_sql, varchar_date_cols)
         updated_plan = [
@@ -695,7 +770,6 @@ def verifier(state: AnalyticsState) -> dict:
     row_count = state.last_query_metadata.get("row_count", "unknown")
     table_preview = _rows_to_markdown(state.last_query_result)
 
-    # ── Cardinality guard ────────────────────────────────────────────────
     cardinality_warning = ""
     if not is_error and state.last_query_metadata:
         conn = get_connection()
@@ -720,7 +794,6 @@ def verifier(state: AnalyticsState) -> dict:
         except Exception:
             pass
 
-    # ── Relationship / join-key guard (multi-table) ─────────────────────
     join_warnings: list[str] = []
     if not is_error and state.last_sql and "JOIN" in state.last_sql.upper():
         try:
