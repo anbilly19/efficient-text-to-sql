@@ -165,10 +165,7 @@ def classify_niq_columns(df: pd.DataFrame) -> dict[str, NiqColInfo]:
     except ImportError:
         _CATALOG = {}
 
-    # Build a lower-cased index of the catalog for fast lookup
-    catalog_lower: dict[str, dict] = {
-        k.lower(): v for k, v in _CATALOG.items()
-    }
+    catalog_lower: dict[str, dict] = {k.lower(): v for k, v in _CATALOG.items()}
 
     result: dict[str, NiqColInfo] = {}
 
@@ -186,22 +183,22 @@ def classify_niq_columns(df: pd.DataFrame) -> dict[str, NiqColInfo]:
             role = ROLE_DIMENSION
 
         # --- description & aliases from static catalog ----------------------
-        cat_entry = catalog_lower.get(col_lo, {})
+        cat_entry   = catalog_lower.get(col_lo, {})
         description = cat_entry.get("description", "")
         aliases     = list(cat_entry.get("aliases", []))
         if not description and cat_entry.get("en"):
             description = cat_entry["en"]
 
-        result[col] = NiqColInfo(
-            role=role,
-            description=description,
-            aliases=aliases,
-        )
+        result[col] = NiqColInfo(role=role, description=description, aliases=aliases)
 
     return result
 
 
-def build_niq_table_context(meta: NiqMeta, dataset_name: str, source_filename: str) -> tuple[str, str, list[str]]:
+def build_niq_table_context(
+    meta: NiqMeta,
+    dataset_name: str,
+    source_filename: str,
+) -> tuple[str, str, list[str]]:
     """
     Build (summary, grain, tags) for _table_context from NiqMeta.
 
@@ -228,10 +225,8 @@ def build_niq_table_context(meta: NiqMeta, dataset_name: str, source_filename: s
         f"{n_dim} dimension(s), {n_metric} CY metric(s), {n_yoy} YoY column(s). "
         f"Period: {period_desc}."
     )
-
     grain = "annual, CY vs PY" if meta.has_periods_col else "annual"
-
-    tags = ["niq", "panel", "haushalte", "penetration", "purchase", "frequency"]
+    tags  = ["niq", "panel", "haushalte", "penetration", "purchase", "frequency"]
     if "products" in [c.lower() for c in meta.dimension_cols]:
         tags.append("product")
     if "retailers" in [c.lower() for c in meta.dimension_cols]:
@@ -253,7 +248,7 @@ def seed_niq_semantic_map(
 ) -> int:
     """
     Write alias rows into _semantic_map for every column that has aliases.
-
+    Also seeds the canonical column name itself as a searchable term.
     Returns the number of rows inserted/updated.
     """
     rows_written = 0
@@ -276,7 +271,6 @@ def seed_niq_semantic_map(
                 rows_written += 1
             except Exception:
                 pass
-        # Also seed the canonical column name itself as a term
         col_term = col_name.strip().lower()
         if col_term:
             try:
@@ -305,13 +299,7 @@ def _enrich_column_catalog(
     dataset_name: str,
     col_info: dict[str, NiqColInfo],
 ) -> None:
-    """
-    Patch _column_catalog rows with NIQ-specific role flags and descriptions.
-
-    is_metric  = True  for metric_cy, metric_py, yoy_delta
-    is_dimension = True  for dimension
-    description  = from SCHEMA_CATALOG if available
-    """
+    """Patch _column_catalog rows with NIQ-specific role flags and descriptions."""
     for col_name, info in col_info.items():
         is_metric    = info.role in (ROLE_METRIC_CY, ROLE_METRIC_PY, ROLE_YOY_DELTA)
         is_dimension = info.role == ROLE_DIMENSION
@@ -328,6 +316,25 @@ def _enrich_column_catalog(
             )
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers — imported directly from the flat tools.py module to
+# avoid the circular agent.tools package → niq_ingest → agent.tools import.
+# ---------------------------------------------------------------------------
+
+def _get_flat_attr(name: str):
+    """Retrieve *name* from the flat agent/tools.py module (alias _agent_tools_flat)."""
+    import sys
+    import importlib.util
+    _ALIAS = "_agent_tools_flat"
+    if _ALIAS not in sys.modules:
+        flat = Path(__file__).parent.parent / "tools.py"
+        spec = importlib.util.spec_from_file_location(_ALIAS, flat)
+        mod  = importlib.util.module_from_spec(spec)
+        sys.modules[_ALIAS] = mod
+        spec.loader.exec_module(mod)
+    return getattr(sys.modules[_ALIAS], name)
 
 
 # ---------------------------------------------------------------------------
@@ -350,14 +357,16 @@ def load_niq_file(path: str, dataset_name: str) -> str:
         path: Absolute or relative path to the NIQ source file.
         dataset_name: Name to register the table / view as in DuckDB.
     """
-    from agent.tools import load_file, get_parquet_path, _get_parquet_store
     from agent.database import get_connection, index_table_schema
     from agent.db.catalog import upsert_table_context
 
-    # ── 1. Read the raw file into a DataFrame ──────────────────────────────
+    # Resolve helpers from the flat tools.py without going through the package.
+    _get_parquet_store = _get_flat_attr("_get_parquet_store")
+    _PROJECT_ROOT      = _get_flat_attr("_PROJECT_ROOT")
+
+    # ── 1. Resolve file path ───────────────────────────────────────────────
     file_path = Path(path)
     if not file_path.exists():
-        from agent.tools import _PROJECT_ROOT
         file_path = _PROJECT_ROOT / path
     if not file_path.exists():
         return f"ERROR: File not found at '{path}'"
@@ -376,19 +385,18 @@ def load_niq_file(path: str, dataset_name: str) -> str:
     except Exception as exc:
         return f"ERROR reading file: {exc}"
 
-    # ── 2. Detect NIQ structure on the raw DataFrame ───────────────────────
+    # ── 2. Detect NIQ structure ────────────────────────────────────────────
     meta     = detect_niq_structure(df)
     col_info = classify_niq_columns(df)
 
     # ── 3. Drop metadata / banner rows ────────────────────────────────────
     n_raw = len(df)
     if any(meta.metadata_row_mask):
-        keep_mask = [not m for m in meta.metadata_row_mask]
-        df = df[keep_mask].reset_index(drop=True)
+        df = df[[not m for m in meta.metadata_row_mask]].reset_index(drop=True)
     n_clean = len(df)
     dropped = n_raw - n_clean
 
-    # ── 4. Convert numeric columns that came in as strings (NIQ quirk) ────
+    # ── 4. Coerce numeric columns that came in as strings (NIQ quirk) ─────
     for col, info in col_info.items():
         if info.role in (ROLE_METRIC_CY, ROLE_METRIC_PY, ROLE_YOY_DELTA):
             if col in df.columns and df[col].dtype == object:
@@ -398,7 +406,7 @@ def load_niq_file(path: str, dataset_name: str) -> str:
                 )
 
     # ── 5. Write Parquet + register DuckDB view ────────────────────────────
-    conn = get_connection()
+    conn          = get_connection()
     parquet_store = _get_parquet_store()
     parquet_path  = parquet_store / f"{dataset_name}.parquet"
     try:
@@ -435,30 +443,29 @@ def load_niq_file(path: str, dataset_name: str) -> str:
     except Exception as exc:
         return f"File loaded but registry update failed: {exc}"
 
-    # ── 7. Index column catalog then enrich with NIQ roles ─────────────────
+    # ── 7. Index + enrich column catalog ──────────────────────────────────
     try:
         index_table_schema(conn, dataset_name)
     except Exception as exc:
         return f"File loaded but column catalog indexing failed: {exc}"
-
     _enrich_column_catalog(conn, dataset_name, col_info)
 
-    # ── 8. Seed _semantic_map from SCHEMA_CATALOG aliases ──────────────────
+    # ── 8. Seed _semantic_map ─────────────────────────────────────────────
     n_aliases = seed_niq_semantic_map(conn, dataset_name, col_info)
 
-    # ── 9. Write _table_context with grain and tags ───────────────────────
+    # ── 9. Write _table_context ───────────────────────────────────────────
     summary, grain, tags = build_niq_table_context(meta, dataset_name, file_path.name)
     upsert_table_context(dataset_name, summary, grain, tags, conn=conn)
 
-    # ── 10. Build response message ────────────────────────────────────────
+    # ── 10. Build response ────────────────────────────────────────────────
     role_summary = {
-        "dimensions":  len(meta.dimension_cols),
-        "metrics_CY":  len(meta.metric_cy_cols),
-        "metrics_PY":  len(meta.metric_py_cols),
-        "yoy_deltas":  len(meta.yoy_delta_cols),
+        "dimensions": len(meta.dimension_cols),
+        "metrics_CY": len(meta.metric_cy_cols),
+        "metrics_PY": len(meta.metric_py_cols),
+        "yoy_deltas": len(meta.yoy_delta_cols),
     }
     periods_msg = (
-        f" Periods: CY='{meta.cy_period_label}' / PY='{meta.py_period_label}'.'"
+        f" Periods: CY='{meta.cy_period_label}' / PY='{meta.py_period_label}'."
         if meta.has_periods_col and meta.cy_period_label
         else " No Periods column detected."
     )
