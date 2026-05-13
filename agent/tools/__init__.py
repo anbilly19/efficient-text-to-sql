@@ -40,6 +40,12 @@ from _agent_tools_flat import (  # noqa: E402  (explicit for IDE / type checkers
     search_semantic_lookup,
     profile_column,
     get_schema_context_tool,
+    # Private helpers needed by niq_ingest — re-exported explicitly so
+    # `from agent.tools import _get_parquet_store` resolves through the
+    # already-loaded _agent_tools_flat module and never triggers a second
+    # importlib load (which would create a second agent.database singleton).
+    _get_parquet_store,
+    _PROJECT_ROOT,
 )
 
 # Schema tools added in this package.
@@ -71,6 +77,8 @@ __all__ = [
     "search_semantic_lookup",
     "profile_column",
     "get_schema_context_tool",
+    "_get_parquet_store",
+    "_PROJECT_ROOT",
     # ── schema_tools ─────────────────────────────────────────────────────────
     "select_tables",
     "get_relationships",
