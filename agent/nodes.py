@@ -22,6 +22,7 @@ from agent.tools import (
     SQL_WRITER_TOOLS,
     get_schema,
     load_file,
+    load_niq_file,
     run_sql,
     search_semantic_lookup,
 )
@@ -121,8 +122,33 @@ def _most_recent_table() -> str:
         return ""
 
 
+# NIQ-domain terms that boost table relevance scoring
+_NIQ_QUERY_TERMS = {
+    "penetration", "spend", "buyer", "panel", "niq", "nielsen",
+    "käuferreichweite", "kaeuferreichweite", "ausgaben", "haushalt",
+    "yoy", "yearonyear", "prior", "volume", "frequency", "trips",
+    "share", "manufacturer", "brand", "category", "market",
+}
+
+# Path/name patterns that indicate a NIQ source file
+_NIQ_FILE_PATTERNS = re.compile(
+    r"niq|nielsen|panel|penetration|buyer|haushalt|käufer",
+    re.IGNORECASE,
+)
+
+
+def _is_niq_file(path: str, dataset_name: str) -> bool:
+    """Return True when the file path or dataset name looks like a NIQ panel extract."""
+    combined = f"{path} {dataset_name}".lower()
+    return bool(_NIQ_FILE_PATTERNS.search(combined))
+
+
 def _select_relevant_tables(user_query: str, all_tables: list[str]) -> list[str]:
-    """Select tables needed for *user_query* using _table_context keyword scoring."""
+    """Select tables needed for *user_query* using _table_context keyword scoring.
+
+    NIQ-tagged tables receive a +2 bonus when the query contains NIQ-domain
+    terminology so that panel datasets win over generic fact tables.
+    """
     if len(all_tables) <= 1:
         return all_tables
 
@@ -139,18 +165,28 @@ def _select_relevant_tables(user_query: str, all_tables: list[str]) -> list[str]
     if not rows:
         return all_tables
 
-    q_words = set(re.findall(r"[a-z]{3,}", user_query.lower()))
+    q_lower = user_query.lower()
+    q_words = set(re.findall(r"[a-z]{3,}", q_lower))
+
+    # Detect whether the query is NIQ-flavoured
+    q_niq_terms = {w.replace("ä", "a").replace("ü", "u").replace("ö", "o") for w in q_words}
+    query_is_niq = bool(q_niq_terms & _NIQ_QUERY_TERMS)
 
     scored: list[tuple[int, str]] = []
-    for dataset_name, summary, tags_json in rows:
+    for dataset_name, summary, tags in rows:
         if dataset_name not in all_tables:
             continue
         text = " ".join([
             dataset_name.lower(),
             (summary or "").lower(),
-            " ".join(json.loads(tags_json) if tags_json else []).lower(),
+            (tags or "").lower(),
         ])
         score = sum(1 for w in q_words if w in text)
+
+        # NIQ bonus: panel datasets get +2 when query is NIQ-flavoured
+        if query_is_niq and tags and "niq" in tags.lower():
+            score += 2
+
         scored.append((score, dataset_name))
 
     selected = [name for score, name in scored if score > 0]
@@ -198,14 +234,14 @@ def _get_date_cast_warnings(table_names: list[str]) -> str:
                     ).fetchone()
                     if sample and re.match(r"\d{4}-\d{2}-\d{2}", str(sample[0])):
                         warnings.append(
-                            f'  \u26a0\ufe0f  {table_name}."{col}" is VARCHAR storing dates (e.g. \'{sample[0]}\').'
+                            f'  ⚠️  {table_name}."{col}" is VARCHAR storing dates (e.g. \'{sample[0]}\').'
                             f' Always wrap: TRY_CAST("{col}" AS DATE)'
                         )
                 except Exception:
                     pass
             elif dtype.upper() in ("DATE", "TIMESTAMP", "TIMESTAMP WITH TIME ZONE"):
                 warnings.append(
-                    f'  \u2705  {table_name}."{col}" is {dtype} \u2014 use YEAR/MONTH/DATE_TRUNC directly.'
+                    f'  ✅  {table_name}."{col}" is {dtype} — use YEAR/MONTH/DATE_TRUNC directly.'
                 )
     return "\n".join(warnings)
 
@@ -239,8 +275,8 @@ def _get_varchar_date_columns_multi(table_names: list[str]) -> dict[str, set[str
 def _sanitize_sql(sql: str, varchar_date_cols: dict[str, set[str]]) -> str:
     if not sql:
         return sql
-    sql = re.sub(r'"(\w+)""', r'"\1"', sql)
-    sql = re.sub(r'""\b(\w+)"', r'"\1"', sql)
+    sql = re.sub(r'"(\w+)"\"', r'"\1"', sql)
+    sql = re.sub(r'""\\b(\w+)"', r'"\1"', sql)
     for _table, cols in varchar_date_cols.items():
         for col in cols:
             col_pattern = rf'(?:"?\w+"?\.)?\"?{re.escape(col)}\"?'
@@ -304,19 +340,16 @@ _META_PATTERNS = [
 
 # DuckDB "table not found" — covers quoted/unquoted identifiers and truncated form
 _TABLE_NOT_FOUND_RE = re.compile(
-    r'(?:Table with name|Table|Catalog Error.*?table)\s+["\']?([\w]+)["\']?\s+does not exist'
-    r'|(?:relation|table)\s+["\']?([\w.]+)["\']?\s+does not exist'
+    r'(?:Table with name|Table|Catalog Error.*?table)\s+["\'']?([\w]+)["\'']?\s+does not exist'
+    r'|(?:relation|table)\s+["\'']?([\w.]+)["\'']?\s+does not exist'
     r'|([\w"]+)\s+not exist',
     re.IGNORECASE,
 )
 
-# DuckDB Binder Error — column referenced in SQL doesn’t exist in the FROM clause.
-# Captures:
-#   group 1  → the missing column name (from “Referenced column X not found”)
-#   group 2  → the same name from the inline “^ column_name” pointer (fallback)
+# DuckDB Binder Error — column referenced in SQL doesn't exist in the FROM clause.
 _BINDER_ERROR_RE = re.compile(
-    r'Binder Error[:\s]+Referenced column\s+["\']?([\w ]+)["\']?\s+not found'
-    r'|Binder Error[:\s]+.*?Column[\s]+["\']?([\w ]+)["\']?\s+not found',
+    r'Binder Error[:\s]+Referenced column\s+["\'']?([\w ]+)["\'']?\s+not found'
+    r'|Binder Error[:\s]+.*?Column[\s]+["\'']?([\w ]+)["\'']?\s+not found',
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -370,12 +403,12 @@ def _build_meta_reply(query: str, all_tables: list[str]) -> str:
             ).fetchone()
             if row:
                 lines.append(
-                    f"\u2705 **{t}** is loaded \u2014 {row[0]:,} rows, {row[1]} columns "
+                    f"✅ **{t}** is loaded — {row[0]:,} rows, {row[1]} columns "
                     f"(source: `{Path(row[3]).name if row[3] else 'unknown'}`, "
                     f"ingested: {str(row[2])[:19]})"
                 )
             else:
-                lines.append(f"\u274c **{t}** is not currently loaded.")
+                lines.append(f"❌ **{t}** is not currently loaded.")
         return "\n".join(lines)
 
     rows = conn.execute(
@@ -384,7 +417,7 @@ def _build_meta_reply(query: str, all_tables: list[str]) -> str:
     ).fetchall()
     lines = [f"I have access to {len(rows)} table(s):\n"]
     for r in rows:
-        lines.append(f"  \u2022 **{r[0]}** \u2014 {r[1]:,} rows, {r[2]} columns (loaded {str(r[3])[:10]})")
+        lines.append(f"  • **{r[0]}** — {r[1]:,} rows, {r[2]} columns (loaded {str(r[3])[:10]})")
     lines.append(
         "\nAsk me anything about this data, or load more files with "
         "`load file at <path> as <name>`."
@@ -434,7 +467,7 @@ def _build_table_not_found_message(error: str, sql: str, all_tables: list[str]) 
     if not m:
         return None
 
-    missing = next((g.strip('"\' ') for g in m.groups() if g), None)
+    missing = next((g.strip('"\'\ ') for g in m.groups() if g), None)
     if not missing:
         return None
 
@@ -447,9 +480,9 @@ def _build_table_not_found_message(error: str, sql: str, all_tables: list[str]) 
         reg_rows = []
 
     loaded_lines = [
-        f"  \u2022 **{name}** (from `{Path(src).name if src else 'unknown'}`)"
+        f"  • **{name}** (from `{Path(src).name if src else 'unknown'}`)"
         for name, src in reg_rows
-    ] or ["  \u2022 *(no tables loaded)*"]
+    ] or ["  • *(no tables loaded)*"]
 
     suggestion = ""
     missing_lower = missing.lower().replace("_", "").replace("-", "")
@@ -460,7 +493,7 @@ def _build_table_not_found_message(error: str, sql: str, all_tables: list[str]) 
             or loaded_name.lower() in missing_lower
         ):
             suggestion = (
-                f"\n\U0001f4a1 **Did you mean `{loaded_name}`?** "
+                f"\n💡 **Did you mean `{loaded_name}`?** "
                 f"The file was ingested as `{loaded_name}`, not `{missing}`.\n"
                 f"Edit your question to use `{loaded_name}` instead, or reload the file with:\n"
                 f"`load <file> as {missing}`"
@@ -468,7 +501,7 @@ def _build_table_not_found_message(error: str, sql: str, all_tables: list[str]) 
             break
 
     lines = [
-        f"\u274c **Table `{missing}` does not exist** in the current session.",
+        f"❌ **Table `{missing}` does not exist** in the current session.",
         "",
         "**Currently loaded tables:**",
         *loaded_lines,
@@ -484,34 +517,24 @@ def _build_table_not_found_message(error: str, sql: str, all_tables: list[str]) 
 def _build_binder_error_message(error: str, sql: str) -> str | None:
     """Rich user-facing message when DuckDB raises a Binder Error (column not found).
 
-    Strategy:
-      1. Extract the missing column name from the error string.
-      2. Look up the DuckDB candidate bindings that DuckDB already reported.
-      3. Look up the actual columns from _column_catalog for each table in the SQL.
-      4. Find the closest real column names via substring matching.
-      5. Return a plain-English explanation — no retry, no corrected SQL.
-
     Returns None when the error is not a Binder Error.
     """
     if "Binder Error" not in error:
         return None
 
     bm = _BINDER_ERROR_RE.search(error)
-    missing_col = next((g.strip('"\' ') for g in (bm.groups() if bm else []) if g), None)
+    missing_col = next((g.strip('"\'\ ') for g in (bm.groups() if bm else []) if g), None)
 
-    # DuckDB already tells us the valid bindings — use them directly
     candidates_match = _CANDIDATES_RE.search(error)
     duckdb_candidates: list[str] = []
     if candidates_match:
         raw = candidates_match.group(1)
         duckdb_candidates = [c.strip().strip('"') for c in raw.split(",") if c.strip()]
 
-    # Also look up catalog columns for the tables involved in the SQL
-    catalog_cols: dict[str, list[str]] = {}   # table_name → [col, ...]
+    catalog_cols: dict[str, list[str]] = {}
     all_tables = _all_table_names()
     conn = get_connection()
     for table in all_tables:
-        # Only look up tables that are actually referenced in the SQL
         if table.lower() not in sql.lower():
             continue
         try:
@@ -523,7 +546,6 @@ def _build_binder_error_message(error: str, sql: str) -> str | None:
         except Exception:
             pass
 
-    # Fuzzy-match: find columns whose name overlaps with the missing column
     suggestions: list[str] = []
     if missing_col:
         missing_norm = missing_col.lower().replace("_", "").replace(" ", "")
@@ -533,13 +555,12 @@ def _build_binder_error_message(error: str, sql: str) -> str | None:
                 if missing_norm in col_norm or col_norm in missing_norm:
                     suggestions.append(f'`{tbl}."{col}"`')
 
-    # Build the message
     lines: list[str] = []
 
     if missing_col:
-        lines.append(f'\u274c **Column `{missing_col}` does not exist** in the loaded table(s).')
+        lines.append(f'❌ **Column `{missing_col}` does not exist** in the loaded table(s).')
     else:
-        lines.append('\u274c **A column referenced in the query does not exist** in the loaded table(s).')
+        lines.append('❌ **A column referenced in the query does not exist** in the loaded table(s).')
 
     lines.append("")
 
@@ -551,15 +572,15 @@ def _build_binder_error_message(error: str, sql: str) -> str | None:
         lines.append("**Full column list for the queried table(s):**")
         for tbl, cols in catalog_cols.items():
             col_list = ", ".join(f'"{c}"' for c in cols)
-            lines.append(f"  \u2022 **{tbl}**: {col_list}")
+            lines.append(f"  • **{tbl}**: {col_list}")
         lines.append("")
 
     if suggestions:
-        lines.append(f"\U0001f4a1 **Closest match(es):** {', '.join(suggestions)}")
+        lines.append(f"💡 **Closest match(es):** {', '.join(suggestions)}")
         lines.append("Rephrase your question using one of those column names.")
     elif missing_col:
         lines.append(
-            f"\U0001f4a1 No column named `{missing_col}` exists in any loaded table. "
+            f"💡 No column named `{missing_col}` exists in any loaded table. "
             "Please rephrase your question using one of the column names listed above."
         )
 
@@ -593,7 +614,7 @@ def _extract_select_columns(sql: str) -> set[str]:
             tokens.add(alias_m.group(1).strip().lower().replace('"', ''))
         else:
             bare = re.sub(r'^.*\.', '', part)
-            bare = re.sub(r'["\s]', '', bare).lower()
+            bare = re.sub(r'["\\s]', '', bare).lower()
             if bare:
                 tokens.add(bare)
     return tokens
@@ -636,7 +657,7 @@ def _detect_semantic_gaps(
         )
         if not in_catalog:
             gaps.append(
-                f'  \u26a0\ufe0f  Concept "{concept}" was requested but no matching column exists '
+                f'  ⚠️  Concept "{concept}" was requested but no matching column exists '
                 f'in the loaded table(s): {table_names}. '
                 f'Available columns: {sorted(catalog_cols)[:10]}'
             )
@@ -657,7 +678,7 @@ def _detect_semantic_gaps(
                 )
                 suggestion = f' (closest column: "{best}")' if best else ""
                 gaps.append(
-                    f'  \u26a0\ufe0f  Concept "{concept}" was requested but is not in the SQL result.'
+                    f'  ⚠️  Concept "{concept}" was requested but is not in the SQL result.'
                     f'{suggestion} The query was answered on the available dimensions only.'
                 )
 
@@ -682,7 +703,7 @@ def _build_relationships_block(table_names: list[str]) -> str:
         note = f"  # {desc}" if desc else ""
         lines.append(
             f"  {r['left_table']}.{r['left_column']} "
-            f"\u2192 {r['right_table']}.{r['right_column']}"
+            f"→ {r['right_table']}.{r['right_column']}"
             f" ({cardinality}){note}"
         )
     return "\n".join(lines)
@@ -720,17 +741,14 @@ def orchestrator(state: AnalyticsState) -> dict:
         if all_failed:
             err = state.error or "The query could not be executed."
 
-            # Priority 1: Binder Error (column not found) — explain + full schema, no retry
             binder_msg = _build_binder_error_message(err, state.last_sql or "")
             if binder_msg:
                 return {**base_reset, "final_answer": binder_msg, "messages": [AIMessage(content=binder_msg)]}
 
-            # Priority 2: Table not found — alias hint
             table_msg = _build_table_not_found_message(err, state.last_sql or "", all_tables)
             if table_msg:
                 return {**base_reset, "final_answer": table_msg, "messages": [AIMessage(content=table_msg)]}
 
-            # Fallback: generic error
             final = (
                 f"I wasn't able to answer that question due to a SQL error:\n\n"
                 f"```\n{err.replace('ERROR: ', '').strip()}\n```\n\n"
@@ -743,7 +761,7 @@ def orchestrator(state: AnalyticsState) -> dict:
                 f"\n\nVerifier note: {state.verification_feedback}"
                 if state.verification_feedback
                 and state.verification_verdict == "warning"
-                and "\u26a0\ufe0f" in state.verification_feedback
+                and "⚠️" in state.verification_feedback
                 else ""
             )
             synthesis_prompt = (
@@ -831,9 +849,9 @@ Classify the user message into exactly ONE of these three intents:
    {{"intent": "chitchat", "final_answer": "<helpful reply>"}}
 
 Decision rules (apply in order):
-  \u2022 Any question referencing a table name OR asking about data/columns \u2192 ANALYTICS
-  \u2022 Any question about what the agent has loaded, can access, or can do \u2192 META
-  \u2022 Everything else \u2192 CHITCHAT
+  • Any question referencing a table name OR asking about data/columns → ANALYTICS
+  • Any question about what the agent has loaded, can access, or can do → META
+  • Everything else → CHITCHAT
 
 Output ONLY the JSON. No markdown, no explanation.
 """
@@ -900,12 +918,36 @@ def load_file_node(state: AnalyticsState) -> dict:
         }
     if not dataset:
         dataset = Path(path).stem.replace(" ", "_").replace("-", "_").lower()
-    result = load_file.invoke({"path": path, "dataset_name": dataset})
-    reply = (
-        f"\u274c Failed to load file: {result}"
-        if result.startswith("ERROR")
-        else f"\u2705 {result}\n\nYou can now ask questions about the `{dataset}` table!"
-    )
+
+    # Route NIQ panel files through the NIQ-aware loader automatically
+    if _is_niq_file(path, dataset):
+        result = load_niq_file.invoke({"path": path, "dataset_name": dataset})
+        if result.startswith("ERROR"):
+            reply = f"❌ Failed to load NIQ file: {result}"
+        else:
+            # Extract grain and period info from the result string for a richer reply
+            grain_match = re.search(r"NIQ grain:\s*([^|]+)", result)
+            grain_info = grain_match.group(1).strip() if grain_match else "detected"
+            period_match = re.search(r"Period values:\s*([^|]+)", result)
+            period_info = (
+                f"\n  • Period values: `{period_match.group(1).strip()}`"
+                if period_match
+                else ""
+            )
+            reply = (
+                f"✅ {result.split('|')[0].strip()}\n\n"
+                f"**NIQ panel loaded** with grain `{grain_info}`.{period_info}\n\n"
+                f"You can now ask NIQ questions about `{dataset}` — "
+                f"e.g. *Käuferreichweite*, *penetration*, *spend per buyer*, *YoY change*."
+            )
+    else:
+        result = load_file.invoke({"path": path, "dataset_name": dataset})
+        reply = (
+            f"❌ Failed to load file: {result}"
+            if result.startswith("ERROR")
+            else f"✅ {result}\n\nYou can now ask questions about the `{dataset}` table!"
+        )
+
     return {
         "final_answer": reply,
         "messages": [AIMessage(content=reply)],
@@ -988,7 +1030,7 @@ def sql_writer(state: AnalyticsState) -> dict:
         lines = ["=== Semantic column hints ==="]
         for h in semantic_hits[:8]:
             lines.append(
-                f"  {h['dataset']}.{h['column']} ({h['type']}) \u2014 {h.get('description', '')}"
+                f"  {h['dataset']}.{h['column']} ({h['type']}) — {h.get('description', '')}"
             )
         semantic_context = "\n".join(lines)
 
@@ -1089,9 +1131,6 @@ def execute_sql(state: AnalyticsState) -> dict:
     if result.startswith("ERROR"):
         error_body = result[len("ERROR:"):].strip() if result.startswith("ERROR:") else result
 
-        # Short-circuit: Binder Errors are unrecoverable — the column simply does not
-        # exist. Mark the step failed immediately so the orchestrator synthesis block
-        # can produce a schema-aware explanation without any verifier retry loop.
         if "Binder Error" in error_body:
             return {
                 "last_query_result": result,
@@ -1126,9 +1165,6 @@ def verifier(state: AnalyticsState) -> dict:
     row_count = state.last_query_metadata.get("row_count", "unknown")
     table_preview = _rows_to_markdown(state.last_query_result)
 
-    # Binder Errors are already marked failed with status="failed" by execute_sql.
-    # The orchestrator synthesis block handles them directly via _build_binder_error_message.
-    # There is nothing for the verifier to correct here — skip immediately.
     if is_error and state.error and "Binder Error" in state.error:
         return {
             "verification_verdict": "fail",
@@ -1155,8 +1191,8 @@ def verifier(state: AnalyticsState) -> dict:
             result_rows = state.last_query_metadata.get("row_count", 0) or 0
             if max_fact_rows > 0 and result_rows > max_fact_rows * 2:
                 cardinality_warning = (
-                    f"\u26a0\ufe0f  Result has {result_rows} rows but the largest source table has "
-                    f"{max_fact_rows} rows \u2014 possible JOIN fan-out (Cartesian product). "
+                    f"⚠️  Result has {result_rows} rows but the largest source table has "
+                    f"{max_fact_rows} rows — possible JOIN fan-out (Cartesian product). "
                     "Verify GROUP BY and JOIN ON conditions."
                 )
         except Exception:
@@ -1191,10 +1227,10 @@ def verifier(state: AnalyticsState) -> dict:
             )
             if gap_warnings:
                 semantic_gap_block = (
-                    "\n\u26a0\ufe0f  SEMANTIC GAP DETECTED (dimension requested but missing from result):\n"
+                    "\n⚠️  SEMANTIC GAP DETECTED (dimension requested but missing from result):\n"
                     + gap_warnings
                     + "\n"
-                    "  \u2192 Set verdict=warning, do NOT set verdict=fail. "
+                    "  → Set verdict=warning, do NOT set verdict=fail. "
                     "The result is still valid for the dimensions that ARE present. "
                     "Explain what was answered and what dimension is absent from the data.\n"
                 )
@@ -1214,7 +1250,7 @@ def verifier(state: AnalyticsState) -> dict:
         join_warn_block = ""
         if join_warnings:
             join_warn_block = (
-                "\n\u26a0\ufe0f  UNREGISTERED JOIN KEYS (must fix):\n"
+                "\n⚠️  UNREGISTERED JOIN KEYS (must fix):\n"
                 + "\n".join(f"  - {w}" for w in join_warnings)
                 + "\n\n"
             )
@@ -1227,10 +1263,10 @@ def verifier(state: AnalyticsState) -> dict:
             + join_warn_block
             + semantic_gap_block
             + "Verify whether the SQL correctly answers the sub-task.\n"
-            "- Correct \u2192 verdict=pass\n"
-            "- Clear bug (wrong column, bad filter, JOIN fan-out, unregistered join key) \u2192 verdict=fail with corrected_sql\n"
-            "- Missing dimension (semantic gap warning above) \u2192 verdict=warning with feedback explaining what is present vs absent\n"
-            "- Plausible but uncertain \u2192 verdict=warning (treated as pass)\n"
+            "- Correct → verdict=pass\n"
+            "- Clear bug (wrong column, bad filter, JOIN fan-out, unregistered join key) → verdict=fail with corrected_sql\n"
+            "- Missing dimension (semantic gap warning above) → verdict=warning with feedback explaining what is present vs absent\n"
+            "- Plausible but uncertain → verdict=warning (treated as pass)\n"
             "- Do NOT call any tools.\n"
             'Output ONLY: {"verdict": "pass|fail|warning", "feedback": "...", "corrected_sql": "(only if fail)"}'
         )
