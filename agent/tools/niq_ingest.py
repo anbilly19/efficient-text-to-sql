@@ -18,7 +18,7 @@ Public API
   load_niq_file(path, dataset_name)  — LangChain @tool, top-level entry point
   detect_niq_structure(df)           — pure function, returns NiqMeta
   classify_niq_columns(df)           — pure function, returns col -> NiqColInfo
-  seed_niq_semantic_map(conn, dataset_name, df)  — writes _semantic_map rows
+  seed_niq_semantic_map(conn, dataset_name, col_info)  — writes _semantic_map rows
   build_niq_table_context(meta)      — returns (summary, grain, tags)
 """
 from __future__ import annotations
@@ -27,7 +27,6 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 import pandas as pd
 from langchain_core.tools import tool
@@ -39,12 +38,15 @@ from langchain_core.tools import tool
 ROLE_DIMENSION = "dimension"
 ROLE_METRIC_CY = "metric_cy"      # current-year metric
 ROLE_METRIC_PY = "metric_py"      # prior-year (VJ) baseline
-ROLE_YOY_DELTA = "yoy_delta"       # % Veränderung vs. VJ
+ROLE_YOY_DELTA = "yoy_delta"      # % Veränderung vs. VJ
 ROLE_UNKNOWN   = "unknown"
 
-_VJ_SUFFIXES     = (" vj", "_vj", "(vj)")
-_YOY_PATTERNS    = ("% ver.", "vs. vj", "veränderung")
+_VJ_SUFFIXES  = (" vj", "_vj", "(vj)")
+_YOY_PATTERNS = ("% ver.", "vs. vj", "veränderung")
 _METADATA_VALUES = {"market", "markets", "fact", "facts", "universe", "base"}
+
+# Column names that unambiguously identify the real NIQ header row.
+_NIQ_ANCHOR_COLS = {"periods", "products", "geographies", "retailers", "demographics"}
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +75,37 @@ class NiqMeta:
 
 
 # ---------------------------------------------------------------------------
+# Preamble detection
+# ---------------------------------------------------------------------------
+
+def _find_header_row(file_path: Path) -> int:
+    """
+    Scan the first 30 rows of *file_path* (Excel or CSV) and return the
+    0-based row index that contains the real column headers.
+
+    NIQ exports embed copyright/export-date text above the data table.
+    The real header is the first row where >= 2 of the known NIQ anchor
+    column names appear (case-insensitive).
+
+    Returns 0 if no preamble is detected (safe default).
+    """
+    suffix = file_path.suffix.lower()
+    try:
+        if suffix in (".xlsx", ".xls"):
+            raw = pd.read_excel(file_path, header=None, nrows=30)
+        else:
+            raw = pd.read_csv(file_path, header=None, nrows=30)
+    except Exception:
+        return 0
+
+    for i, row in raw.iterrows():
+        vals = {str(v).strip().lower() for v in row.values if pd.notna(v)}
+        if len(vals & _NIQ_ANCHOR_COLS) >= 2:
+            return int(i)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # DataFrame cleaning
 # ---------------------------------------------------------------------------
 
@@ -80,23 +113,21 @@ def _sanitize_df(df: pd.DataFrame, col_info: dict[str, NiqColInfo]) -> pd.DataFr
     """
     Clean *df* so it is safe to write as Parquet.
 
-    Steps:
-      1. Drop columns whose name starts with 'Unnamed:' — Excel header bleed.
-      2. For every remaining object-dtype column that is NOT already classified
-         as a metric/yoy role, cast to pandas StringDtype (nullable string).
-         This handles the 'Expected bytes, got float' pyarrow error caused by
-         mixed str/float objects in dimension columns.
-      3. For metric/yoy columns still typed as object, pd.to_numeric with
-         coerce (already done in load_niq_file step 4, but repeated here as
-         a safety net).
+      1. Drop all-NaN rows (footer/blank lines).
+      2. Drop Unnamed:* columns (Excel header bleed).
+      3. Coerce metric/yoy object cols to numeric.
+      4. Cast remaining object cols to nullable StringDtype.
     """
-    # 1. Drop Unnamed columns
+    # 1. Drop rows that are entirely NaN
+    df = df.dropna(how="all").reset_index(drop=True)
+
+    # 2. Drop Unnamed columns
     unnamed = [c for c in df.columns if str(c).startswith("Unnamed:")]
     if unnamed:
         df = df.drop(columns=unnamed)
 
-    # 2 & 3. Fix remaining object columns
-    for col in df.select_dtypes(include="object").columns:
+    # 3 & 4. Fix object dtype columns
+    for col in list(df.select_dtypes(include="object").columns):
         role = col_info.get(col, NiqColInfo(role=ROLE_DIMENSION)).role
         if role in (ROLE_METRIC_CY, ROLE_METRIC_PY, ROLE_YOY_DELTA):
             df[col] = pd.to_numeric(
@@ -104,9 +135,8 @@ def _sanitize_df(df: pd.DataFrame, col_info: dict[str, NiqColInfo]) -> pd.DataFr
                 errors="coerce",
             )
         else:
-            # Cast to nullable string — replaces float NaN with pd.NA cleanly
-            df[col] = df[col].astype(object).where(df[col].notna(), other=None)
-            df[col] = df[col].astype("string")
+            # Nullable string — maps float NaN → pd.NA, pyarrow writes as null
+            df[col] = df[col].where(df[col].notna(), other=None).astype("string")
 
     return df
 
@@ -122,7 +152,7 @@ def detect_niq_structure(df: pd.DataFrame) -> NiqMeta:
     Detection rules (in priority order):
       1. Periods column: column named 'Periods'/'Period' (case-insensitive),
          or a low-cardinality string column with 2 distinct values both
-         matching NIQ period-label patterns ('Letzte', 'dd/mm/yy').
+         matching NIQ period-label patterns.
       2. Metadata rows: rows where ALL dimension columns hold banner/header
          values from _METADATA_VALUES.
     """
@@ -136,15 +166,14 @@ def detect_niq_structure(df: pd.DataFrame) -> NiqMeta:
 
     # Detect Periods column by name first
     for col in df.columns:
-        col_lo = col.strip().lower()
-        if col_lo in ("periods", "period"):
+        if col.strip().lower() in ("periods", "period"):
             meta.has_periods_col = True
             meta.periods_col = col
             break
 
     # Fallback: low-cardinality string col with NIQ period-label patterns
     if not meta.has_periods_col:
-        for col in df.select_dtypes(include="object").columns:
+        for col in df.select_dtypes(include=["object", "string"]).columns:
             vals = df[col].dropna().unique()
             if len(vals) == 2 and all(
                 "letzte" in str(v).lower() or re.search(r"\d{2}/\d{2}/\d{2}", str(v))
@@ -169,10 +198,9 @@ def detect_niq_structure(df: pd.DataFrame) -> NiqMeta:
             vals = [
                 str(row[c]).strip().lower()
                 for c in meta.dimension_cols
-                if c in row.index and pd.notna(row[c])
+                if c in row.index and pd.notna(row[c]) and str(row[c]) != "<NA>"
             ]
-            return not vals or all(v in _METADATA_VALUES or v == "nan" for v in vals)
-
+            return not vals or all(v in _METADATA_VALUES or v in ("nan", "<na>") for v in vals)
         meta.metadata_row_mask = df.apply(_is_meta_row, axis=1).tolist()
     else:
         meta.metadata_row_mask = [False] * len(df)
@@ -184,7 +212,7 @@ def classify_niq_columns(df: pd.DataFrame) -> dict[str, NiqColInfo]:
     """
     Classify every column in *df* into a NIQ semantic role.
 
-    Priority order:
+    Priority:
       1. YoY delta  — name contains any _YOY_PATTERNS token
       2. Prior year — name ends with any _VJ_SUFFIXES token
       3. Numeric dtype                                → metric_cy
@@ -245,9 +273,10 @@ def build_niq_table_context(
     )
     grain = "annual, CY vs PY" if meta.has_periods_col else "annual"
     tags  = ["niq", "panel", "haushalte", "penetration", "purchase", "frequency"]
-    if "products"    in [c.lower() for c in meta.dimension_cols]: tags.append("product")
-    if "retailers"   in [c.lower() for c in meta.dimension_cols]: tags.extend(["retailer", "channel", "shop"])
-    if "geographies" in [c.lower() for c in meta.dimension_cols]: tags.extend(["geography", "market", "region"])
+    dim_lo = [c.lower() for c in meta.dimension_cols]
+    if "products"    in dim_lo: tags.append("product")
+    if "retailers"   in dim_lo: tags.extend(["retailer", "channel", "shop"])
+    if "geographies" in dim_lo: tags.extend(["geography", "market", "region"])
 
     return summary, grain, tags
 
@@ -345,11 +374,14 @@ def _get_flat_attr(name: str):
 def load_niq_file(path: str, dataset_name: str) -> str:
     """Load a NIQ-format panel dataset (Excel/CSV/Parquet) into DuckDB.
 
-    Extends load_file with NIQ-specific post-processing:
-      - Drops Unnamed:* columns (Excel header bleed)
+    Handles NIQ exports that embed a copyright/metadata preamble above the
+    real data table.  The preamble is auto-detected and skipped.
+
+    Post-processing:
+      - Drops Unnamed:* columns and all-NaN rows
       - Sanitizes mixed-type object columns so Parquet write never fails
       - Auto-detects Periods column and CY/PY period labels
-      - Classifies every column into: dimension, metric_cy, metric_py, yoy_delta
+      - Classifies every column: dimension / metric_cy / metric_py / yoy_delta
       - Drops header/banner metadata rows embedded in NIQ exports
       - Enriches _column_catalog with role flags and descriptions
       - Seeds _semantic_map with aliases from SCHEMA_CATALOG
@@ -365,20 +397,23 @@ def load_niq_file(path: str, dataset_name: str) -> str:
     _get_parquet_store = _get_flat_attr("_get_parquet_store")
     _PROJECT_ROOT      = _get_flat_attr("_PROJECT_ROOT")
 
-    # ── 1. Resolve + read file ─────────────────────────────────────────────
+    # ── 1. Resolve file path ─────────────────────────────────────────────
     file_path = Path(path)
     if not file_path.exists():
         file_path = _PROJECT_ROOT / path
     if not file_path.exists():
         return f"ERROR: File not found at '{path}'"
     file_path = file_path.resolve()
-
     suffix = file_path.suffix.lower()
+
+    # ── 2. Auto-detect preamble and read file ─────────────────────────────
     try:
         if suffix in (".xlsx", ".xls"):
-            df = pd.read_excel(file_path)
+            skip = _find_header_row(file_path)
+            df = pd.read_excel(file_path, skiprows=skip)
         elif suffix == ".csv":
-            df = pd.read_csv(file_path, low_memory=False)
+            skip = _find_header_row(file_path)
+            df = pd.read_csv(file_path, skiprows=skip, low_memory=False)
         elif suffix == ".parquet":
             df = pd.read_parquet(file_path)
         else:
@@ -386,27 +421,25 @@ def load_niq_file(path: str, dataset_name: str) -> str:
     except Exception as exc:
         return f"ERROR reading file: {exc}"
 
-    # ── 2. Classify columns on the raw DataFrame ───────────────────────────
+    # ── 3. Classify columns on the raw (post-header) DataFrame ──────────────
     col_info = classify_niq_columns(df)
     meta     = detect_niq_structure(df)
 
-    # ── 3. Drop metadata / banner rows ────────────────────────────────────
+    # ── 4. Drop metadata / banner rows ────────────────────────────────────
     n_raw = len(df)
     if any(meta.metadata_row_mask):
-        keep = [not m for m in meta.metadata_row_mask]
-        df   = df[keep].reset_index(drop=True)
+        df = df[[not m for m in meta.metadata_row_mask]].reset_index(drop=True)
     n_clean = len(df)
     dropped = n_raw - n_clean
 
-    # ── 4. Sanitize DataFrame for Parquet compatibility ─────────────────────
-    #    - drops Unnamed:* columns
-    #    - coerces mixed object cols (fixes 'Expected bytes, got float')
+    # ── 5. Sanitize DataFrame (Unnamed cols, mixed types, all-NaN rows) ──────
     df       = _sanitize_df(df, col_info)
-    # Re-classify after Unnamed columns were dropped
+    # Re-classify after sanitization (dtypes may have changed)
     col_info = classify_niq_columns(df)
     meta     = detect_niq_structure(df)
+    n_clean  = len(df)
 
-    # ── 5. Write Parquet + register DuckDB view ────────────────────────────
+    # ── 6. Write Parquet + register DuckDB view ────────────────────────────
     conn          = get_connection()
     parquet_store = _get_parquet_store()
     parquet_path  = parquet_store / f"{dataset_name}.parquet"
@@ -424,7 +457,7 @@ def load_niq_file(path: str, dataset_name: str) -> str:
     except Exception as exc:
         return f"ERROR registering DuckDB view: {exc}"
 
-    # ── 6. Update _data_registry ──────────────────────────────────────────
+    # ── 7. Update _data_registry ──────────────────────────────────────────
     try:
         conn.execute(
             """
@@ -444,21 +477,21 @@ def load_niq_file(path: str, dataset_name: str) -> str:
     except Exception as exc:
         return f"File loaded but registry update failed: {exc}"
 
-    # ── 7. Index + enrich column catalog ──────────────────────────────────
+    # ── 8. Index + enrich column catalog ──────────────────────────────────
     try:
         index_table_schema(conn, dataset_name)
     except Exception as exc:
         return f"File loaded but column catalog indexing failed: {exc}"
     _enrich_column_catalog(conn, dataset_name, col_info)
 
-    # ── 8. Seed _semantic_map ─────────────────────────────────────────────
+    # ── 9. Seed _semantic_map ─────────────────────────────────────────────
     n_aliases = seed_niq_semantic_map(conn, dataset_name, col_info)
 
-    # ── 9. Write _table_context ───────────────────────────────────────────
+    # ── 10. Write _table_context ───────────────────────────────────────────
     summary, grain, tags = build_niq_table_context(meta, dataset_name, file_path.name)
     upsert_table_context(dataset_name, summary, grain, tags, conn=conn)
 
-    # ── 10. Response ──────────────────────────────────────────────────────
+    # ── 11. Response ─────────────────────────────────────────────────────
     role_summary = {
         "dimensions": len(meta.dimension_cols),
         "metrics_CY": len(meta.metric_cy_cols),
@@ -471,10 +504,12 @@ def load_niq_file(path: str, dataset_name: str) -> str:
         else " No Periods column detected."
     )
     drop_msg = f" Dropped {dropped} metadata row(s)." if dropped else ""
+    skip_msg = f" Skipped {skip} preamble row(s)." if suffix != ".parquet" and skip > 0 else ""
 
     return (
         f"Successfully loaded NIQ file '{file_path.name}' as '{dataset_name}'. "
         f"{len(df.columns)} columns, {n_clean} data rows."
+        f"{skip_msg}"
         f"{drop_msg}"
         f" Column roles: {role_summary}."
         f"{periods_msg}"
