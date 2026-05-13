@@ -1,4 +1,5 @@
-"""tools sub-package — re-exports every public symbol from agent/tools.py.
+"""tools sub-package — re-exports every public symbol from agent/tools.py
+and adds the NIQ ingest tool and schema_tools.
 
 Python resolves `agent.tools` to this package directory, so anything that
 does `from agent.tools import ORCHESTRATOR_TOOLS` (or any other symbol from
@@ -41,11 +42,22 @@ from _agent_tools_flat import (  # noqa: E402  (explicit for IDE / type checkers
     get_schema_context_tool,
 )
 
-# Also expose the new schema_tools added in this package.
+# Schema tools added in this package.
 from agent.tools.schema_tools import (  # noqa: E402
     select_tables,
     get_relationships,
     validate_joins,
+)
+
+# NIQ ingest tool.
+from agent.tools.niq_ingest import (  # noqa: E402
+    load_niq_file,
+    detect_niq_structure,
+    classify_niq_columns,
+    seed_niq_semantic_map,
+    build_niq_table_context,
+    NiqMeta,
+    NiqColInfo,
 )
 
 __all__ = [
@@ -59,8 +71,16 @@ __all__ = [
     "search_semantic_lookup",
     "profile_column",
     "get_schema_context_tool",
-    # ── new schema_tools ─────────────────────────────────────────────────────
+    # ── schema_tools ─────────────────────────────────────────────────────────
     "select_tables",
     "get_relationships",
     "validate_joins",
+    # ── niq_ingest ────────────────────────────────────────────────────────────
+    "load_niq_file",
+    "detect_niq_structure",
+    "classify_niq_columns",
+    "seed_niq_semantic_map",
+    "build_niq_table_context",
+    "NiqMeta",
+    "NiqColInfo",
 ]
