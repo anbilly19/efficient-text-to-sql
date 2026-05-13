@@ -126,6 +126,137 @@ def _table_info(dataset_name: str) -> list[tuple[str, str]]:
 
 
 # ---------------------------------------------------------------------------
+# NIQ-specific heuristics
+# ---------------------------------------------------------------------------
+
+# Keywords that strongly indicate a metric column in NIQ panel data
+_NIQ_METRIC_KEYWORDS = {
+    "penetration", "spend", "buyer", "volume", "sales",
+    "trips", "units", "frequency", "share", "revenue",
+    "amount", "value", "rate", "index", "count",
+}
+
+# Keywords that indicate a dimension / label column regardless of dtype
+_NIQ_DIMENSION_KEYWORDS = {
+    "period", "product", "category", "brand", "market",
+    "channel", "retailer", "region", "segment", "pack",
+    "manufacturer", "supplier", "description", "name", "label",
+}
+
+# Keywords that tag a metric as prior-year / YoY comparison
+_NIQ_PY_KEYWORDS = {"py", "prior year", "prev", "previous", "yoy", "year on year", "year-on-year"}
+
+# Keywords that tag a metric as current-year
+_NIQ_CY_KEYWORDS = {"cy", "current year", "curr", "current"}
+
+
+def classify_niq_columns(conn, dataset_name: str) -> None:
+    """Patch _column_catalog with NIQ-aware roles and descriptions.
+
+    Rules (in priority order):
+    1. If the column name contains a dimension keyword → force is_dimension=True,
+       is_metric=False, regardless of dtype.
+    2. If the column name contains a metric keyword → is_metric=True,
+       is_dimension=False, with PY/CY sub-tagging in description.
+    3. Otherwise fall back to the dtype-based classification already written
+       by index_table_schema (no change).
+    """
+    cols = conn.execute(
+        "SELECT column_name, column_type, is_metric, is_dimension FROM _column_catalog "
+        "WHERE dataset_name = ?",
+        [dataset_name],
+    ).fetchall()
+
+    for col_name, col_type, cur_metric, cur_dim in cols:
+        lower = col_name.lower()
+        desc: Optional[str] = None
+        is_metric: Optional[bool] = None
+        is_dim: Optional[bool] = None
+
+        if any(k in lower for k in _NIQ_DIMENSION_KEYWORDS):
+            is_metric, is_dim = False, True
+            desc = "NIQ dimension"
+        elif any(k in lower for k in _NIQ_METRIC_KEYWORDS):
+            is_metric, is_dim = True, False
+            if any(k in lower for k in _NIQ_PY_KEYWORDS):
+                desc = "NIQ metric — prior year / YoY comparison"
+            elif any(k in lower for k in _NIQ_CY_KEYWORDS):
+                desc = "NIQ metric — current year"
+            else:
+                desc = "NIQ metric"
+        else:
+            # No keyword match — keep existing dtype-derived flags, only set desc if numeric
+            is_metric = cur_metric
+            is_dim = cur_dim
+            desc = "NIQ metric" if cur_metric else "NIQ dimension"
+
+        conn.execute(
+            "UPDATE _column_catalog "
+            "SET is_metric = ?, is_dimension = ?, description = ? "
+            "WHERE dataset_name = ? AND column_name = ?",
+            [is_metric, is_dim, desc, dataset_name, col_name],
+        )
+
+
+def detect_niq_structure(conn, dataset_name: str) -> dict:
+    """Detect grain and period labels by inspecting actual column values.
+
+    Returns a dict with at least:
+      grain        – "annual", "annual, CY vs PY", or "unknown"
+      period_col   – name of the period column found, or None
+      period_values – sample distinct values from that column
+    """
+    try:
+        period_row = conn.execute(
+            "SELECT column_name FROM _column_catalog "
+            "WHERE dataset_name = ? AND LOWER(column_name) LIKE '%period%' LIMIT 1",
+            [dataset_name],
+        ).fetchone()
+
+        grain = "annual"
+        period_col = period_row[0] if period_row else None
+        period_values: list = []
+
+        if period_col:
+            rows = conn.execute(
+                f'SELECT DISTINCT "{period_col}" FROM "{dataset_name}" '
+                f'WHERE "{period_col}" IS NOT NULL LIMIT 20'
+            ).fetchall()
+            period_values = [str(r[0]) for r in rows]
+            lowered = [v.lower() for v in period_values]
+            has_cy = any("cy" in v or "current" in v for v in lowered)
+            has_py = any("py" in v or "prior" in v or "yoy" in v for v in lowered)
+            if has_cy or has_py:
+                grain = "annual, CY vs PY"
+
+        return {
+            "grain": grain,
+            "period_col": period_col,
+            "period_values": period_values,
+        }
+    except Exception as exc:
+        return {"grain": "unknown", "period_col": None, "period_values": [], "error": str(exc)}
+
+
+# Default NIQ semantic map entries: (term, column_name, description)
+# dataset_name is filled in at load time so aliases are scoped per dataset.
+_NIQ_SEMANTIC_TERMS: list[tuple[str, str, str]] = [
+    ("penetration",          "Penetration %",       "% of households buying at least once"),
+    ("Käuferreichweite",     "Penetration %",       "German: buyer reach (Penetration %)"),
+    ("käuferreichweite",     "Penetration %",       "German (lowercase): buyer reach"),
+    ("spend per buyer",      "Spend per Buyer",     "Average spend in € per buying household"),
+    ("Ausgaben je Käufer",   "Spend per Buyer",     "German: spend per buyer"),
+    ("ausgaben je käufer",   "Spend per Buyer",     "German (lowercase): spend per buyer"),
+    ("yoy",                  "YoY Change",          "Year-over-year change vs prior year"),
+    ("year on year",         "YoY Change",          "Year-over-year change vs prior year"),
+    ("year-on-year",         "YoY Change",          "Year-over-year change vs prior year"),
+    ("Veränderung zum Vorjahr", "YoY Change",       "German: change vs prior year"),
+    ("buyer penetration",    "Penetration %",       "Alias for penetration (buyer reach)"),
+    ("Haushaltsdurchdringung", "Penetration %",     "German: household penetration"),
+]
+
+
+# ---------------------------------------------------------------------------
 # Public tools
 # ---------------------------------------------------------------------------
 
@@ -571,6 +702,94 @@ def load_file(path: str, dataset_name: str) -> str:
     )
 
 
+@tool
+def load_niq_file(path: str, dataset_name: str) -> str:
+    """Load a NIQ panel Excel/CSV/Parquet file with NIQ-aware column classification.
+
+    Extends load_file with:
+    - NIQ-specific column role detection (classify_niq_columns): correctly
+      tags Periods/Products/Category as dimensions and Penetration/Spend/YoY
+      as metrics with PY vs CY sub-tagging.
+    - Grain detection (detect_niq_structure): inspects period-column values to
+      determine "annual" vs "annual, CY vs PY" and writes to _table_context.
+    - Semantic map seeding: registers German/English marketing term aliases
+      (Käuferreichweite, Ausgaben je Käufer, yoy, etc.) scoped to this dataset.
+
+    For multi-dataset NIQ support, use distinct dataset_names per extract
+    (e.g. niq_panel_petfood, niq_panel_snacks). Repeated calls upsert safely.
+
+    Args:
+        path: Absolute or relative path to the NIQ source file.
+        dataset_name: Name to register the view as in DuckDB (e.g. 'niq_panel').
+    """
+    # Step 1: generic ingestion (Parquet conversion, registry, catalog, relationships)
+    result = load_file.invoke({"path": path, "dataset_name": dataset_name})
+    if result.startswith("ERROR"):
+        return result
+
+    conn = get_connection()
+
+    # Step 2: patch _column_catalog with NIQ-aware roles and descriptions
+    try:
+        classify_niq_columns(conn, dataset_name)
+    except Exception as exc:
+        return result + f" | WARNING: classify_niq_columns failed: {exc}"
+
+    # Step 3: detect grain from actual data, update _table_context
+    structure = detect_niq_structure(conn, dataset_name)
+    grain = structure.get("grain", "unknown")
+    try:
+        conn.execute(
+            """
+            UPDATE _table_context
+            SET grain   = ?,
+                summary = ?,
+                tags    = 'niq,panel'
+            WHERE dataset_name = ?
+            """,
+            [
+                grain,
+                (
+                    f"NIQ panel dataset '{dataset_name}'. "
+                    f"Grain: {grain}. "
+                    f"Period column: {structure.get('period_col') or 'not detected'}."
+                ),
+                dataset_name,
+            ],
+        )
+    except Exception as exc:
+        return result + f" | WARNING: _table_context update failed: {exc}"
+
+    # Step 4: seed _semantic_map with German/English aliases scoped to this dataset
+    niq_rows = [
+        (term, dataset_name, col, desc)
+        for term, col, desc in _NIQ_SEMANTIC_TERMS
+    ]
+    try:
+        conn.executemany(
+            """
+            INSERT INTO _semantic_map (term, dataset_name, column_name, description)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT (term, dataset_name) DO NOTHING
+            """,
+            niq_rows,
+        )
+    except Exception as exc:
+        return result + f" | WARNING: _semantic_map seeding failed: {exc}"
+
+    period_info = (
+        f"Period values: {structure['period_values'][:5]}"
+        if structure.get("period_values")
+        else "No period column detected"
+    )
+    return (
+        result
+        + f" | NIQ grain: {grain}"
+        + f" | {period_info}"
+        + f" | Seeded {len(niq_rows)} semantic aliases"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tool sets per node
 # ---------------------------------------------------------------------------
@@ -587,6 +806,7 @@ ALL_TOOLS = [
     lookup_semantic,
     search_semantic_lookup,
     load_file,
+    load_niq_file,
 ]
 
 ORCHESTRATOR_TOOLS = [
