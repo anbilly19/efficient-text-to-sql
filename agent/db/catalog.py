@@ -26,6 +26,7 @@ def upsert_table_context(
     tags: list[str] | None = None,
     conn: duckdb.DuckDBPyConnection | None = None,
 ) -> None:
+    """Insert or replace the _table_context row for *dataset_name*."""
     conn = conn or get_connection()
     tags_json = json.dumps(tags or [])
     conn.execute(
@@ -43,6 +44,7 @@ def upsert_table_context(
 
 
 def get_table_context(dataset_name: str, conn: duckdb.DuckDBPyConnection | None = None) -> dict[str, Any]:
+    """Return the _table_context row for *dataset_name* as a dict."""
     conn = conn or get_connection()
     row = conn.execute(
         "SELECT summary, grain, tags FROM _table_context WHERE dataset_name = ?",

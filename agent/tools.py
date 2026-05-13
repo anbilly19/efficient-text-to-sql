@@ -6,7 +6,7 @@ import os
 import re
 from pathlib import Path
 from typing import Optional
-
+import duckdb
 import pandas as pd
 from langchain_core.tools import tool
 
@@ -106,7 +106,6 @@ def _table_info(dataset_name: str) -> list[tuple[str, str]]:
         [dataset_name],
     ).fetchall()
     return [(r[0], r[1]) for r in rows]
-
 
 # ---------------------------------------------------------------------------
 # Public tools
@@ -339,7 +338,7 @@ def lookup_semantic(term: str) -> str:
     Args:
         term: The business term (e.g. 'revenue', 'active_customer').
     """
-    conn = get_connection()
+    conn: duckdb.DuckDBPyConnection = get_connection()
     try:
         row = conn.execute(
             "SELECT description FROM _semantic_map WHERE LOWER(term) = LOWER(?)",
@@ -435,7 +434,6 @@ def search_semantic_lookup(query: str, dataset: Optional[str] = None) -> str:
 @tool
 def load_file(path: str, dataset_name: str) -> str:
     """Load an Excel, Parquet, or CSV file into DuckDB.
-
     Converts the file to Parquet, registers it as a DuckDB VIEW, populates
     _data_registry, _column_catalog, and _table_context, and auto-detects
     join relationships to any already-loaded tables.
@@ -445,7 +443,6 @@ def load_file(path: str, dataset_name: str) -> str:
         dataset_name: Name to register the table / view as in DuckDB.
     """
     conn = get_connection()
-
     file_path = Path(path)
     if not file_path.exists():
         file_path = _PROJECT_ROOT / path
@@ -487,7 +484,6 @@ def load_file(path: str, dataset_name: str) -> str:
 
     row_count = len(df)
     col_count = len(df.columns)
-
     try:
         conn.execute(
             """
@@ -542,7 +538,6 @@ def load_file(path: str, dataset_name: str) -> str:
         if inferred
         else ""
     )
-
     return (
         f"Successfully loaded '{file_path.name}' as view '{dataset_name}'. "
         f"{col_count} columns, {row_count} rows."

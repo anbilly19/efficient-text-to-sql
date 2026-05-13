@@ -41,15 +41,19 @@ data/
 # Local scratch — developer-specific files
 .local/
 
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
+# PyPI configuration file
+.pypirc
 
-# OS
-.DS_Store
-Thumbs.db
+# Marimo
+marimo/_static/
+marimo/_lsp/
+__marimo__/
 
-# LangGraph
-.langgraph_api/
+# Streamlit
+.streamlit/secrets.toml
+*.pckl
+*.xlsx
+exports/*
+data/parquet/*.parquet
+.local/parquet/*.parquet
+.local/duckdb/*.duckdb

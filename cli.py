@@ -126,7 +126,7 @@ def main() -> None:
 
     # ── Hand off to langgraph dev ─────────────────────────────────────────
     langgraph_bin = _find_langgraph()
-    cmd = [langgraph_bin, "dev"] + extra
+    cmd = [langgraph_bin, "dev", "--no-browser"] + extra
     try:
         subprocess.run(cmd, env=env, check=True)
     except KeyboardInterrupt:

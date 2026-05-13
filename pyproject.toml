@@ -32,3 +32,10 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["agent"]
+
+[tool.pytest.ini_options]
+markers = [
+    "round_01", "round_02", "round_03", "round_04",
+    "round_05", "round_06", "round_07", "round_08",
+    "round_09", "round_10", "round_11", "round_12",
+]

@@ -22,11 +22,6 @@ _lock = threading.Lock()
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _DEFAULT_DB_PATH = _PROJECT_ROOT / ".local" / "duckdb" / "efficient-text-to-sql.duckdb"
 
-
-# ---------------------------------------------------------------------------
-# Connection
-# ---------------------------------------------------------------------------
-
 def get_connection() -> duckdb.DuckDBPyConnection:
     """Return the singleton DuckDB connection, initialising it on first call."""
     global _conn
@@ -99,6 +94,7 @@ def _ensure_metadata_tables(conn: duckdb.DuckDBPyConnection) -> None:
     _add_column_if_missing(conn, "_column_catalog", "is_join_key",   "BOOLEAN DEFAULT FALSE")
     _add_column_if_missing(conn, "_column_catalog", "description",   "VARCHAR")
     _add_column_if_missing(conn, "_column_catalog", "sample_values", "VARCHAR")
+
 
     # ── _relationships ──────────────────────────────────────────────────────────────
     conn.execute("""
@@ -177,7 +173,6 @@ def _auto_reattach_parquet(conn: duckdb.DuckDBPyConnection) -> None:
 # ---------------------------------------------------------------------------
 # Dynamic schema indexing
 # ---------------------------------------------------------------------------
-
 def index_table_schema(conn: duckdb.DuckDBPyConnection, dataset_name: str) -> None:
     """Introspect a newly loaded table and populate _column_catalog."""
     conn.execute(
