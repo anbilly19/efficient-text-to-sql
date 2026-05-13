@@ -1,9 +1,8 @@
 """Deterministic tool functions – no LLM involved here."""
 from __future__ import annotations
 
-import csv
-import io
 import json
+import os
 import re
 from pathlib import Path
 from typing import Optional
@@ -11,8 +10,75 @@ from typing import Optional
 import pandas as pd
 from langchain_core.tools import tool
 
-from agent.database import get_connection, get_parquet_path, PARQUET_STORE
+import sys as _sys
 
+
+def _db():
+    return _sys.modules["agent.database"]
+
+
+def get_connection():
+    return _db().get_connection()
+
+
+def get_schema_context(table_names):
+    return _db().get_schema_context(table_names)
+
+
+def get_table_summaries():
+    return _db().get_table_summaries()
+
+
+def index_table_schema(conn, dataset_name):
+    return _db().index_table_schema(conn, dataset_name)
+
+
+def infer_and_register_relationships(conn, new_table):
+    return _db().infer_and_register_relationships(conn, new_table)
+
+
+def register_relationship(conn, left_table, left_column, right_table, right_column,
+                          cardinality="many-to-one", description=None):
+    return _db().register_relationship(
+        conn, left_table, left_column, right_table, right_column, cardinality, description
+    )
+
+
+import agent.database as _agent_database  # noqa: F401, E402
+
+# ---------------------------------------------------------------------------
+# Parquet storage
+# ---------------------------------------------------------------------------
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_DEFAULT_PARQUET_STORE = _PROJECT_ROOT / ".local" / "parquet"
+
+
+def _get_parquet_store() -> Path:
+    env = os.environ.get("PARQUET_STORE")
+    return Path(env) if env else _DEFAULT_PARQUET_STORE
+
+
+def get_parquet_path(dataset_name: str) -> Path:
+    return _get_parquet_store() / f"{dataset_name}.parquet"
+
+
+class _LazyParquetStore:
+    def __truediv__(self, other):   return _get_parquet_store() / other
+    def __str__(self):              return str(_get_parquet_store())
+    def __repr__(self):             return repr(_get_parquet_store())
+    def __fspath__(self):           return os.fspath(_get_parquet_store())
+    def mkdir(self, **kw):          return _get_parquet_store().mkdir(**kw)
+    def exists(self):               return _get_parquet_store().exists()
+    def __eq__(self, other):        return _get_parquet_store() == other
+
+
+PARQUET_STORE = _LazyParquetStore()
+
+
+# ---------------------------------------------------------------------------
+# Private helpers
+# ---------------------------------------------------------------------------
 
 _DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}")
 
@@ -21,15 +87,7 @@ def _looks_like_date(value: str) -> bool:
     return bool(_DATE_PATTERN.match(str(value).strip()))
 
 
-def _table_info(dataset_name: str) -> list[tuple[str, str]]:
-    """Return [(column_name, column_type), ...] using PRAGMA — always safe."""
-    conn = get_connection()
-    rows = conn.execute(f"PRAGMA table_info('{dataset_name}')").fetchall()
-    return [(r[1], r[2]) for r in rows]
-
-
 def _normalize_date_columns_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Cast object columns that look like ISO dates to datetime64."""
     for col in df.select_dtypes(include="object").columns:
         sample = df[col].dropna().head(5)
         if len(sample) > 0 and all(_looks_like_date(str(v)) for v in sample):
@@ -40,119 +98,114 @@ def _normalize_date_columns_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _normalize_date_columns(dataset_name: str) -> list[str]:
-    """Cast VARCHAR date columns to DATE in-place. Returns converted column names."""
+def _table_info(dataset_name: str) -> list[tuple[str, str]]:
     conn = get_connection()
-    converted: list[str] = []
-    for col, dtype in _table_info(dataset_name):
-        if dtype.upper() != "VARCHAR":
-            continue
-        try:
-            sample = conn.execute(
-                f'SELECT "{col}" FROM "{dataset_name}" WHERE "{col}" IS NOT NULL LIMIT 5'
-            ).fetchall()
-            values = [row[0] for row in sample if row[0] is not None]
-            if values and all(_looks_like_date(v) for v in values):
-                conn.execute(
-                    f'ALTER TABLE "{dataset_name}" ALTER COLUMN "{col}" TYPE DATE '
-                    f'USING TRY_CAST("{col}" AS DATE)'
-                )
-                conn.execute(
-                    "UPDATE _schema_catalog SET data_type = 'DATE' "
-                    "WHERE dataset_name = ? AND column_name = ?",
-                    [dataset_name, col],
-                )
-                converted.append(col)
-        except Exception:
-            pass
-    return converted
+    rows = conn.execute(
+        "SELECT column_name, data_type FROM information_schema.columns "
+        "WHERE table_name = ? ORDER BY ordinal_position",
+        [dataset_name],
+    ).fetchall()
+    return [(r[0], r[1]) for r in rows]
 
 
-def _build_semantic_lookup(df: pd.DataFrame, dataset_name: str) -> None:
-    """Populate _semantic_lookup with per-column stats derived from the DataFrame."""
-    conn = get_connection()
-    conn.execute("DELETE FROM _semantic_lookup WHERE dataset_name = ?", [dataset_name])
-    total_rows = len(df)
-    for col in df.columns:
-        series = df[col]
-        dtype_str = str(series.dtype)
+# ---------------------------------------------------------------------------
+# Public tools
+# ---------------------------------------------------------------------------
 
-        try:
-            n_distinct = int(series.nunique(dropna=True))
-        except Exception:
-            n_distinct = -1
+@tool
+def list_tables() -> str:
+    """Return a short summary of every loaded table with row/column counts.
 
-        null_frac = float(series.isna().sum()) / total_rows if total_rows > 0 else 0.0
-
-        try:
-            raw_samples = series.dropna().unique()[:5].tolist()
-            sample_values = json.dumps([str(s) for s in raw_samples], default=str)
-        except Exception:
-            sample_values = "[]"
-
-        col_lower = col.lower().replace("_", " ")
-        description = (
-            f"{col_lower.title()} — {dtype_str} column with {n_distinct} distinct values"
-            + (f", e.g. {', '.join(json.loads(sample_values)[:3])}" if json.loads(sample_values) else "")
-        )
-
-        conn.execute(
-            """
-            INSERT INTO _semantic_lookup
-                (dataset_name, column_name, data_type, sample_values, n_distinct, null_frac, description)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            [dataset_name, col, dtype_str, sample_values, n_distinct, null_frac, description],
-        )
+    Use this first when the user's question may span multiple tables, or when
+    you need to know which tables are available before selecting the right ones.
+    """
+    return get_table_summaries()
 
 
-def _semantic_map_coverage(dataset_name: str, columns: list[str]) -> int:
-    """Return the number of columns that have at least one alias in _semantic_map.
+@tool
+def get_relationships() -> str:
+    """Return all known join relationships between loaded tables.
 
-    The check is intentionally broad: a column is considered 'covered' if its
-    exact name (case-insensitive) appears as a term in _semantic_map.
+    Returns a JSON list of objects with keys:
+      left_table, left_column, right_table, right_column, cardinality, description.
+    Use this before writing a JOIN to confirm which columns to join on.
     """
     conn = get_connection()
     try:
         rows = conn.execute(
-            "SELECT COUNT(DISTINCT term) FROM _semantic_map "
-            "WHERE LOWER(term) IN ({})".format(
-                ", ".join(["LOWER(?)"] * len(columns))
-            ),
-            [c.lower() for c in columns],
-        ).fetchone()
-        return rows[0] if rows else 0
-    except Exception:
-        return 0
-
-
-def _build_alias_csv_template(dataset_name: str, columns: list[str]) -> str:
-    """Return a CSV string as an alias registration template.
-
-    The user fills in 'definition_sql' (a SQL expression or column ref) and
-    an optional 'description' then passes the file back via register_alias.
-    """
-    buf = io.StringIO()
-    writer = csv.DictWriter(
-        buf,
-        fieldnames=["term", "definition_sql", "description"],
-        lineterminator="\n",
-    )
-    writer.writeheader()
-    for col in columns:
-        writer.writerow(
+            "SELECT left_table, left_column, right_table, right_column, cardinality, description "
+            "FROM _relationships ORDER BY left_table, right_table"
+        ).fetchall()
+        result = [
             {
-                "term": col,
-                "definition_sql": f'"{col}"',  # default: identity reference
-                "description": "",
+                "left_table": r[0],
+                "left_column": r[1],
+                "right_table": r[2],
+                "right_column": r[3],
+                "cardinality": r[4],
+                "description": r[5],
             }
+            for r in rows
+        ]
+        if not result:
+            return json.dumps({"relationships": [], "note": "No relationships registered yet."})
+        return json.dumps({"relationships": result}, default=str)
+    except Exception as exc:
+        return f"ERROR: {exc}"
+
+
+@tool
+def get_schema_context_tool(table_names: list[str]) -> str:
+    """Return full schema context (columns, types, flags, samples, relationships) for the
+    given list of table names.  Always call this before writing SQL that touches
+    any of those tables.
+
+    Args:
+        table_names: One or more table names to describe.
+    """
+    try:
+        return get_schema_context(table_names)
+    except Exception as exc:
+        return f"ERROR: {exc}"
+
+
+@tool
+def register_relationship_tool(
+    left_table: str,
+    left_column: str,
+    right_table: str,
+    right_column: str,
+    cardinality: str = "many-to-one",
+    description: Optional[str] = None,
+) -> str:
+    """Explicitly register (or update) an authoritative join relationship.
+
+    Args:
+        left_table: The fact / left-hand table name.
+        left_column: The join column on the left table.
+        right_table: The dimension / right-hand table name.
+        right_column: The join column on the right table.
+        cardinality: e.g. 'many-to-one', 'one-to-one'. Default 'many-to-one'.
+        description: Optional human-readable note.
+    """
+    try:
+        register_relationship(
+            get_connection(),
+            left_table,
+            left_column,
+            right_table,
+            right_column,
+            cardinality,
+            description,
         )
-    return buf.getvalue()
+        return f"Registered: {left_table}.{left_column} → {right_table}.{right_column} ({cardinality})"
+    except Exception as exc:
+        return f"ERROR: {exc}"
 
 
 @tool
 def get_schema(dataset: str, columns: Optional[list[str]] = None) -> str:
-    """Return column names, types, and 3 sample values for a dataset.
+    """Return column names, types, and 3 sample values for a single dataset.
 
     Args:
         dataset: The table / view name in DuckDB.
@@ -221,7 +274,6 @@ def profile_column(dataset: str, column: str) -> str:
 
 
 def _execute_select(query: str) -> tuple[str, dict]:
-    """Run a read-only SELECT; return (rows_json, metadata). Raises on forbidden DDL."""
     conn = get_connection()
     normalised = query.strip().upper()
     for forbidden in ("INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER", "COPY"):
@@ -285,31 +337,56 @@ def lookup_semantic(term: str) -> str:
     """Look up a business term in the semantic map.
 
     Args:
-        term: The business term (e.g. 'active_customer').
+        term: The business term (e.g. 'revenue', 'active_customer').
     """
     conn = get_connection()
     try:
         row = conn.execute(
-            "SELECT definition_sql, description FROM _semantic_map WHERE LOWER(term) = LOWER(?)",
+            "SELECT description FROM _semantic_map WHERE LOWER(term) = LOWER(?)",
             [term],
         ).fetchone()
         if row:
-            return json.dumps({"term": term, "definition_sql": row[0], "description": row[1]})
-        return json.dumps({"term": term, "definition_sql": None, "description": "Term not found."})
+            cols = conn.execute(
+                "SELECT dataset_name, column_name, column_type, sample_values "
+                "FROM _column_catalog WHERE LOWER(column_name) LIKE LOWER(?)",
+                [f"%{term}%"],
+            ).fetchall()
+            return json.dumps({
+                "term": term,
+                "description": row[0],
+                "matching_columns": [
+                    {"table": r[0], "column": r[1], "type": r[2], "samples": json.loads(r[3] or "[]")}
+                    for r in cols
+                ],
+            })
+        cols = conn.execute(
+            "SELECT dataset_name, column_name, column_type, description, sample_values "
+            "FROM _column_catalog WHERE LOWER(column_name) LIKE LOWER(?)",
+            [f"%{term}%"],
+        ).fetchall()
+        if cols:
+            return json.dumps({
+                "term": term,
+                "description": None,
+                "matching_columns": [
+                    {"table": r[0], "column": r[1], "type": r[2],
+                     "desc": r[3], "samples": json.loads(r[4] or "[]")}
+                    for r in cols
+                ],
+            })
+        return json.dumps({"term": term, "description": None, "matching_columns": [],
+                           "note": "Term not found in semantic map or column catalog."})
     except Exception as exc:
         return f"ERROR: {exc}"
 
 
 @tool
 def search_semantic_lookup(query: str, dataset: Optional[str] = None) -> str:
-    """Search the semantic_lookup for columns matching a keyword or description.
-
-    Useful for finding which column represents a business concept (e.g. 'revenue',
-    'customer id', 'date of order') without knowing the exact column name.
+    """Search _column_catalog for columns matching a keyword or description.
 
     Args:
         query: Keyword or phrase to search for in column names and descriptions.
-        dataset: Optional dataset name to restrict the search to one table.
+        dataset: Optional table name to restrict the search.
     """
     conn = get_connection()
     try:
@@ -317,8 +394,9 @@ def search_semantic_lookup(query: str, dataset: Optional[str] = None) -> str:
         if dataset:
             rows = conn.execute(
                 """
-                SELECT dataset_name, column_name, data_type, sample_values, n_distinct, description
-                FROM _semantic_lookup
+                SELECT dataset_name, column_name, column_type, sample_values,
+                       is_metric, is_dimension, is_join_key, description
+                FROM _column_catalog
                 WHERE dataset_name = ?
                   AND (LOWER(column_name) LIKE ? OR LOWER(description) LIKE ?)
                 ORDER BY dataset_name, column_name
@@ -328,8 +406,9 @@ def search_semantic_lookup(query: str, dataset: Optional[str] = None) -> str:
         else:
             rows = conn.execute(
                 """
-                SELECT dataset_name, column_name, data_type, sample_values, n_distinct, description
-                FROM _semantic_lookup
+                SELECT dataset_name, column_name, column_type, sample_values,
+                       is_metric, is_dimension, is_join_key, description
+                FROM _column_catalog
                 WHERE LOWER(column_name) LIKE ? OR LOWER(description) LIKE ?
                 ORDER BY dataset_name, column_name
                 """,
@@ -341,8 +420,10 @@ def search_semantic_lookup(query: str, dataset: Optional[str] = None) -> str:
                 "column": r[1],
                 "type": r[2],
                 "samples": json.loads(r[3] or "[]"),
-                "n_distinct": r[4],
-                "description": r[5],
+                "is_metric": r[4],
+                "is_dimension": r[5],
+                "is_join_key": r[6],
+                "description": r[7],
             }
             for r in rows
         ]
@@ -352,245 +433,164 @@ def search_semantic_lookup(query: str, dataset: Optional[str] = None) -> str:
 
 
 @tool
-def list_loaded_tables() -> str:
-    """List all datasets currently registered in DuckDB.
-
-    Returns dataset name, row count, column count, source file, and when it
-    was loaded.  Falls back to scanning _semantic_lookup when _data_registry
-    is empty (e.g. datasets loaded in a prior session without the registry).
-    """
-    conn = get_connection()
-    try:
-        rows = conn.execute(
-            """
-            SELECT dataset_name, source_file, row_count, column_count, loaded_at
-            FROM _data_registry
-            ORDER BY loaded_at DESC
-            """
-        ).fetchall()
-        if rows:
-            results = [
-                {
-                    "dataset": r[0],
-                    "source_file": r[1],
-                    "row_count": r[2],
-                    "column_count": r[3],
-                    "loaded_at": str(r[4]),
-                }
-                for r in rows
-            ]
-            return json.dumps(results, default=str)
-    except Exception:
-        pass
-
-    # Fallback: derive from _semantic_lookup
-    try:
-        rows = conn.execute(
-            """
-            SELECT dataset_name, COUNT(*) AS column_count
-            FROM _semantic_lookup
-            GROUP BY dataset_name
-            ORDER BY dataset_name
-            """
-        ).fetchall()
-        results = [
-            {"dataset": r[0], "column_count": r[1], "source_file": None, "row_count": None}
-            for r in rows
-        ]
-        return json.dumps(results, default=str)
-    except Exception as exc:
-        return f"ERROR: {exc}"
-
-
-@tool
-def register_alias(
-    term: str,
-    definition_sql: str,
-    description: Optional[str] = None,
-) -> str:
-    """Register or update a business-term alias in the semantic map.
-
-    After registration the alias is immediately available to lookup_semantic
-    and the sql_writer uses it when constructing queries.
-
-    Args:
-        term: Short business name for the concept, e.g. 'umsatz' or 'revenue'.
-        definition_sql: SQL expression that resolves the term, e.g.
-            '"Umsatz_EUR"' or 'SUM("Umsatz_EUR") / 1000'.
-        description: Optional human-readable explanation shown to the LLM.
-    """
-    conn = get_connection()
-    try:
-        conn.execute(
-            """
-            INSERT INTO _semantic_map (term, definition_sql, description)
-            VALUES (?, ?, ?)
-            ON CONFLICT (term) DO UPDATE
-                SET definition_sql = excluded.definition_sql,
-                    description    = excluded.description
-            """,
-            [term.lower().strip(), definition_sql, description],
-        )
-        return json.dumps(
-            {
-                "status": "ok",
-                "term": term.lower().strip(),
-                "definition_sql": definition_sql,
-                "description": description,
-            }
-        )
-    except Exception as exc:
-        return f"ERROR: {exc}"
-
-
-@tool
-def load_file(path: str, dataset_name: str, force_schema: bool = False) -> str:
+def load_file(path: str, dataset_name: str) -> str:
     """Load an Excel, Parquet, or CSV file into DuckDB.
 
-    Excel and CSV files are converted to Parquet and persisted on disk so they
-    survive server restarts. DuckDB holds a VIEW backed by the Parquet file,
-    keeping memory usage minimal. _schema_catalog, _semantic_lookup, and
-    _data_registry are rebuilt for the dataset.
-
-    If no alias entries exist in _semantic_map for this dataset's columns a
-    CSV template is generated and its path is included in the response so the
-    user can fill in business-term mappings and run register_alias.
+    Converts the file to Parquet, registers it as a DuckDB VIEW, populates
+    _data_registry, _column_catalog, and _table_context, and auto-detects
+    join relationships to any already-loaded tables.
 
     Args:
         path: Absolute or relative path to the source file.
         dataset_name: Name to register the table / view as in DuckDB.
-        force_schema: If True, re-populate catalog even if entry exists.
     """
     conn = get_connection()
+
     file_path = Path(path)
     if not file_path.exists():
-        return f"ERROR: File not found at '{path}'"
+        file_path = _PROJECT_ROOT / path
+    if not file_path.exists():
+        return f"ERROR: File not found at '{path}' (also tried '{_PROJECT_ROOT / path}')"
+    file_path = file_path.resolve()
 
     suffix = file_path.suffix.lower()
-    parquet_path = get_parquet_path(dataset_name)
+    parquet_store = _get_parquet_store()
+    parquet_path = parquet_store / f"{dataset_name}.parquet"
 
-    # ── 1. Read source into DataFrame ────────────────────────────────────
     try:
         if suffix in (".xlsx", ".xls"):
-            df = pd.read_excel(path)
+            df = pd.read_excel(file_path)
             df = _normalize_date_columns_df(df)
         elif suffix == ".csv":
-            df = pd.read_csv(path, low_memory=False)
+            df = pd.read_csv(file_path, low_memory=False)
             df = _normalize_date_columns_df(df)
         elif suffix == ".parquet":
-            df = pd.read_parquet(path)
+            df = pd.read_parquet(file_path)
         else:
             return f"ERROR: Unsupported file type '{suffix}'. Use .xlsx, .parquet, or .csv."
     except Exception as exc:
         return f"ERROR reading file: {exc}"
 
-    columns = list(df.columns)
-    row_count = len(df)
-
-    # ── 2. Persist as Parquet ─────────────────────────────────────────────
     try:
-        PARQUET_STORE.mkdir(parents=True, exist_ok=True)
+        parquet_store.mkdir(parents=True, exist_ok=True)
         df.to_parquet(parquet_path, index=False, engine="pyarrow")
     except Exception as exc:
         return f"ERROR writing Parquet: {exc}"
 
-    # ── 3. Register as a DuckDB VIEW backed by the Parquet file ──────────
     try:
         conn.execute(
-            f"CREATE OR REPLACE VIEW \"{dataset_name}\" AS "
+            f'CREATE OR REPLACE VIEW "{dataset_name}" AS '
             f"SELECT * FROM read_parquet('{parquet_path.as_posix()}')"
         )
     except Exception as exc:
         return f"ERROR registering view in DuckDB: {exc}"
 
-    # ── 4. Rebuild _schema_catalog ────────────────────────────────────────
-    try:
-        col_info = _table_info(dataset_name)
-        conn.execute("DELETE FROM _schema_catalog WHERE dataset_name = ?", [dataset_name])
-        for col, dtype in col_info:
-            conn.execute(
-                "INSERT INTO _schema_catalog "
-                "(dataset_name, column_name, data_type, nullable, description) "
-                "VALUES (?, ?, ?, ?, ?)",
-                [dataset_name, col, dtype, True, None],
-            )
-    except Exception as exc:
-        return f"File loaded but schema catalog update failed: {exc}"
+    row_count = len(df)
+    col_count = len(df.columns)
 
-    # ── 5. Build _semantic_lookup ─────────────────────────────────────────
-    try:
-        _build_semantic_lookup(df, dataset_name)
-    except Exception:
-        pass  # non-fatal
-
-    # ── 6. Update _data_registry ──────────────────────────────────────────
     try:
         conn.execute(
             """
             INSERT INTO _data_registry
-                (dataset_name, parquet_path, source_file, row_count, column_count, loaded_at)
-            VALUES (?, ?, ?, ?, ?, current_timestamp)
-            ON CONFLICT (dataset_name) DO UPDATE
-                SET parquet_path  = excluded.parquet_path,
-                    source_file   = excluded.source_file,
-                    row_count     = excluded.row_count,
-                    column_count  = excluded.column_count,
-                    loaded_at     = excluded.loaded_at
+                (dataset_name, parquet_path, source_file, row_count, column_count)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (dataset_name) DO UPDATE SET
+                parquet_path  = excluded.parquet_path,
+                source_file   = excluded.source_file,
+                row_count     = excluded.row_count,
+                column_count  = excluded.column_count,
+                ingested_at   = now()
             """,
-            [
-                dataset_name,
-                parquet_path.as_posix(),
-                file_path.name,
-                row_count,
-                len(columns),
-            ],
+            [dataset_name, str(parquet_path.resolve()), str(file_path), row_count, col_count],
         )
-    except Exception:
-        pass  # non-fatal
+    except Exception as exc:
+        return f"File loaded but registry update failed: {exc}"
 
-    # ── 7. Check semantic_map coverage → emit template if missing ─────────
-    alias_warning = ""
-    template_path: Optional[Path] = None
-    coverage = _semantic_map_coverage(dataset_name, columns)
-    if coverage == 0:
-        try:
-            template_csv = _build_alias_csv_template(dataset_name, columns)
-            template_dir = PARQUET_STORE.parent / "templates"
-            template_dir.mkdir(parents=True, exist_ok=True)
-            template_path = template_dir / f"{dataset_name}_aliases.csv"
-            template_path.write_text(template_csv, encoding="utf-8")
-            alias_warning = (
-                f" No business-term aliases found for '{dataset_name}'. "
-                f"A template CSV has been saved to '{template_path}'. "
-                f"Fill in 'definition_sql' and 'description' for each column, "
-                f"then use register_alias to load them."
+    try:
+        index_table_schema(conn, dataset_name)
+    except Exception as exc:
+        return f"File loaded but column catalog indexing failed: {exc}"
+
+    inferred = []
+    try:
+        inferred = infer_and_register_relationships(conn, dataset_name)
+    except Exception:
+        pass
+
+    try:
+        existing = conn.execute(
+            "SELECT 1 FROM _table_context WHERE dataset_name = ?", [dataset_name]
+        ).fetchone()
+        if not existing:
+            conn.execute(
+                """
+                INSERT INTO _table_context (dataset_name, summary, grain)
+                VALUES (?, ?, ?)
+                """,
+                [
+                    dataset_name,
+                    f"Data loaded from {file_path.name} ({row_count} rows, {col_count} columns).",
+                    None,
+                ],
             )
-        except Exception:
-            alias_warning = (
-                f" No business-term aliases found for '{dataset_name}'. "
-                f"Use register_alias(term, definition_sql) to map column names to business terms."
-            )
+    except Exception:
+        pass
+
+    inferred_msg = (
+        f" Auto-detected {len(inferred)} relationship(s): "
+        + ", ".join(f"{r['left']}.{r['on']} ↔ {r['right']}.{r['on']}" for r in inferred)
+        if inferred
+        else ""
+    )
 
     return (
         f"Successfully loaded '{file_path.name}' as view '{dataset_name}'. "
-        f"{len(col_info)} columns, {row_count:,} rows. "
-        f"Persisted to '{parquet_path}'."
-        + alias_warning
+        f"{col_count} columns, {row_count} rows."
+        f"{inferred_msg}"
     )
 
 
+# ---------------------------------------------------------------------------
+# Tool sets per node
+# ---------------------------------------------------------------------------
+
 ALL_TOOLS = [
+    list_tables,
+    get_relationships,
+    get_schema_context_tool,
+    register_relationship_tool,
     get_schema,
     profile_column,
     run_sql,
     run_test_query,
     lookup_semantic,
     search_semantic_lookup,
-    list_loaded_tables,
-    register_alias,
     load_file,
 ]
-ORCHESTRATOR_TOOLS = [get_schema, lookup_semantic, list_loaded_tables]
-PROFILER_TOOLS = [get_schema, profile_column]
-SQL_WRITER_TOOLS = [get_schema, lookup_semantic, search_semantic_lookup, profile_column]
-VERIFIER_TOOLS = [run_test_query, profile_column]
+
+ORCHESTRATOR_TOOLS = [
+    list_tables,
+    get_relationships,
+    get_schema_context_tool,
+    lookup_semantic,
+]
+
+PROFILER_TOOLS = [
+    get_schema_context_tool,
+    get_schema,
+    profile_column,
+]
+
+SQL_WRITER_TOOLS = [
+    get_schema_context_tool,
+    get_relationships,
+    lookup_semantic,
+    search_semantic_lookup,
+    profile_column,
+]
+
+VERIFIER_TOOLS = [
+    run_test_query,
+    profile_column,
+    get_relationships,
+]
