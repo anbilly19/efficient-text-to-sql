@@ -136,11 +136,90 @@ _NIQ_FILE_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
+# Regex: detects a resolved query that already contains a vs-VJ column name
+_YOY_COL_RE = re.compile(
+    r'"?([^"]+vs\.\s*VJ\s*\(%\s*Ver\.\))"?',
+    re.IGNORECASE,
+)
+
 
 def _is_niq_file(path: str, dataset_name: str) -> bool:
     """Return True when the file path or dataset name looks like a NIQ panel extract."""
     combined = f"{path} {dataset_name}".lower()
     return bool(_NIQ_FILE_PATTERNS.search(combined))
+
+
+def _get_niq_cy_label(dataset_name: str) -> str | None:
+    """Look up the CY period label stored in _table_context for a NIQ table."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT summary FROM _table_context WHERE dataset_name = ?",
+            [dataset_name],
+        ).fetchone()
+        if row and row[0]:
+            m = re.search(r"CY='([^']+)'", row[0])
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+    return None
+
+
+def _niq_yoy_fast_path(
+    resolved_query: str,
+    dataset_name: str,
+) -> str | None:
+    """Return a ready-made SQL string when the resolved query names a vs-VJ column.
+
+    This bypasses LLM SQL generation entirely for YoY-delta questions, which
+    the LLM consistently gets wrong by using LAG() instead of reading the
+    pre-computed delta column directly.
+
+    Returns None when the fast-path does not apply.
+    """
+    m = _YOY_COL_RE.search(resolved_query)
+    if not m:
+        return None
+
+    yoy_col = m.group(1).strip()
+    cy_label = _get_niq_cy_label(dataset_name)
+    if not cy_label:
+        # Fall back to LLM if we can't determine the CY label
+        return None
+
+    # Determine which dimension columns are also mentioned in the query
+    # so we can GROUP BY them for a useful aggregation.
+    dimension_cols = []
+    q_lower = resolved_query.lower()
+    dim_map = {
+        "Products": ["product", "products", "marke", "brand", "artikel", "produkt", "sku"],
+        "Retailers": ["retailer", "retailers", "händler", "store", "shop", "kanal"],
+        "People": ["people", "panel group"],
+        "Demographics": ["demographics", "segment"],
+        "Geographies": ["geograph", "region", "market"],
+    }
+    for col, keywords in dim_map.items():
+        if any(kw in q_lower for kw in keywords):
+            dimension_cols.append(col)
+
+    # Default: show Products if no specific dimension requested
+    if not dimension_cols:
+        dimension_cols = ["Products"]
+
+    select_dims = ", ".join(f'"{c}"' for c in dimension_cols)
+    group_by = ", ".join(f'"{c}"' for c in dimension_cols)
+
+    sql = (
+        f'SELECT {select_dims}, \n'
+        f'       AVG("{yoy_col}") AS yoy_delta\n'
+        f'FROM "{dataset_name}"\n'
+        f"WHERE \"Periods\" = '{cy_label}'\n"
+        f'  AND "{yoy_col}" IS NOT NULL\n'
+        f'GROUP BY {group_by}\n'
+        f'ORDER BY yoy_delta DESC'
+    )
+    return sql
 
 
 def _select_relevant_tables(user_query: str, all_tables: list[str]) -> list[str]:
@@ -1060,6 +1139,26 @@ def sql_writer(state: AnalyticsState) -> dict:
     resolved_query = _resolve_niq_aliases(state.user_query, relevant_tables)
     resolved_step_desc = _resolve_niq_aliases(step.description, relevant_tables)
 
+    # ------------------------------------------------------------------
+    # NIQ YoY fast-path: when the resolved query already contains a
+    # "vs. VJ (% Ver.)" column name, emit correct SQL directly without
+    # involving the LLM. This prevents the LLM from inventing LAG() or
+    # any other incorrect window-function recomputation.
+    # ------------------------------------------------------------------
+    if relevant_tables and state.retry_count == 0:
+        fast_sql = _niq_yoy_fast_path(resolved_query, relevant_tables[0])
+        if fast_sql:
+            updated_plan = [
+                s.model_copy(update={"status": "running"}) if s.id == step.id else s
+                for s in state.plan
+            ]
+            return {
+                "last_sql": fast_sql,
+                "plan": updated_plan,
+                "verification_feedback": "",
+                "current_step": step,
+            }
+
     schema_context = get_schema_context(relevant_tables)
     cast_warnings = _get_date_cast_warnings(relevant_tables)
     varchar_date_cols = _get_varchar_date_columns_multi(relevant_tables)
@@ -1116,10 +1215,18 @@ def sql_writer(state: AnalyticsState) -> dict:
             f"  Use the RESOLVED column names verbatim in SQL.\n"
         )
 
+    # Include the CY period label explicitly so the LLM never has to guess it
+    cy_label = _get_niq_cy_label(relevant_tables[0]) if relevant_tables else None
+    cy_hint = (
+        f"\n📅 NIQ CY period label (use this literal string for WHERE \"Periods\" filter): "
+        f"'{cy_label}'\n"
+    ) if cy_label else ""
+
     prompt = (
         f"Sub-task: {resolved_step_desc}\n"
         f"User question: {resolved_query}\n"
         + alias_note
+        + cy_hint
         + f"\n=== SCHEMA (use these table/column names verbatim) ===\n"
         f"{schema_context}\n\n"
         + (f"{relationships_block}\n\n" if relationships_block else "")

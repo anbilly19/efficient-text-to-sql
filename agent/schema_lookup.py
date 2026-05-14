@@ -99,12 +99,29 @@ SCHEMA_CATALOG: dict[str, dict] = {
     "Penetration (%) vs. VJ (% Ver.)": {
         "en": "Penetration Change vs. Prior Year (%)",
         "category": "yoy",
-        "description": "% change in penetration vs. prior year. Range: -100% to +11,318%. Extreme positives = new launches.",
+        "description": (
+            "% change in penetration vs. prior year. Range: -100% to +11,318%. "
+            "Extreme positives = new launches. This column is PRECOMPUTED by NIQ — "
+            "select it directly with AVG(); never recompute via LAG() or CY minus PY."
+        ),
         "aliases": [
             "penetration growth", "penetration change", "YoY penetration",
             "veränderung penetration", "reach growth", "gained buyers",
-            "veränderung zum vorjahr penetration", "veränderung der penetration",
-            "reichweite wachstum", "käuferreichweite veränderung",
+            # full-phrase German variants (all word orders)
+            "veränderung zum vorjahr penetration",
+            "veränderung der penetration",
+            "veränderung zum vorjahr der penetration",
+            "penetration veränderung zum vorjahr",
+            "penetration änderung vorjahr",
+            "penetration yoy",
+            "yoy penetration change",
+            # bare YoY trigger phrases — these alone should resolve to this column
+            # when the context is clearly about penetration
+            "reichweite wachstum",
+            "käuferreichweite veränderung",
+            "käuferreichweite yoy",
+            "reichweite veränderung",
+            "reichweite änderung",
         ],
     },
     "Käuferhaushalte": {
@@ -151,7 +168,10 @@ SCHEMA_CATALOG: dict[str, dict] = {
         "en": "Purchase Frequency Change vs. Prior Year (%)",
         "category": "yoy",
         "description": "% change in purchase frequency vs. prior year. Mean: -3.4% (slight overall decline).",
-        "aliases": ["frequency change", "frequency growth", "buy more often", "frequenz veränderung"],
+        "aliases": [
+            "frequency change", "frequency growth", "buy more often", "frequenz veränderung",
+            "veränderung frequenz vorjahr", "frequenz yoy",
+        ],
     },
     "Anzahl Einkaufsakte": {
         "en": "Total Purchase Occasions (Current Year)",
@@ -176,12 +196,18 @@ SCHEMA_CATALOG: dict[str, dict] = {
         "en": "Total Purchase Occasions Change vs. Prior Year (%)",
         "category": "yoy",
         "description": "% change in total purchase volume vs. prior year. Mean: +37%.",
-        "aliases": ["volume growth", "occasion growth", "anzahl wachstum", "trip growth YoY", "volume change"],
+        "aliases": [
+            "volume growth", "occasion growth", "anzahl wachstum", "trip growth YoY", "volume change",
+            "veränderung anzahl vorjahr", "anzahl yoy",
+        ],
     },
     "Ausgaben pro Käuferhaushalt": {
         "en": "Spend per Buying Household € (Current Year)",
         "category": "metric",
-        "description": "Avg annual spend (€) per buying household in CY. Range: €0.01–€823. Key value/wallet metric.",
+        "description": (
+            "Avg annual spend (€) per buying household in CY. Range: €0.01–€823. Key value/wallet metric. "
+            "This is a PRE-AGGREGATED NIQ metric — use AVG() when grouping, never SUM()."
+        ),
         "aliases": [
             "spend per household", "average spend", "ausgaben", "wallet",
             "how much spent", "consumer value", "expenditure", "ausgaben haushalt",
@@ -194,6 +220,15 @@ SCHEMA_CATALOG: dict[str, dict] = {
         "category": "yoy",
         "description": "Avg annual spend per buying household in the prior year.",
         "aliases": ["spend VJ", "prior year spend", "ausgaben VJ", "last year spend"],
+    },
+    "Ausgaben pro Käuferhaushalt vs. VJ (% Ver.)": {
+        "en": "Spend per Buying Household Change vs. Prior Year (%)",
+        "category": "yoy",
+        "description": "% change in spend per buying household vs. prior year.",
+        "aliases": [
+            "spend growth", "spend change YoY", "ausgaben wachstum",
+            "veränderung ausgaben vorjahr", "ausgaben yoy",
+        ],
     },
     "Ausgaben pro Einkaufsakt": {
         "en": "Spend per Purchase Occasion € (Current Year)",
