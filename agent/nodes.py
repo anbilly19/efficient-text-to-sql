@@ -137,24 +137,56 @@ _NIQ_FILE_PATTERNS = re.compile(
 )
 
 # Regex: detects a resolved query that already contains a vs-VJ column name.
-# Handles: quoted or unquoted, with or without leading percent sign,
-# any unicode chars in the column name prefix.
-# Captures the full column name (without surrounding quotes if present).
 _YOY_COL_RE = re.compile(
     r'"([^"]*vs\.\s*VJ\s*\(%\s*Ver\.\))"'
     r'|([^\s"()]+\s+vs\.\s*VJ\s*\(%\s*Ver\.\))',
     re.IGNORECASE,
 )
 
+# Columns in NIQ tables that map common user terms -> real column name fragments
+_NIQ_METRIC_TERMS: dict[str, str] = {
+    "penetration":              "Penetration (%)",
+    "käuferreichweite":         "Penetration (%)",
+    "kaeuferreichweite":        "Penetration (%)",
+    "spend":                    "Ausgaben pro Käuferhaushalt",
+    "ausgaben":                 "Ausgaben pro Käuferhaushalt",
+    "frequency":                "Einkaufsakte pro Käuferhaushalt",
+    "einkaufsakte":             "Einkaufsakte pro Käuferhaushalt",
+    "käuferhaushalte":          "Käuferhaushalte",
+    "buyers":                   "Käuferhaushalte",
+}
+
+# Patterns that indicate "show distinct values in column X"
+_DISTINCT_VALUES_PATTERNS = re.compile(
+    r"\b(?:what|which|show|list)\b.{0,40}\b(?:periods?|values?|categories|options|available)\b"
+    r"|\b(?:periods?|values?|categories)\b.{0,30}\b(?:available|exist|loaded|in)\b",
+    re.IGNORECASE,
+)
+
+# NIQ column that corresponds to distinct-values queries for 'periods'
+_NIQ_PERIOD_COL = "Periods"
+
+# Patterns that indicate a grain / temporal granularity question
+_GRAIN_PATTERNS = re.compile(
+    r"\b(?:grain|granularity|temporal\s+grain|how\s+often|frequency\s+of\s+data"
+    r"|annual|monthly|quarterly|weekly)\b",
+    re.IGNORECASE,
+)
+
+# Patterns that indicate 'show all figures / values for <metric>' (round 6 bug 3)
+_ALL_FIGURES_PATTERNS = re.compile(
+    r"\b(?:show|give|list|all)\b.{0,30}\b(?:figures?|values?|data|numbers?)\b"
+    r"|\b(?:annual|yearly|all)\b.{0,20}\b(?:figures?|values?|penetration|spend|ausgaben)\b",
+    re.IGNORECASE,
+)
+
 
 def _is_niq_file(path: str, dataset_name: str) -> bool:
-    """Return True when the file path or dataset name looks like a NIQ panel extract."""
     combined = f"{path} {dataset_name}".lower()
     return bool(_NIQ_FILE_PATTERNS.search(combined))
 
 
 def _get_niq_cy_label(dataset_name: str) -> str | None:
-    """Look up the CY period label stored in _table_context for a NIQ table."""
     conn = get_connection()
     try:
         row = conn.execute(
@@ -170,22 +202,32 @@ def _get_niq_cy_label(dataset_name: str) -> str | None:
     return None
 
 
+def _get_niq_grain(dataset_name: str) -> str | None:
+    """Read NIQ grain from _table_context summary string."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT summary FROM _table_context WHERE dataset_name = ?",
+            [dataset_name],
+        ).fetchone()
+        if row and row[0]:
+            m = re.search(r"grain[=:\s]+([\w\s]+?)(?:\||$)", row[0], re.IGNORECASE)
+            if m:
+                return m.group(1).strip()
+    except Exception:
+        pass
+    return None
+
+
 def _niq_yoy_fast_path(
     resolved_query: str,
     dataset_name: str,
 ) -> str | None:
-    """Return a ready-made SQL string when the resolved query names a vs-VJ column.
-
-    This bypasses LLM SQL generation entirely for YoY-delta questions, which
-    the LLM consistently gets wrong by using LAG() or omitting GROUP BY.
-
-    Returns None when the fast-path does not apply.
-    """
+    """Return ready-made SQL for YoY-delta questions. Bypasses LLM."""
     m = _YOY_COL_RE.search(resolved_query)
     if not m:
         return None
 
-    # Group 1 = quoted match, group 2 = unquoted match
     yoy_col = (m.group(1) or m.group(2) or "").strip()
     if not yoy_col:
         return None
@@ -194,26 +236,24 @@ def _niq_yoy_fast_path(
     if not cy_label:
         return None
 
-    # Determine which dimension columns are also mentioned in the query
     dimension_cols = []
     q_lower = resolved_query.lower()
     dim_map = {
-        "Products": ["product", "products", "marke", "brand", "artikel", "produkt", "sku"],
-        "Retailers": ["retailer", "retailers", "händler", "store", "shop", "kanal"],
-        "People": ["people", "panel group"],
+        "Products":     ["product", "products", "marke", "brand", "artikel", "produkt", "sku"],
+        "Retailers":    ["retailer", "retailers", "händler", "store", "shop", "kanal"],
+        "People":       ["people", "panel group"],
         "Demographics": ["demographics", "segment"],
-        "Geographies": ["geograph", "region", "market"],
+        "Geographies":  ["geograph", "region", "market"],
     }
     for col, keywords in dim_map.items():
         if any(kw in q_lower for kw in keywords):
             dimension_cols.append(col)
 
-    # Default: show Products if no specific dimension requested
     if not dimension_cols:
         dimension_cols = ["Products"]
 
     select_dims = ", ".join(f'"{c}"' for c in dimension_cols)
-    group_by = ", ".join(f'"{c}"' for c in dimension_cols)
+    group_by    = ", ".join(f'"{c}"' for c in dimension_cols)
 
     sql = (
         f'SELECT {select_dims},\n'
@@ -227,12 +267,142 @@ def _niq_yoy_fast_path(
     return sql
 
 
-def _select_relevant_tables(user_query: str, all_tables: list[str]) -> list[str]:
-    """Select tables needed for *user_query* using _table_context keyword scoring.
+def _niq_metric_fastpath(user_query: str, dataset_name: str) -> str | None:
+    """Return SQL for 'show all figures for <metric>' on a NIQ table.
 
-    NIQ-tagged tables receive a +2 bonus when the query contains NIQ-domain
-    terminology so that panel datasets win over generic fact tables.
+    Detects metric terms in the user query, looks up the real column name
+    from _column_catalog, and emits a properly grouped CY-filtered SELECT.
+    Returns None when the fast-path does not apply.
     """
+    if not _ALL_FIGURES_PATTERNS.search(user_query):
+        return None
+
+    cy_label = _get_niq_cy_label(dataset_name)
+    if not cy_label:
+        return None
+
+    q_lower = user_query.lower()
+
+    # Find which NIQ metric term the user mentioned
+    metric_col_fragment: str | None = None
+    for term, col_fragment in _NIQ_METRIC_TERMS.items():
+        if term in q_lower:
+            metric_col_fragment = col_fragment
+            break
+
+    if not metric_col_fragment:
+        return None
+
+    # Resolve exact column name from catalog
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT column_name FROM _column_catalog WHERE dataset_name = ?",
+            [dataset_name],
+        ).fetchall()
+    except Exception:
+        return None
+
+    exact_col: str | None = None
+    for (col,) in rows:
+        if metric_col_fragment.lower() in col.lower():
+            # Prefer the plain metric (not a vs-VJ variant)
+            if "vs." not in col and "VJ" not in col:
+                exact_col = col
+                break
+
+    if not exact_col:
+        return None
+
+    sql = (
+        f'SELECT "Products",\n'
+        f'       AVG("{exact_col}") AS metric_value\n'
+        f'FROM "{dataset_name}"\n'
+        f"WHERE \"Periods\" = '{cy_label}'\n"
+        f'  AND "{exact_col}" IS NOT NULL\n'
+        f'GROUP BY "Products"\n'
+        f'ORDER BY metric_value DESC'
+    )
+    return sql
+
+
+def _detect_distinct_values_intent(text: str, all_tables: list[str]) -> tuple[str, str] | None:
+    """Return (table_name, column_name) when the query asks for distinct values in a column.
+
+    Specifically handles 'what periods are available in <table>' style queries.
+    Returns None when the pattern does not match.
+    """
+    if not _DISTINCT_VALUES_PATTERNS.search(text):
+        return None
+
+    text_lower = text.lower()
+
+    # Identify the table
+    target_table: str | None = None
+    for t in all_tables:
+        if t.lower() in text_lower:
+            target_table = t
+            break
+
+    if target_table is None:
+        # Fall through — not a table-specific distinct values query
+        return None
+
+    # Identify the column — currently only 'periods' supported
+    if "period" in text_lower:
+        return (target_table, _NIQ_PERIOD_COL)
+
+    return None
+
+
+def _detect_grain_intent(text: str) -> bool:
+    return bool(_GRAIN_PATTERNS.search(text))
+
+
+def _build_grain_reply(query: str, all_tables: list[str]) -> str | None:
+    """Return a grain answer sourced from _table_context. Returns None if no grain found."""
+    text_lower = query.lower()
+
+    # Identify which table the user is asking about
+    target_table: str | None = None
+    for t in all_tables:
+        if t.lower() in text_lower:
+            target_table = t
+            break
+    if target_table is None and all_tables:
+        target_table = all_tables[-1]  # most recently loaded
+
+    if not target_table:
+        return None
+
+    grain = _get_niq_grain(target_table)
+    cy_label = _get_niq_cy_label(target_table)
+
+    if grain:
+        cy_note = f" Current year period label: `{cy_label}`" if cy_label else ""
+        return (
+            f"The grain of **{target_table}** is **{grain}** (sourced from `_table_context`).{cy_note}"
+        )
+
+    # Grain not stored — fall back to inspecting Periods column
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            f'SELECT DISTINCT "Periods" FROM "{target_table}" ORDER BY 1'
+        ).fetchall()
+        if rows:
+            period_vals = ", ".join(f"`{r[0]}`" for r in rows)
+            return (
+                f"The grain of **{target_table}** could not be determined from metadata. "
+            f"Available period values: {period_vals}"
+            )
+    except Exception:
+        pass
+
+    return None
+
+
+def _select_relevant_tables(user_query: str, all_tables: list[str]) -> list[str]:
     if len(all_tables) <= 1:
         return all_tables
 
@@ -918,7 +1088,30 @@ def orchestrator(state: AnalyticsState) -> dict:
             reply = f"Here are all loaded tables:\n\n```\n{tables_summary}\n```"
         return {**base_reset, "final_answer": reply, "messages": [AIMessage(content=reply)]}
 
-    # ── Fast-path 3: META — agent-state questions ──────────────────────────
+    # ── Fast-path 3: distinct column values (e.g. 'what periods are available') ──
+    distinct_match = _detect_distinct_values_intent(current_query, all_tables)
+    if distinct_match:
+        tbl, col = distinct_match
+        sql = f'SELECT DISTINCT "{col}" FROM "{tbl}" ORDER BY 1'
+        result_raw = run_sql.invoke({"query": sql})
+        if result_raw.startswith("ERROR"):
+            reply = f"❌ Could not retrieve distinct values: {result_raw}"
+        else:
+            parsed_rows = json.loads(result_raw).get("rows", [])
+            vals = [str(r.get(col, "")) for r in parsed_rows]
+            reply = (
+                f"Available values for **{col}** in `{tbl}`:\n\n"
+                + "\n".join(f"  • `{v}`" for v in vals)
+            )
+        return {**base_reset, "final_answer": reply, "messages": [AIMessage(content=reply)]}
+
+    # ── Fast-path 4: grain / temporal granularity question ─────────────────
+    if _detect_grain_intent(current_query) and all_tables:
+        grain_reply = _build_grain_reply(current_query, all_tables)
+        if grain_reply:
+            return {**base_reset, "final_answer": grain_reply, "messages": [AIMessage(content=grain_reply)]}
+
+    # ── Fast-path 5: META — agent-state questions ──────────────────────────
     if _detect_meta_intent(current_query):
         reply = _build_meta_reply(current_query, all_tables)
         return {**base_reset, "final_answer": reply, "messages": [AIMessage(content=reply)]}
@@ -1106,11 +1299,10 @@ def sql_writer(state: AnalyticsState) -> dict:
     resolved_step_desc = _resolve_niq_aliases(step.description, relevant_tables)
 
     # ------------------------------------------------------------------
-    # NIQ YoY fast-path: when the resolved query already contains a
-    # "vs. VJ (% Ver.)" column name, emit correct SQL directly without
-    # involving the LLM.
+    # NIQ fast-paths (retry_count == 0 only)
     # ------------------------------------------------------------------
     if relevant_tables and state.retry_count == 0:
+        # Fast-path A: YoY delta column detected in resolved query
         fast_sql = _niq_yoy_fast_path(resolved_query, relevant_tables[0])
         if fast_sql:
             updated_plan = [
@@ -1119,6 +1311,20 @@ def sql_writer(state: AnalyticsState) -> dict:
             ]
             return {
                 "last_sql": fast_sql,
+                "plan": updated_plan,
+                "verification_feedback": "",
+                "current_step": step,
+            }
+
+        # Fast-path B: 'show all figures for <metric>' query
+        metric_sql = _niq_metric_fastpath(state.user_query, relevant_tables[0])
+        if metric_sql:
+            updated_plan = [
+                s.model_copy(update={"status": "running"}) if s.id == step.id else s
+                for s in state.plan
+            ]
+            return {
+                "last_sql": metric_sql,
                 "plan": updated_plan,
                 "verification_feedback": "",
                 "current_step": step,
