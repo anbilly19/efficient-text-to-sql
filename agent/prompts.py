@@ -66,17 +66,34 @@ Output a single JSON object:
   or substitute synonyms.
 
 ── NIQ panel rules (apply when table has a "Periods" column) ────────
-- YoY delta columns have names ending in "vs. VJ (% Ver.)". These columns only
-  contain real values for the CURRENT YEAR period row. When selecting a YoY delta
-  column, ALWAYS add a WHERE filter:
+
+A. YoY delta columns (names ending in "vs. VJ (% Ver.)"):
+- These columns only contain real values for the CURRENT YEAR period row.
+- When selecting a YoY delta column, ALWAYS filter:
     WHERE "Periods" = '<cy_period_label>'
-  where <cy_period_label> is the CY period string shown in the schema or alias note
-  (e.g. 'Letzte 12 M - 52 W bis 28/12/25'). Never return both period rows for a
-  YoY delta column — the PY row is always NULL by construction.
-- The column "Penetration (%) vs. VJ (% Ver.)" is the YoY change in penetration.
-  Select it directly; do not compute it manually from CY and PY columns.
-- "Ausgaben pro Käuferhaushalt" is spend per buying household — it is NOT a column
-  called buyer_id, spend_id, or any other invented name.
+  Use the CY period string from the schema or alias note
+  (e.g. 'Letzte 12 M - 52 W bis 28/12/25').
+- Never return both period rows for a YoY delta — the PY row is always NULL.
+- "Penetration (%) vs. VJ (% Ver.)" is the direct YoY penetration change column;
+  select it as-is, never recompute it from CY minus PY.
+
+B. NIQ pre-aggregated metrics — aggregation rules (CRITICAL):
+- Columns whose names begin with "Ausgaben pro", "Einkaufsakte pro", or
+  "Penetration (%)" are ALREADY normalised per-unit values computed by NIQ.
+  They must be aggregated with AVG(), never with SUM().
+- NEVER compute SUM(metric) / COUNT(dimension) to derive a per-unit figure;
+  these metrics are pre-divided by NIQ. Use AVG() across rows instead.
+- "Käuferhaushalte" is a COUNT of households — it is NOT an ID column.
+  NEVER use COUNT(DISTINCT "Käuferhaushalte"); use SUM("Käuferhaushalte") to
+  total up buying households, or AVG() if averaging across rows.
+- Correct pattern for "spend per buyer by retailer":
+    SELECT "Retailers", AVG("Ausgaben pro Käuferhaushalt") AS avg_spend_per_buyer
+    FROM niq_panel
+    WHERE "Periods" = '<cy_label>'
+    GROUP BY "Retailers"
+    ORDER BY avg_spend_per_buyer DESC
+- "Ausgaben pro Käuferhaushalt" is spend per buying household.
+  It is NOT called buyer_id, spend_id, or any other invented name.
 
 ── DuckDB dialect rules ─────────────────────────────────────────────
 - Use DuckDB-native functions: STRFTIME, DATE_TRUNC, EPOCH, LIST_AGG, PIVOT, etc.
@@ -97,7 +114,7 @@ Output a single JSON object:
 - Never CROSS JOIN unless the task explicitly requires it.
 - Always alias both tables: FROM sales1000 s JOIN sales_rep_targets t ON ...
 
-── DATE HANDLING (critical) ──────────────────────────────────────────────
+── DATE HANDLING (critical) ─────────────────────────────────────────────
 - If the column type is TIMESTAMP or DATE: use YEAR(col), MONTH(col),
   DATE_TRUNC('month', col) directly.
 - If the column type is VARCHAR storing dates (e.g. '2023-06-13'):
@@ -140,6 +157,10 @@ Verification checklist:
    that adds the CY period filter (use the period label visible in the result rows).
 9. Invented columns: if the SQL references a column name not present in the schema
    (e.g. buyer_id), set verdict=fail with corrected_sql using the correct schema column.
+10. NIQ aggregation: if the SQL aggregates a NIQ per-unit metric (column starting with
+    "Ausgaben pro", "Einkaufsakte pro", or "Penetration (%)") using SUM() or
+    SUM(metric)/COUNT(something), set verdict=fail. The correct aggregation is AVG().
+    Provide corrected_sql replacing the wrong aggregate with AVG().
 
 Never fabricate data. Do not call any tools in this node.
 """
