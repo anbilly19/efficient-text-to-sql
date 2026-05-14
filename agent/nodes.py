@@ -175,6 +175,69 @@ _ALL_FIGURES_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
+# Dimension columns to highlight in empty-SQL suggestions (ordered by importance)
+_NIQ_DIMENSION_COLS = ["Products", "Retailers", "Demographics", "Geographies", "People", "Periods"]
+
+
+def _build_empty_sql_message(explanation: str, user_query: str, all_tables: list[str]) -> str:
+    """Build a friendly, informative message when sql_writer returns empty SQL."""
+    # Extract the concept the user asked for from the explanation
+    concept_match = re.search(r"matching ['\"]?([\w\s]+)['\"]?", explanation, re.IGNORECASE)
+    concept = concept_match.group(1).strip() if concept_match else ""
+
+    # Collect dimension columns from the most relevant table
+    conn = get_connection()
+    dim_cols: list[str] = []
+    metric_cols: list[str] = []
+    table_used: str = ""
+    for tbl in all_tables:
+        if tbl.lower() in user_query.lower() or not table_used:
+            table_used = tbl
+            try:
+                rows = conn.execute(
+                    "SELECT column_name FROM _column_catalog "
+                    "WHERE dataset_name = ? ORDER BY column_name",
+                    [tbl],
+                ).fetchall()
+                all_cols = [r[0] for r in rows]
+                dim_cols = [c for c in _NIQ_DIMENSION_COLS if c in all_cols]
+                metric_cols = [
+                    c for c in all_cols
+                    if c not in _NIQ_DIMENSION_COLS
+                    and "VJ" not in c
+                    and "vs." not in c
+                ][:4]
+            except Exception:
+                pass
+            break
+
+    lines: list[str] = []
+    if concept and table_used:
+        lines.append(
+            f"❌ **`{table_used}` doesn't contain a column matching '{concept}'.** "
+            f"This table is a household panel dataset — it has no transactional records "
+            f"(no customer IDs, invoice numbers, order IDs, or store IDs)."
+        )
+    elif explanation:
+        lines.append(f"❌ {explanation}")
+    else:
+        lines.append("❌ I couldn't generate a query for that question.")
+
+    if dim_cols:
+        lines.append(f"\n**Available dimensions:** {', '.join(f'`{c}`' for c in dim_cols)}")
+    if metric_cols:
+        lines.append(f"**Available metrics:** {', '.join(f'`{c}`' for c in metric_cols)}")
+
+    if table_used and dim_cols and metric_cols:
+        lines.append(
+            f"\n💡 Try asking:\n"
+            f"  • *Top {dim_cols[0].lower()} by {metric_cols[0]}*\n"
+            + (f"  • *{metric_cols[0]} by {dim_cols[1].lower()}*\n" if len(dim_cols) > 1 else "")
+            + f"  • *Penetration (%) by {dim_cols[0].lower()}*"
+        )
+
+    return "\n".join(lines)
+
 
 def _infer_niq_grain(cy_label: str) -> str:
     """Derive a human-readable grain string from the NIQ CY period label."""
@@ -220,11 +283,9 @@ def _get_niq_grain(dataset_name: str) -> str | None:
             [dataset_name],
         ).fetchone()
         if row and row[0]:
-            # Try explicit grain= key first
             m = re.search(r"grain='([^']+)'", row[0], re.IGNORECASE)
             if m and m.group(1).lower() != "detected":
                 return m.group(1).strip()
-            # Fall back: infer from CY label stored in same summary
             cy_m = re.search(r"CY='([^']+)'", row[0])
             if cy_m:
                 inferred = _infer_niq_grain(cy_m.group(1))
@@ -354,7 +415,6 @@ def _build_grain_reply(query: str, all_tables: list[str]) -> str | None:
         cy_note = f" Current year period label: `{cy_label}`" if cy_label else ""
         return f"The grain of **{target_table}** is **{grain}** (sourced from `_table_context`).{cy_note}"
 
-    # Absolute fallback: inspect Periods column
     conn = get_connection()
     try:
         rows = conn.execute(
@@ -941,6 +1001,13 @@ def orchestrator(state: AnalyticsState) -> dict:
         all_failed = all(s.status == "failed" for s in state.plan)
         if all_failed:
             err = state.error or "The query could not be executed."
+
+            # Empty-SQL path: sql_writer declined to generate SQL
+            if err and "empty SQL" in err.lower() or (state.last_sql == ""):
+                explanation = err if "No column matching" in err else ""
+                friendly = _build_empty_sql_message(explanation, state.user_query, all_tables)
+                return {**base_reset, "final_answer": friendly, "messages": [AIMessage(content=friendly)]}
+
             binder_msg = _build_binder_error_message(err, state.last_sql or "")
             if binder_msg:
                 return {**base_reset, "final_answer": binder_msg, "messages": [AIMessage(content=binder_msg)]}
@@ -1147,7 +1214,6 @@ def load_file_node(state: AnalyticsState) -> dict:
             grain_match = re.search(r"NIQ grain:\s*([^|]+)", result)
             raw_grain = grain_match.group(1).strip() if grain_match else "detected"
 
-            # Infer grain from CY period label when loader returns 'detected'
             if raw_grain.lower() == "detected":
                 cy_match = re.search(r"CY='([^']+)'", result)
                 if cy_match:
@@ -1166,7 +1232,6 @@ def load_file_node(state: AnalyticsState) -> dict:
                 f"e.g. *Käuferreichweite*, *penetration*, *spend per buyer*, *YoY change*."
             )
 
-            # Persist inferred grain back to _table_context so _get_niq_grain() finds it
             try:
                 conn = get_connection()
                 row = conn.execute(
@@ -1368,7 +1433,6 @@ def sql_writer(state: AnalyticsState) -> dict:
                 break
 
     if not sql or not sql.strip():
-        # sql_writer returned empty SQL (e.g. concept not found in schema)
         explanation = parsed.get("explanation", "")
         updated_plan = [
             s.model_copy(update={"status": "failed", "result": explanation or "sql_writer produced empty SQL"})
