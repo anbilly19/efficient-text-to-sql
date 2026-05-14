@@ -340,16 +340,16 @@ _META_PATTERNS = [
 
 # DuckDB "table not found" — covers quoted/unquoted identifiers and truncated form
 _TABLE_NOT_FOUND_RE = re.compile(
-    r'(?:Table with name|Table|Catalog Error.*?table)\s+["\']?([\w]+)["\']?\s+does not exist'
-    r'|(?:relation|table)\s+["\']?([\w.]+)["\']?\s+does not exist'
+    r'(?:Table with name|Table|Catalog Error.*?table)\s+["\'']?([\w]+)["\'']?\s+does not exist'
+    r'|(?:relation|table)\s+["\'']?([\w.]+)["\'']?\s+does not exist'
     r'|([\w"]+)\s+not exist',
     re.IGNORECASE,
 )
 
 # DuckDB Binder Error — column referenced in SQL doesn't exist in the FROM clause.
 _BINDER_ERROR_RE = re.compile(
-    r'Binder Error[:\s]+Referenced column\s+["\']?([\w ]+)["\']?\s+not found'
-    r'|Binder Error[:\s]+.*?Column[\s]+["\']?([\w ]+)["\']?\s+not found',
+    r'Binder Error[:\s]+Referenced column\s+["\'']?([\w ]+)["\'']?\s+not found'
+    r'|Binder Error[:\s]+.*?Column[\s]+["\'']?([\w ]+)["\'']?\s+not found',
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -452,6 +452,44 @@ def _resolve_user_query(state: AnalyticsState) -> str:
     if state.user_query and state.user_query.strip():
         return state.user_query.strip()
     return ""
+
+
+# ---------------------------------------------------------------------------
+# NIQ alias resolution
+# ---------------------------------------------------------------------------
+
+def _resolve_niq_aliases(text: str, dataset_names: list[str]) -> str:
+    """Replace NIQ semantic-map terms in *text* with their real column names.
+
+    Queries _semantic_map for every dataset in *dataset_names*, then does a
+    case-insensitive, longest-term-first substitution so that e.g.
+    'Ausgaben je Käufer' is replaced before the shorter token 'Käufer'.
+
+    Returns the rewritten text (unchanged if no aliases match or on any error).
+    """
+    if not text or not dataset_names:
+        return text
+
+    conn = get_connection()
+    try:
+        placeholders = ", ".join("?" * len(dataset_names))
+        rows = conn.execute(
+            f"SELECT term, column_name FROM _semantic_map "
+            f"WHERE dataset_name IN ({placeholders}) "
+            f"ORDER BY LENGTH(term) DESC",
+            dataset_names,
+        ).fetchall()
+    except Exception:
+        return text
+
+    resolved = text
+    for term, col_name in rows:
+        if not term or not col_name:
+            continue
+        pattern = re.compile(re.escape(term), re.IGNORECASE)
+        resolved = pattern.sub(col_name, resolved)
+
+    return resolved
 
 
 # ---------------------------------------------------------------------------
@@ -1001,6 +1039,14 @@ def sql_writer(state: AnalyticsState) -> dict:
     if not relevant_tables:
         relevant_tables = [_most_recent_table()] if _most_recent_table() else all_tables
 
+    # ------------------------------------------------------------------
+    # NIQ alias resolution: replace German/English semantic-map terms
+    # (e.g. Käuferreichweite, Ausgaben je Käufer) with their exact
+    # DuckDB column names BEFORE the LLM generates SQL.
+    # ------------------------------------------------------------------
+    resolved_query = _resolve_niq_aliases(state.user_query, relevant_tables)
+    resolved_step_desc = _resolve_niq_aliases(step.description, relevant_tables)
+
     schema_context = get_schema_context(relevant_tables)
     cast_warnings = _get_date_cast_warnings(relevant_tables)
     varchar_date_cols = _get_varchar_date_columns_multi(relevant_tables)
@@ -1008,7 +1054,7 @@ def sql_writer(state: AnalyticsState) -> dict:
 
     keywords = [
         w
-        for w in re.findall(r"[a-zA-Z]{4,}", state.user_query.lower())
+        for w in re.findall(r"[a-zA-Z]{4,}", resolved_query.lower())
         if w
         not in {
             "what", "show", "list", "give", "find", "from", "that", "this",
@@ -1048,10 +1094,22 @@ def sql_writer(state: AnalyticsState) -> dict:
         if s.status == "done" and s.result and s.id != step.id
     )
 
+    # Show the resolved query if it differs from the original so the LLM
+    # always uses canonical column names, never raw German aliases.
+    alias_note = ""
+    if resolved_query != state.user_query:
+        alias_note = (
+            f"\n⚠️  NIQ alias resolution applied:\n"
+            f"  Original : {state.user_query}\n"
+            f"  Resolved : {resolved_query}\n"
+            f"  Use the RESOLVED column names verbatim in SQL.\n"
+        )
+
     prompt = (
-        f"Sub-task: {step.description}\n"
-        f"User question: {state.user_query}\n\n"
-        f"=== SCHEMA (use these table/column names verbatim) ===\n"
+        f"Sub-task: {resolved_step_desc}\n"
+        f"User question: {resolved_query}\n"
+        + alias_note
+        + f"\n=== SCHEMA (use these table/column names verbatim) ===\n"
         f"{schema_context}\n\n"
         + (f"{relationships_block}\n\n" if relationships_block else "")
         + (f"{semantic_context}\n\n" if semantic_context else "")
