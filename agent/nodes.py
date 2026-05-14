@@ -340,16 +340,16 @@ _META_PATTERNS = [
 
 # DuckDB "table not found" — covers quoted/unquoted identifiers and truncated form
 _TABLE_NOT_FOUND_RE = re.compile(
-    r'(?:Table with name|Table|Catalog Error.*?table)\s+["\'']?([\w]+)["\'']?\s+does not exist'
-    r'|(?:relation|table)\s+["\'']?([\w.]+)["\'']?\s+does not exist'
+    r'(?:Table with name|Table|Catalog Error.*?table)\s+["\']?([\w]+)["\']?\s+does not exist'
+    r'|(?:relation|table)\s+["\']?([\w.]+)["\']?\s+does not exist'
     r'|([\w"]+)\s+not exist',
     re.IGNORECASE,
 )
 
 # DuckDB Binder Error — column referenced in SQL doesn't exist in the FROM clause.
 _BINDER_ERROR_RE = re.compile(
-    r'Binder Error[:\s]+Referenced column\s+["\'']?([\w ]+)["\'']?\s+not found'
-    r'|Binder Error[:\s]+.*?Column[\s]+["\'']?([\w ]+)["\'']?\s+not found',
+    r'Binder Error[:\s]+Referenced column\s+["\']?([\w ]+)["\']?\s+not found'
+    r'|Binder Error[:\s]+.*?Column[\s]+["\']?([\w ]+)["\']?\s+not found',
     re.IGNORECASE | re.DOTALL,
 )
 
