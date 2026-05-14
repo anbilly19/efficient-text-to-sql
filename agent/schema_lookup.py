@@ -71,7 +71,7 @@ SCHEMA_CATALOG: dict[str, dict] = {
         "description": "Retail channel or store (9 unique values: e.g. Rewe, Edeka, Amazon, Zooplus).",
         "aliases": [
             "retailer", "store", "channel", "shop", "where bought",
-            "h\u00e4ndler", "kanal", "online", "offline",
+            "händler", "kanal", "online", "offline",
         ],
     },
     "Penetration (%)": {
@@ -79,18 +79,22 @@ SCHEMA_CATALOG: dict[str, dict] = {
         "category": "metric",
         "description": (
             "% of all German households that bought this product/retailer in the current 12-month period. "
-            "Range: ~0\u201312.9%. Core reach KPI."
+            "Range: ~0–12.9%. Core reach KPI. Also referred to as Käuferreichweite in German NIQ reports."
         ),
         "aliases": [
             "penetration", "reach", "how many households bought", "buyer rate",
             "market penetration", "household share", "penetrationsrate", "% haushalte",
+            "käuferreichweite", "kaeuferreichweite", "buyer reach", "reichweite",
         ],
     },
     "Penetration (%) VJ": {
         "en": "Penetration Rate % (Prior Year)",
         "category": "yoy",
         "description": "Penetration rate for the prior year. Baseline for YoY reach comparison.",
-        "aliases": ["penetration VJ", "prior year penetration", "last year penetration", "vorjahr penetration"],
+        "aliases": [
+            "penetration VJ", "prior year penetration", "last year penetration",
+            "vorjahr penetration", "käuferreichweite VJ", "reichweite VJ",
+        ],
     },
     "Penetration (%) vs. VJ (% Ver.)": {
         "en": "Penetration Change vs. Prior Year (%)",
@@ -98,36 +102,38 @@ SCHEMA_CATALOG: dict[str, dict] = {
         "description": "% change in penetration vs. prior year. Range: -100% to +11,318%. Extreme positives = new launches.",
         "aliases": [
             "penetration growth", "penetration change", "YoY penetration",
-            "ver\u00e4nderung penetration", "reach growth", "gained buyers",
+            "veränderung penetration", "reach growth", "gained buyers",
+            "veränderung zum vorjahr penetration", "veränderung der penetration",
+            "reichweite wachstum", "käuferreichweite veränderung",
         ],
     },
-    "K\u00e4uferhaushalte": {
+    "Käuferhaushalte": {
         "en": "Buying Households (Current Year)",
         "category": "metric",
-        "description": "Absolute number of German households that bought this product at this retailer (CY). Range: 61\u20135.4M.",
+        "description": "Absolute number of German households that bought this product at this retailer (CY). Range: 61–5.4M.",
         "aliases": [
-            "buying households", "buyers", "households", "k\u00e4ufer", "haushalt",
-            "how many buyers", "buyer count", "anzahl k\u00e4ufer", "kaufer",
+            "buying households", "buyers", "households",
+            "how many buyers", "buyer count", "anzahl käufer", "kaufer",
         ],
     },
-    "K\u00e4uferhaushalte VJ": {
+    "Käuferhaushalte VJ": {
         "en": "Buying Households (Prior Year)",
         "category": "yoy",
         "description": "Number of buying households in the prior year. Baseline for YoY buyer count comparison.",
-        "aliases": ["buyers last year", "prior year buyers", "vorjahr k\u00e4ufer", "k\u00e4ufer VJ"],
+        "aliases": ["buyers last year", "prior year buyers", "vorjahr käufer", "käufer VJ"],
     },
-    "K\u00e4uferhaushalte vs. VJ (% Ver.)": {
+    "Käuferhaushalte vs. VJ (% Ver.)": {
         "en": "Buying Households Change vs. Prior Year (%)",
         "category": "yoy",
         "description": "% change in absolute buying household count vs. prior year.",
-        "aliases": ["buyer growth", "household growth", "more buyers", "k\u00e4ufer wachstum", "buyer change YoY"],
+        "aliases": ["buyer growth", "household growth", "more buyers", "käufer wachstum", "buyer change YoY"],
     },
-    "Einkaufsakte pro K\u00e4uferhaushalt": {
+    "Einkaufsakte pro Käuferhaushalt": {
         "en": "Purchase Frequency per Buying Household (CY)",
         "category": "metric",
         "description": (
             "Avg number of purchase occasions per buying household in the current period. "
-            "Range: 1\u201324. High value = repeat buying / loyalty."
+            "Range: 1–24. High value = repeat buying / loyalty."
         ),
         "aliases": [
             "purchase frequency", "buy frequency", "occasions", "trips",
@@ -135,24 +141,24 @@ SCHEMA_CATALOG: dict[str, dict] = {
             "einkaufsakte", "frequency",
         ],
     },
-    "Einkaufsakte pro K\u00e4uferhaushalt VJ": {
+    "Einkaufsakte pro Käuferhaushalt VJ": {
         "en": "Purchase Frequency per Buying Household (Prior Year)",
         "category": "yoy",
         "description": "Purchase frequency per buying household in the prior year.",
         "aliases": ["frequency VJ", "prior year frequency", "frequenz VJ", "vorjahr frequenz"],
     },
-    "Einkaufsakte pro K\u00e4uferhaushalt vs. VJ (% Ver.)": {
+    "Einkaufsakte pro Käuferhaushalt vs. VJ (% Ver.)": {
         "en": "Purchase Frequency Change vs. Prior Year (%)",
         "category": "yoy",
         "description": "% change in purchase frequency vs. prior year. Mean: -3.4% (slight overall decline).",
-        "aliases": ["frequency change", "frequency growth", "buy more often", "frequenz ver\u00e4nderung"],
+        "aliases": ["frequency change", "frequency growth", "buy more often", "frequenz veränderung"],
     },
     "Anzahl Einkaufsakte": {
         "en": "Total Purchase Occasions (Current Year)",
         "category": "metric",
         "description": (
             "Total purchase trips for this product/retailer in CY. "
-            "= K\u00e4uferhaushalte \u00d7 Einkaufsakte per household. Range: 61\u201350M."
+            "= Käuferhaushalte × Einkaufsakte per household. Range: 61–50M."
         ),
         "aliases": [
             "total occasions", "total trips", "total purchases", "volume",
@@ -172,26 +178,27 @@ SCHEMA_CATALOG: dict[str, dict] = {
         "description": "% change in total purchase volume vs. prior year. Mean: +37%.",
         "aliases": ["volume growth", "occasion growth", "anzahl wachstum", "trip growth YoY", "volume change"],
     },
-    "Ausgaben pro K\u00e4uferhaushalt": {
-        "en": "Spend per Buying Household \u20ac (Current Year)",
+    "Ausgaben pro Käuferhaushalt": {
+        "en": "Spend per Buying Household € (Current Year)",
         "category": "metric",
-        "description": "Avg annual spend (\u20ac) per buying household in CY. Range: \u20ac0.01\u2013\u20ac823. Key value/wallet metric.",
+        "description": "Avg annual spend (€) per buying household in CY. Range: €0.01–€823. Key value/wallet metric.",
         "aliases": [
             "spend per household", "average spend", "ausgaben", "wallet",
             "how much spent", "consumer value", "expenditure", "ausgaben haushalt",
-            "spend", "euro per buyer", "\u20ac per buyer",
+            "spend", "euro per buyer", "€ per buyer",
+            "ausgaben je käufer", "ausgaben pro käufer", "spend per buyer",
         ],
     },
-    "Ausgaben pro K\u00e4uferhaushalt VJ": {
-        "en": "Spend per Buying Household \u20ac (Prior Year)",
+    "Ausgaben pro Käuferhaushalt VJ": {
+        "en": "Spend per Buying Household € (Prior Year)",
         "category": "yoy",
         "description": "Avg annual spend per buying household in the prior year.",
         "aliases": ["spend VJ", "prior year spend", "ausgaben VJ", "last year spend"],
     },
     "Ausgaben pro Einkaufsakt": {
-        "en": "Spend per Purchase Occasion \u20ac (Current Year)",
+        "en": "Spend per Purchase Occasion € (Current Year)",
         "category": "metric",
-        "description": "Avg basket value (\u20ac) per individual purchase trip in CY. Range: \u20ac0.01\u2013\u20ac227.88. Mean: ~\u20ac10.",
+        "description": "Avg basket value (€) per individual purchase trip in CY. Range: €0.01–€227.88. Mean: ~€10.",
         "aliases": [
             "basket size", "spend per trip", "spend per occasion", "price per purchase",
             "basket value", "korb", "ausgaben akt", "how much per visit", "ticket size",
@@ -199,7 +206,7 @@ SCHEMA_CATALOG: dict[str, dict] = {
         ],
     },
     "Ausgaben pro Einkaufsakt VJ": {
-        "en": "Spend per Purchase Occasion \u20ac (Prior Year)",
+        "en": "Spend per Purchase Occasion € (Prior Year)",
         "category": "yoy",
         "description": "Avg basket value per purchase occasion in the prior year.",
         "aliases": ["basket VJ", "prior year basket", "ausgaben akt VJ", "spend per trip last year"],
