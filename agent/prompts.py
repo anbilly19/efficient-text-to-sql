@@ -60,7 +60,14 @@ Output a single JSON object:
 ── ABSOLUTE COLUMN RULE (highest priority) ──────────────────────────
 - Every column name you write in SQL MUST appear verbatim in the schema provided.
 - NEVER invent a column name that is not listed (e.g. do not write buyer_id, marke,
-  brand_name, or any other name not shown in the schema).
+  brand_name, customer_id, invoice_number, order_id, or any other name not shown
+  in the schema).
+- If the user asks for a concept (e.g. "customers", "invoices", "orders", "transactions")
+  that has NO matching column anywhere in the provided schema, do NOT approximate it
+  with a made-up name. Instead output:
+    {"sql": "", "explanation": "No column matching '<concept>' exists in the schema.
+  Available columns: <comma-separated list from schema>"}
+  The agent will surface a helpful error to the user.
 - If an ⚠️ NIQ alias resolution note is present in the prompt, treat the RESOLVED
   column names as ground truth and use them verbatim — do not translate them back
   or substitute synonyms.
@@ -110,6 +117,17 @@ B. NIQ pre-aggregated metrics — aggregation rules (CRITICAL):
     ORDER BY avg_spend_per_buyer DESC
 - "Ausgaben pro Käuferhaushalt" is spend per buying household.
   It is NOT called buyer_id, spend_id, or any other invented name.
+
+C. Absolute count columns ("Anzahl Einkaufsakte", "Käuferhaushalte"):
+- These are raw counts, not rates. Use SUM() to total them.
+- ALWAYS filter WHERE "Periods" = '<cy_label>' before aggregating.
+  Without this filter, CY and PY rows both contribute and all counts are doubled.
+- Correct pattern for total purchase acts by product:
+    SELECT "Products", SUM("Anzahl Einkaufsakte") AS total_volume
+    FROM niq_panel
+    WHERE "Periods" = 'Letzte 12 M - 52 W bis 28/12/25'
+    GROUP BY "Products"
+    ORDER BY total_volume DESC
 
 ── DuckDB dialect rules ─────────────────────────────────────────────
 - Use DuckDB-native functions: STRFTIME, DATE_TRUNC, EPOCH, LIST_AGG, PIVOT, etc.
@@ -183,6 +201,10 @@ Verification checklist:
     "Ausgaben pro", "Einkaufsakte pro", or "Penetration (%)") using SUM() or
     SUM(metric)/COUNT(something), set verdict=fail. The correct aggregation is AVG().
     Provide corrected_sql replacing the wrong aggregate with AVG().
+11. NIQ missing Periods filter: if the SQL queries a table with a "Periods" column,
+    uses GROUP BY, but has NO WHERE "Periods" = '...' clause, set verdict=fail.
+    The CY label is visible in the sub-task description or schema hint.
+    Provide corrected_sql that adds WHERE "Periods" = '<cy_label>'.
 
 Never fabricate data. Do not call any tools in this node.
 """
