@@ -102,7 +102,6 @@ def _try_parse_json(text: str) -> dict | None:
 
 
 def _all_table_names() -> list[str]:
-    """Return every table registered in _data_registry."""
     conn = get_connection()
     try:
         rows = conn.execute("SELECT dataset_name FROM _data_registry ORDER BY ingested_at").fetchall()
@@ -130,20 +129,17 @@ _NIQ_QUERY_TERMS = {
     "share", "manufacturer", "brand", "category", "market",
 }
 
-# Path/name patterns that indicate a NIQ source file
 _NIQ_FILE_PATTERNS = re.compile(
     r"niq|nielsen|panel|penetration|buyer|haushalt|käufer",
     re.IGNORECASE,
 )
 
-# Regex: detects a resolved query that already contains a vs-VJ column name.
 _YOY_COL_RE = re.compile(
     r'"([^"]*vs\.\s*VJ\s*\(%\s*Ver\.\))"'
     r'|([^\s"()]+\s+vs\.\s*VJ\s*\(%\s*Ver\.\))',
     re.IGNORECASE,
 )
 
-# Columns in NIQ tables that map common user terms -> real column name fragments
 _NIQ_METRIC_TERMS: dict[str, str] = {
     "penetration":              "Penetration (%)",
     "käuferreichweite":         "Penetration (%)",
@@ -156,29 +152,42 @@ _NIQ_METRIC_TERMS: dict[str, str] = {
     "buyers":                   "Käuferhaushalte",
 }
 
-# Patterns that indicate "show distinct values in column X"
 _DISTINCT_VALUES_PATTERNS = re.compile(
     r"\b(?:what|which|show|list)\b.{0,40}\b(?:periods?|values?|categories|options|available)\b"
     r"|\b(?:periods?|values?|categories)\b.{0,30}\b(?:available|exist|loaded|in)\b",
     re.IGNORECASE,
 )
 
-# NIQ column that corresponds to distinct-values queries for 'periods'
 _NIQ_PERIOD_COL = "Periods"
 
-# Patterns that indicate a grain / temporal granularity question
+# Tightened: only explicit meta/grain questions, NOT 'annual figures' data questions
 _GRAIN_PATTERNS = re.compile(
     r"\b(?:grain|granularity|temporal\s+grain|how\s+often|frequency\s+of\s+data"
-    r"|annual|monthly|quarterly|weekly)\b",
+    r"|monthly|quarterly|weekly)\b"
+    r"|\bwhat\s+(?:is\s+(?:the\s+)?)?(?:time\s+)?grain\b"
+    r"|\bhow\s+(?:is\s+(?:the\s+)?data\s+)?(?:broken\s+down|aggregated|collected|reported)\b",
     re.IGNORECASE,
 )
 
-# Patterns that indicate 'show all figures / values for <metric>' (round 6 bug 3)
 _ALL_FIGURES_PATTERNS = re.compile(
     r"\b(?:show|give|list|all)\b.{0,30}\b(?:figures?|values?|data|numbers?)\b"
     r"|\b(?:annual|yearly|all)\b.{0,20}\b(?:figures?|values?|penetration|spend|ausgaben)\b",
     re.IGNORECASE,
 )
+
+
+def _infer_niq_grain(cy_label: str) -> str:
+    """Derive a human-readable grain string from the NIQ CY period label."""
+    label = cy_label.lower()
+    if re.search(r"12\s*m|52\s*w|jahr", label):
+        return "annual (52-week rolling)"
+    if re.search(r"13\s*w|quartal", label):
+        return "quarterly"
+    if re.search(r"4\s*w|monat", label):
+        return "monthly (4-week)"
+    if re.search(r"26\s*w", label):
+        return "semi-annual (26-week)"
+    return "detected"
 
 
 def _is_niq_file(path: str, dataset_name: str) -> bool:
@@ -211,27 +220,28 @@ def _get_niq_grain(dataset_name: str) -> str | None:
             [dataset_name],
         ).fetchone()
         if row and row[0]:
-            m = re.search(r"grain[=:\s]+([\w\s]+?)(?:\||$)", row[0], re.IGNORECASE)
-            if m:
+            # Try explicit grain= key first
+            m = re.search(r"grain='([^']+)'", row[0], re.IGNORECASE)
+            if m and m.group(1).lower() != "detected":
                 return m.group(1).strip()
+            # Fall back: infer from CY label stored in same summary
+            cy_m = re.search(r"CY='([^']+)'", row[0])
+            if cy_m:
+                inferred = _infer_niq_grain(cy_m.group(1))
+                if inferred != "detected":
+                    return inferred
     except Exception:
         pass
     return None
 
 
-def _niq_yoy_fast_path(
-    resolved_query: str,
-    dataset_name: str,
-) -> str | None:
-    """Return ready-made SQL for YoY-delta questions. Bypasses LLM."""
+def _niq_yoy_fast_path(resolved_query: str, dataset_name: str) -> str | None:
     m = _YOY_COL_RE.search(resolved_query)
     if not m:
         return None
-
     yoy_col = (m.group(1) or m.group(2) or "").strip()
     if not yoy_col:
         return None
-
     cy_label = _get_niq_cy_label(dataset_name)
     if not cy_label:
         return None
@@ -248,14 +258,12 @@ def _niq_yoy_fast_path(
     for col, keywords in dim_map.items():
         if any(kw in q_lower for kw in keywords):
             dimension_cols.append(col)
-
     if not dimension_cols:
         dimension_cols = ["Products"]
 
     select_dims = ", ".join(f'"{c}"' for c in dimension_cols)
     group_by    = ", ".join(f'"{c}"' for c in dimension_cols)
-
-    sql = (
+    return (
         f'SELECT {select_dims},\n'
         f'       AVG("{yoy_col}") AS yoy_delta\n'
         f'FROM "{dataset_name}"\n'
@@ -264,36 +272,22 @@ def _niq_yoy_fast_path(
         f'GROUP BY {group_by}\n'
         f'ORDER BY yoy_delta DESC'
     )
-    return sql
 
 
 def _niq_metric_fastpath(user_query: str, dataset_name: str) -> str | None:
-    """Return SQL for 'show all figures for <metric>' on a NIQ table.
-
-    Detects metric terms in the user query, looks up the real column name
-    from _column_catalog, and emits a properly grouped CY-filtered SELECT.
-    Returns None when the fast-path does not apply.
-    """
     if not _ALL_FIGURES_PATTERNS.search(user_query):
         return None
-
     cy_label = _get_niq_cy_label(dataset_name)
     if not cy_label:
         return None
-
     q_lower = user_query.lower()
-
-    # Find which NIQ metric term the user mentioned
     metric_col_fragment: str | None = None
     for term, col_fragment in _NIQ_METRIC_TERMS.items():
         if term in q_lower:
             metric_col_fragment = col_fragment
             break
-
     if not metric_col_fragment:
         return None
-
-    # Resolve exact column name from catalog
     conn = get_connection()
     try:
         rows = conn.execute(
@@ -302,19 +296,15 @@ def _niq_metric_fastpath(user_query: str, dataset_name: str) -> str | None:
         ).fetchall()
     except Exception:
         return None
-
     exact_col: str | None = None
     for (col,) in rows:
         if metric_col_fragment.lower() in col.lower():
-            # Prefer the plain metric (not a vs-VJ variant)
             if "vs." not in col and "VJ" not in col:
                 exact_col = col
                 break
-
     if not exact_col:
         return None
-
-    sql = (
+    return (
         f'SELECT "Products",\n'
         f'       AVG("{exact_col}") AS metric_value\n'
         f'FROM "{dataset_name}"\n'
@@ -323,35 +313,21 @@ def _niq_metric_fastpath(user_query: str, dataset_name: str) -> str | None:
         f'GROUP BY "Products"\n'
         f'ORDER BY metric_value DESC'
     )
-    return sql
 
 
 def _detect_distinct_values_intent(text: str, all_tables: list[str]) -> tuple[str, str] | None:
-    """Return (table_name, column_name) when the query asks for distinct values in a column.
-
-    Specifically handles 'what periods are available in <table>' style queries.
-    Returns None when the pattern does not match.
-    """
     if not _DISTINCT_VALUES_PATTERNS.search(text):
         return None
-
     text_lower = text.lower()
-
-    # Identify the table
     target_table: str | None = None
     for t in all_tables:
         if t.lower() in text_lower:
             target_table = t
             break
-
     if target_table is None:
-        # Fall through — not a table-specific distinct values query
         return None
-
-    # Identify the column — currently only 'periods' supported
     if "period" in text_lower:
         return (target_table, _NIQ_PERIOD_COL)
-
     return None
 
 
@@ -360,18 +336,14 @@ def _detect_grain_intent(text: str) -> bool:
 
 
 def _build_grain_reply(query: str, all_tables: list[str]) -> str | None:
-    """Return a grain answer sourced from _table_context. Returns None if no grain found."""
     text_lower = query.lower()
-
-    # Identify which table the user is asking about
     target_table: str | None = None
     for t in all_tables:
         if t.lower() in text_lower:
             target_table = t
             break
     if target_table is None and all_tables:
-        target_table = all_tables[-1]  # most recently loaded
-
+        target_table = all_tables[-1]
     if not target_table:
         return None
 
@@ -380,11 +352,9 @@ def _build_grain_reply(query: str, all_tables: list[str]) -> str | None:
 
     if grain:
         cy_note = f" Current year period label: `{cy_label}`" if cy_label else ""
-        return (
-            f"The grain of **{target_table}** is **{grain}** (sourced from `_table_context`).{cy_note}"
-        )
+        return f"The grain of **{target_table}** is **{grain}** (sourced from `_table_context`).{cy_note}"
 
-    # Grain not stored — fall back to inspecting Periods column
+    # Absolute fallback: inspect Periods column
     conn = get_connection()
     try:
         rows = conn.execute(
@@ -394,18 +364,16 @@ def _build_grain_reply(query: str, all_tables: list[str]) -> str | None:
             period_vals = ", ".join(f"`{r[0]}`" for r in rows)
             return (
                 f"The grain of **{target_table}** could not be determined from metadata. "
-            f"Available period values: {period_vals}"
+                f"Available period values: {period_vals}"
             )
     except Exception:
         pass
-
     return None
 
 
 def _select_relevant_tables(user_query: str, all_tables: list[str]) -> list[str]:
     if len(all_tables) <= 1:
         return all_tables
-
     conn = get_connection()
     try:
         rows = conn.execute(
@@ -415,16 +383,12 @@ def _select_relevant_tables(user_query: str, all_tables: list[str]) -> list[str]
         ).fetchall()
     except Exception:
         return all_tables
-
     if not rows:
         return all_tables
-
     q_lower = user_query.lower()
     q_words = set(re.findall(r"[a-z]{3,}", q_lower))
-
     q_niq_terms = {w.replace("ä", "a").replace("ü", "u").replace("ö", "o") for w in q_words}
     query_is_niq = bool(q_niq_terms & _NIQ_QUERY_TERMS)
-
     scored: list[tuple[int, str]] = []
     for dataset_name, summary, tags in rows:
         if dataset_name not in all_tables:
@@ -435,12 +399,9 @@ def _select_relevant_tables(user_query: str, all_tables: list[str]) -> list[str]
             (tags or "").lower(),
         ])
         score = sum(1 for w in q_words if w in text)
-
         if query_is_niq and tags and "niq" in tags.lower():
             score += 2
-
         scored.append((score, dataset_name))
-
     selected = [name for score, name in scored if score > 0]
     if not selected:
         return _select_relevant_tables_llm(user_query, all_tables)
@@ -628,15 +589,12 @@ def _detect_meta_intent(text: str) -> bool:
 def _build_meta_reply(query: str, all_tables: list[str]) -> str:
     conn = get_connection()
     query_lower = query.lower()
-
     if not all_tables:
         return (
             "No tables are loaded yet. Upload a file with:\n"
             "`load file at <path> as <name>`"
         )
-
     mentioned = [t for t in all_tables if t.lower() in query_lower]
-
     if mentioned:
         lines = []
         for t in mentioned:
@@ -654,7 +612,6 @@ def _build_meta_reply(query: str, all_tables: list[str]) -> str:
             else:
                 lines.append(f"❌ **{t}** is not currently loaded.")
         return "\n".join(lines)
-
     rows = conn.execute(
         "SELECT dataset_name, row_count, column_count, ingested_at "
         "FROM _data_registry ORDER BY ingested_at"
@@ -703,10 +660,8 @@ def _resolve_user_query(state: AnalyticsState) -> str:
 # ---------------------------------------------------------------------------
 
 def _resolve_niq_aliases(text: str, dataset_names: list[str]) -> str:
-    """Replace NIQ semantic-map terms in *text* with their real column names."""
     if not text or not dataset_names:
         return text
-
     conn = get_connection()
     try:
         placeholders = ", ".join("?" * len(dataset_names))
@@ -718,7 +673,6 @@ def _resolve_niq_aliases(text: str, dataset_names: list[str]) -> str:
         ).fetchall()
     except Exception:
         return text
-
     resolved = text
     for term, col_name in rows:
         if not term or not col_name:
@@ -731,7 +685,6 @@ def _resolve_niq_aliases(text: str, dataset_names: list[str]) -> str:
         except re.error:
             continue
         resolved = pattern.sub(col_name, resolved)
-
     return resolved
 
 
@@ -743,11 +696,9 @@ def _build_table_not_found_message(error: str, sql: str, all_tables: list[str]) 
     m = _TABLE_NOT_FOUND_RE.search(error)
     if not m:
         return None
-
     missing = next((g.strip('"\'\ ') for g in m.groups() if g), None)
     if not missing:
         return None
-
     conn = get_connection()
     try:
         reg_rows = conn.execute(
@@ -755,12 +706,10 @@ def _build_table_not_found_message(error: str, sql: str, all_tables: list[str]) 
         ).fetchall()
     except Exception:
         reg_rows = []
-
     loaded_lines = [
         f"  • **{name}** (from `{Path(src).name if src else 'unknown'}`)"
         for name, src in reg_rows
     ] or ["  • *(no tables loaded)*"]
-
     suggestion = ""
     missing_lower = missing.lower().replace("_", "").replace("-", "")
     for loaded_name, _ in reg_rows:
@@ -776,7 +725,6 @@ def _build_table_not_found_message(error: str, sql: str, all_tables: list[str]) 
                 f"`load <file> as {missing}`"
             )
             break
-
     lines = [
         f"❌ **Table `{missing}` does not exist** in the current session.",
         "",
@@ -794,16 +742,13 @@ def _build_table_not_found_message(error: str, sql: str, all_tables: list[str]) 
 def _build_binder_error_message(error: str, sql: str) -> str | None:
     if "Binder Error" not in error:
         return None
-
     bm = _BINDER_ERROR_RE.search(error)
     missing_col = next((g.strip('"\'\ ') for g in (bm.groups() if bm else []) if g), None)
-
     candidates_match = _CANDIDATES_RE.search(error)
     duckdb_candidates: list[str] = []
     if candidates_match:
         raw = candidates_match.group(1)
         duckdb_candidates = [c.strip().strip('"') for c in raw.split(",") if c.strip()]
-
     catalog_cols: dict[str, list[str]] = {}
     all_tables = _all_table_names()
     conn = get_connection()
@@ -818,7 +763,6 @@ def _build_binder_error_message(error: str, sql: str) -> str | None:
             catalog_cols[table] = [r[0] for r in rows]
         except Exception:
             pass
-
     suggestions: list[str] = []
     if missing_col:
         missing_norm = missing_col.lower().replace("_", "").replace(" ", "")
@@ -827,27 +771,21 @@ def _build_binder_error_message(error: str, sql: str) -> str | None:
                 col_norm = col.lower().replace("_", "").replace(" ", "")
                 if missing_norm in col_norm or col_norm in missing_norm:
                     suggestions.append(f'`{tbl}."{col}"`')
-
     lines: list[str] = []
-
     if missing_col:
         lines.append(f'❌ **Column `{missing_col}` does not exist** in the loaded table(s).')
     else:
         lines.append('❌ **A column referenced in the query does not exist** in the loaded table(s).')
-
     lines.append("")
-
     if duckdb_candidates:
         lines.append(f"**DuckDB reported these available columns:** {', '.join(f'`{c}`' for c in duckdb_candidates)}")
         lines.append("")
-
     if catalog_cols:
         lines.append("**Full column list for the queried table(s):**")
         for tbl, cols in catalog_cols.items():
             col_list = ", ".join(f'"{c}"' for c in cols)
             lines.append(f"  • **{tbl}**: {col_list}")
         lines.append("")
-
     if suggestions:
         lines.append(f"💡 **Closest match(es):** {', '.join(suggestions)}")
         lines.append("Rephrase your question using one of those column names.")
@@ -856,7 +794,6 @@ def _build_binder_error_message(error: str, sql: str) -> str | None:
             f"💡 No column named `{missing_col}` exists in any loaded table. "
             "Please rephrase your question using one of the column names listed above."
         )
-
     return "\n".join(lines)
 
 
@@ -893,13 +830,8 @@ def _extract_select_columns(sql: str) -> set[str]:
     return tokens
 
 
-def _detect_semantic_gaps(
-    user_query: str,
-    sql: str,
-    table_names: list[str],
-) -> str:
+def _detect_semantic_gaps(user_query: str, sql: str, table_names: list[str]) -> str:
     conn = get_connection()
-
     catalog_cols: set[str] = set()
     for tbl in table_names:
         try:
@@ -912,14 +844,11 @@ def _detect_semantic_gaps(
                 catalog_cols.add(col.lower().replace(" ", "").replace("_", ""))
         except Exception:
             pass
-
     user_concepts = [
         w for w in re.findall(r'[a-zA-Z]{4,}', user_query.lower())
         if w not in _QUERY_STOPWORDS
     ]
-
     sql_cols = _extract_select_columns(sql)
-
     gaps: list[str] = []
     for concept in user_concepts:
         concept_norm = concept.replace(" ", "").replace("_", "")
@@ -954,7 +883,6 @@ def _detect_semantic_gaps(
                     f'  ⚠️  Concept "{concept}" was requested but is not in the SQL result.'
                     f'{suggestion} The query was answered on the available dimensions only.'
                 )
-
     return "\n".join(gaps)
 
 
@@ -1013,15 +941,12 @@ def orchestrator(state: AnalyticsState) -> dict:
         all_failed = all(s.status == "failed" for s in state.plan)
         if all_failed:
             err = state.error or "The query could not be executed."
-
             binder_msg = _build_binder_error_message(err, state.last_sql or "")
             if binder_msg:
                 return {**base_reset, "final_answer": binder_msg, "messages": [AIMessage(content=binder_msg)]}
-
             table_msg = _build_table_not_found_message(err, state.last_sql or "", all_tables)
             if table_msg:
                 return {**base_reset, "final_answer": table_msg, "messages": [AIMessage(content=table_msg)]}
-
             final = (
                 f"I wasn't able to answer that question due to a SQL error:\n\n"
                 f"```\n{err.replace('ERROR: ', '').strip()}\n```\n\n"
@@ -1078,7 +1003,6 @@ def orchestrator(state: AnalyticsState) -> dict:
                 break
         if target_table is None and most_recent:
             target_table = most_recent
-
         if not all_tables:
             reply = "No tables are loaded yet. Load a file first with: `load file at <path> as <name>`."
         elif target_table:
@@ -1221,7 +1145,14 @@ def load_file_node(state: AnalyticsState) -> dict:
             reply = f"❌ Failed to load NIQ file: {result}"
         else:
             grain_match = re.search(r"NIQ grain:\s*([^|]+)", result)
-            grain_info = grain_match.group(1).strip() if grain_match else "detected"
+            raw_grain = grain_match.group(1).strip() if grain_match else "detected"
+
+            # Infer grain from CY period label when loader returns 'detected'
+            if raw_grain.lower() == "detected":
+                cy_match = re.search(r"CY='([^']+)'", result)
+                if cy_match:
+                    raw_grain = _infer_niq_grain(cy_match.group(1))
+
             period_match = re.search(r"Period values:\s*([^|]+)", result)
             period_info = (
                 f"\n  • Period values: `{period_match.group(1).strip()}`"
@@ -1230,10 +1161,32 @@ def load_file_node(state: AnalyticsState) -> dict:
             )
             reply = (
                 f"✅ {result.split('|')[0].strip()}\n\n"
-                f"**NIQ panel loaded** with grain `{grain_info}`.{period_info}\n\n"
+                f"**NIQ panel loaded** with grain `{raw_grain}`.{period_info}\n\n"
                 f"You can now ask NIQ questions about `{dataset}` — "
                 f"e.g. *Käuferreichweite*, *penetration*, *spend per buyer*, *YoY change*."
             )
+
+            # Persist inferred grain back to _table_context so _get_niq_grain() finds it
+            try:
+                conn = get_connection()
+                row = conn.execute(
+                    "SELECT summary FROM _table_context WHERE dataset_name = ?",
+                    [dataset],
+                ).fetchone()
+                if row and row[0]:
+                    updated_summary = re.sub(
+                        r"grain='[^']*'",
+                        f"grain='{raw_grain}'",
+                        row[0],
+                    )
+                    if updated_summary == row[0]:
+                        updated_summary = row[0] + f" | grain='{raw_grain}'"
+                    conn.execute(
+                        "UPDATE _table_context SET summary = ? WHERE dataset_name = ?",
+                        [updated_summary, dataset],
+                    )
+            except Exception:
+                pass
     else:
         result = load_file.invoke({"path": path, "dataset_name": dataset})
         reply = (
@@ -1298,11 +1251,7 @@ def sql_writer(state: AnalyticsState) -> dict:
     resolved_query = _resolve_niq_aliases(state.user_query, relevant_tables)
     resolved_step_desc = _resolve_niq_aliases(step.description, relevant_tables)
 
-    # ------------------------------------------------------------------
-    # NIQ fast-paths (retry_count == 0 only)
-    # ------------------------------------------------------------------
     if relevant_tables and state.retry_count == 0:
-        # Fast-path A: YoY delta column detected in resolved query
         fast_sql = _niq_yoy_fast_path(resolved_query, relevant_tables[0])
         if fast_sql:
             updated_plan = [
@@ -1315,8 +1264,6 @@ def sql_writer(state: AnalyticsState) -> dict:
                 "verification_feedback": "",
                 "current_step": step,
             }
-
-        # Fast-path B: 'show all figures for <metric>' query
         metric_sql = _niq_metric_fastpath(state.user_query, relevant_tables[0])
         if metric_sql:
             updated_plan = [
@@ -1338,8 +1285,7 @@ def sql_writer(state: AnalyticsState) -> dict:
     keywords = [
         w
         for w in re.findall(r"[a-zA-Z]{4,}", resolved_query.lower())
-        if w
-        not in {
+        if w not in {
             "what", "show", "list", "give", "find", "from", "that", "this",
             "with", "have", "does", "each", "many", "much", "more", "most",
             "last", "year", "month", "week", "date", "time", "when", "where", "which",
@@ -1422,21 +1368,23 @@ def sql_writer(state: AnalyticsState) -> dict:
                 break
 
     if not sql or not sql.strip():
+        # sql_writer returned empty SQL (e.g. concept not found in schema)
+        explanation = parsed.get("explanation", "")
         updated_plan = [
-            s.model_copy(update={"status": "failed", "result": "sql_writer produced empty SQL"})
+            s.model_copy(update={"status": "failed", "result": explanation or "sql_writer produced empty SQL"})
             if s.id == step.id
             else s
             for s in state.plan
         ]
+        err_msg = explanation or "sql_writer produced empty SQL"
         return {
             "last_sql": "",
             "plan": updated_plan,
-            "error": "sql_writer produced empty SQL",
+            "error": err_msg,
             "current_step": step,
         }
 
     sql = _sanitize_sql(sql, varchar_date_cols)
-
     updated_plan = [
         s.model_copy(update={"status": "running"}) if s.id == step.id else s
         for s in state.plan
@@ -1476,7 +1424,6 @@ def execute_sql(state: AnalyticsState) -> dict:
 
     if result.startswith("ERROR"):
         error_body = result[len("ERROR:"):].strip() if result.startswith("ERROR:") else result
-
         if "Binder Error" in error_body:
             return {
                 "last_query_result": result,
@@ -1484,7 +1431,6 @@ def execute_sql(state: AnalyticsState) -> dict:
                 "plan": _updated_plan("failed", error_body),
                 "error": error_body,
             }
-
         return {
             "last_query_result": result,
             "last_query_metadata": {},
