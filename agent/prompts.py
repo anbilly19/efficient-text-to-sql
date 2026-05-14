@@ -69,13 +69,29 @@ Output a single JSON object:
 
 A. YoY delta columns (names ending in "vs. VJ (% Ver.)"):
 - These columns only contain real values for the CURRENT YEAR period row.
-- When selecting a YoY delta column, ALWAYS filter:
-    WHERE "Periods" = '<cy_period_label>'
-  Use the CY period string from the schema or alias note
-  (e.g. 'Letzte 12 M - 52 W bis 28/12/25').
-- Never return both period rows for a YoY delta — the PY row is always NULL.
+- When selecting a YoY delta column, ALWAYS:
+  1. Filter: WHERE "Periods" = '<cy_period_label>'
+     Use the CY period string from the schema or alias note
+     (e.g. 'Letzte 12 M - 52 W bis 28/12/25').
+  2. GROUP BY the most granular dimension available (prefer "Products",
+     then "Retailers"; use both if the question asks about both).
+  3. Use AVG(<yoy_col>) AS yoy_delta in the SELECT.
+  4. ORDER BY yoy_delta DESC (or ASC for bottom-N queries).
+  5. Add AND <yoy_col> IS NOT NULL to exclude launch-year nulls.
+- NEVER return a single-row ungrouped AVG across the entire table — that is
+  meaningless for a YoY delta question.
+- NEVER use LAG(), window functions, or CY-minus-PY arithmetic to compute YoY
+  delta. The column already contains the precomputed % change.
 - "Penetration (%) vs. VJ (% Ver.)" is the direct YoY penetration change column;
-  select it as-is, never recompute it from CY minus PY.
+  select it as-is using the rules above.
+- Correct pattern for YoY penetration change by product:
+    SELECT "Products",
+           AVG("Penetration (%) vs. VJ (% Ver.)") AS yoy_penetration_delta
+    FROM niq_panel
+    WHERE "Periods" = 'Letzte 12 M - 52 W bis 28/12/25'
+      AND "Penetration (%) vs. VJ (% Ver.)" IS NOT NULL
+    GROUP BY "Products"
+    ORDER BY yoy_penetration_delta DESC
 
 B. NIQ pre-aggregated metrics — aggregation rules (CRITICAL):
 - Columns whose names begin with "Ausgaben pro", "Einkaufsakte pro", or
@@ -152,9 +168,15 @@ Verification checklist:
 6. GROUP BY completeness: all non-aggregated SELECT columns must appear in GROUP BY.
 7. VARCHAR date columns: confirm TRY_CAST(col AS DATE) was used before
    YEAR/MONTH/DATE_TRUNC. If not, verdict=fail with corrected_sql.
-8. NIQ YoY columns: if the SQL selects a column ending in "vs. VJ (% Ver.)" but
-   does NOT filter WHERE "Periods" = '<cy_label>', set verdict=fail with a corrected_sql
-   that adds the CY period filter (use the period label visible in the result rows).
+8. NIQ YoY columns: if the SQL selects a column ending in "vs. VJ (% Ver.)" check both:
+   a. Missing CY period filter: if WHERE "Periods" = '<cy_label>' is absent,
+      set verdict=fail with corrected_sql that adds the filter.
+   b. Missing GROUP BY: if the query has no GROUP BY clause (i.e. returns a single
+      ungrouped aggregate row), set verdict=fail with corrected_sql that adds
+      GROUP BY "Products" (or "Retailers" if the question is retailer-focused),
+      plus AND <yoy_col> IS NOT NULL in the WHERE clause.
+   c. LAG() or window function used instead of direct column select: set verdict=fail
+      with corrected_sql that selects the column directly with AVG().
 9. Invented columns: if the SQL references a column name not present in the schema
    (e.g. buyer_id), set verdict=fail with corrected_sql using the correct schema column.
 10. NIQ aggregation: if the SQL aggregates a NIQ per-unit metric (column starting with

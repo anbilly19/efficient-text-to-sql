@@ -136,9 +136,13 @@ _NIQ_FILE_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
-# Regex: detects a resolved query that already contains a vs-VJ column name
+# Regex: detects a resolved query that already contains a vs-VJ column name.
+# Handles: quoted or unquoted, with or without leading percent sign,
+# any unicode chars in the column name prefix.
+# Captures the full column name (without surrounding quotes if present).
 _YOY_COL_RE = re.compile(
-    r'"?([^"]+vs\.\s*VJ\s*\(%\s*Ver\.\))"?',
+    r'"([^"]*vs\.\s*VJ\s*\(%\s*Ver\.\))"'
+    r'|([^\s"()]+\s+vs\.\s*VJ\s*\(%\s*Ver\.\))',
     re.IGNORECASE,
 )
 
@@ -173,8 +177,7 @@ def _niq_yoy_fast_path(
     """Return a ready-made SQL string when the resolved query names a vs-VJ column.
 
     This bypasses LLM SQL generation entirely for YoY-delta questions, which
-    the LLM consistently gets wrong by using LAG() instead of reading the
-    pre-computed delta column directly.
+    the LLM consistently gets wrong by using LAG() or omitting GROUP BY.
 
     Returns None when the fast-path does not apply.
     """
@@ -182,14 +185,16 @@ def _niq_yoy_fast_path(
     if not m:
         return None
 
-    yoy_col = m.group(1).strip()
+    # Group 1 = quoted match, group 2 = unquoted match
+    yoy_col = (m.group(1) or m.group(2) or "").strip()
+    if not yoy_col:
+        return None
+
     cy_label = _get_niq_cy_label(dataset_name)
     if not cy_label:
-        # Fall back to LLM if we can't determine the CY label
         return None
 
     # Determine which dimension columns are also mentioned in the query
-    # so we can GROUP BY them for a useful aggregation.
     dimension_cols = []
     q_lower = resolved_query.lower()
     dim_map = {
@@ -211,7 +216,7 @@ def _niq_yoy_fast_path(
     group_by = ", ".join(f'"{c}"' for c in dimension_cols)
 
     sql = (
-        f'SELECT {select_dims}, \n'
+        f'SELECT {select_dims},\n'
         f'       AVG("{yoy_col}") AS yoy_delta\n'
         f'FROM "{dataset_name}"\n'
         f"WHERE \"Periods\" = '{cy_label}'\n"
@@ -247,7 +252,6 @@ def _select_relevant_tables(user_query: str, all_tables: list[str]) -> list[str]
     q_lower = user_query.lower()
     q_words = set(re.findall(r"[a-z]{3,}", q_lower))
 
-    # Detect whether the query is NIQ-flavoured
     q_niq_terms = {w.replace("ä", "a").replace("ü", "u").replace("ö", "o") for w in q_words}
     query_is_niq = bool(q_niq_terms & _NIQ_QUERY_TERMS)
 
@@ -262,7 +266,6 @@ def _select_relevant_tables(user_query: str, all_tables: list[str]) -> list[str]
         ])
         score = sum(1 for w in q_words if w in text)
 
-        # NIQ bonus: panel datasets get +2 when query is NIQ-flavoured
         if query_is_niq and tags and "niq" in tags.lower():
             score += 2
 
@@ -275,7 +278,6 @@ def _select_relevant_tables(user_query: str, all_tables: list[str]) -> list[str]
 
 
 def _select_relevant_tables_llm(user_query: str, all_tables: list[str]) -> list[str]:
-    """LLM fallback for table selection when keyword scoring yields no hits."""
     summaries = get_table_summaries()
     prompt = (
         f"The following tables are loaded in DuckDB:\n{summaries}\n\n"
@@ -413,11 +415,6 @@ _META_PATTERNS = [
     re.compile(r"\bare\s+(?:you|any\s+tables?)\s+(?:ready|set\s+up|configured)\b", re.IGNORECASE),
 ]
 
-# ---------------------------------------------------------------------------
-# Error pattern matchers
-# ---------------------------------------------------------------------------
-
-# DuckDB "table not found" — covers quoted/unquoted identifiers and truncated form
 _TABLE_NOT_FOUND_RE = re.compile(
     r'(?:Table with name|Table|Catalog Error.*?table)\s+["\']?([\w]+)["\']?\s+does not exist'
     r'|(?:relation|table)\s+["\']?([\w.]+)["\']?\s+does not exist'
@@ -425,14 +422,12 @@ _TABLE_NOT_FOUND_RE = re.compile(
     re.IGNORECASE,
 )
 
-# DuckDB Binder Error — column referenced in SQL doesn't exist in the FROM clause.
 _BINDER_ERROR_RE = re.compile(
     r'Binder Error[:\s]+Referenced column\s+["\']?([\w ]+)["\']?\s+not found'
     r'|Binder Error[:\s]+.*?Column[\s]+["\']?([\w ]+)["\']?\s+not found',
     re.IGNORECASE | re.DOTALL,
 )
 
-# Extract candidate bindings DuckDB helpfully lists after the error
 _CANDIDATES_RE = re.compile(
     r'Candidate bindings:\s*([^\n]+)',
     re.IGNORECASE,
@@ -538,15 +533,7 @@ def _resolve_user_query(state: AnalyticsState) -> str:
 # ---------------------------------------------------------------------------
 
 def _resolve_niq_aliases(text: str, dataset_names: list[str]) -> str:
-    """Replace NIQ semantic-map terms in *text* with their real column names.
-
-    Queries _semantic_map for every dataset in *dataset_names*, then does a
-    case-insensitive, longest-term-first substitution using whole-word (\\b)
-    boundaries so that short aliases (e.g. 'käufer') cannot match as a
-    substring inside longer tokens (e.g. 'käuferreichweite').
-
-    Returns the rewritten text (unchanged if no aliases match or on any error).
-    """
+    """Replace NIQ semantic-map terms in *text* with their real column names."""
     if not text or not dataset_names:
         return text
 
@@ -566,15 +553,8 @@ def _resolve_niq_aliases(text: str, dataset_names: list[str]) -> str:
     for term, col_name in rows:
         if not term or not col_name:
             continue
-        # Skip self-mappings (term == column name) — they're identity entries
-        # seeded so searches can find columns by their own names, but they
-        # must not be substituted because the result would be a no-op at best
-        # and a garbled double-application at worst.
         if term.strip().lower() == col_name.strip().lower():
             continue
-        # Use Unicode-aware word boundaries: \b works poorly with umlauts.
-        # Wrap the term with (?<![\w\u00c0-\u024f]) / (?![\w\u00c0-\u024f])
-        # so that e.g. 'käufer' does not match inside 'käuferreichweite'.
         boundary = r"(?<![\w\u00c0-\u024f])" + re.escape(term) + r"(?![\w\u00c0-\u024f])"
         try:
             pattern = re.compile(boundary, re.IGNORECASE)
@@ -590,10 +570,6 @@ def _resolve_niq_aliases(text: str, dataset_names: list[str]) -> str:
 # ---------------------------------------------------------------------------
 
 def _build_table_not_found_message(error: str, sql: str, all_tables: list[str]) -> str | None:
-    """Rich user-facing message when DuckDB says a table does not exist.
-
-    Returns None when the error is not a table-not-found error.
-    """
     m = _TABLE_NOT_FOUND_RE.search(error)
     if not m:
         return None
@@ -646,10 +622,6 @@ def _build_table_not_found_message(error: str, sql: str, all_tables: list[str]) 
 
 
 def _build_binder_error_message(error: str, sql: str) -> str | None:
-    """Rich user-facing message when DuckDB raises a Binder Error (column not found).
-
-    Returns None when the error is not a Binder Error.
-    """
     if "Binder Error" not in error:
         return None
 
@@ -1050,7 +1022,6 @@ def load_file_node(state: AnalyticsState) -> dict:
     if not dataset:
         dataset = Path(path).stem.replace(" ", "_").replace("-", "_").lower()
 
-    # Route NIQ panel files through the NIQ-aware loader automatically
     if _is_niq_file(path, dataset):
         result = load_niq_file.invoke({"path": path, "dataset_name": dataset})
         if result.startswith("ERROR"):
@@ -1131,19 +1102,13 @@ def sql_writer(state: AnalyticsState) -> dict:
     if not relevant_tables:
         relevant_tables = [_most_recent_table()] if _most_recent_table() else all_tables
 
-    # ------------------------------------------------------------------
-    # NIQ alias resolution: replace German/English semantic-map terms
-    # (e.g. Käuferreichweite, Ausgaben je Käufer) with their exact
-    # DuckDB column names BEFORE the LLM generates SQL.
-    # ------------------------------------------------------------------
     resolved_query = _resolve_niq_aliases(state.user_query, relevant_tables)
     resolved_step_desc = _resolve_niq_aliases(step.description, relevant_tables)
 
     # ------------------------------------------------------------------
     # NIQ YoY fast-path: when the resolved query already contains a
     # "vs. VJ (% Ver.)" column name, emit correct SQL directly without
-    # involving the LLM. This prevents the LLM from inventing LAG() or
-    # any other incorrect window-function recomputation.
+    # involving the LLM.
     # ------------------------------------------------------------------
     if relevant_tables and state.retry_count == 0:
         fast_sql = _niq_yoy_fast_path(resolved_query, relevant_tables[0])
@@ -1215,7 +1180,6 @@ def sql_writer(state: AnalyticsState) -> dict:
             f"  Use the RESOLVED column names verbatim in SQL.\n"
         )
 
-    # Include the CY period label explicitly so the LLM never has to guess it
     cy_label = _get_niq_cy_label(relevant_tables[0]) if relevant_tables else None
     cy_hint = (
         f"\n📅 NIQ CY period label (use this literal string for WHERE \"Periods\" filter): "
