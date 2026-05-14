@@ -178,6 +178,98 @@ _ALL_FIGURES_PATTERNS = re.compile(
 # Dimension columns to highlight in empty-SQL suggestions (ordered by importance)
 _NIQ_DIMENSION_COLS = ["Products", "Retailers", "Demographics", "Geographies", "People", "Periods"]
 
+# ---------------------------------------------------------------------------
+# Fast-path 6: semantic map lookup
+# ---------------------------------------------------------------------------
+
+_SEMANTIC_LOOKUP_PATTERNS = re.compile(
+    r"\bwhat\s+(?:does|do)\s+['\"]?(?P<term>[\w\s\u00c0-\u024f]+?)['\"]?\s+"
+    r"(?:map\s+to|correspond\s+to|mean|stand\s+for|refer\s+to|translate\s+to)\b"
+    r"|\blook\s+up\s+['\"]?(?P<term2>[\w\s\u00c0-\u024f]+?)['\"]?\s+in\s+(?:the\s+)?semantic\s+map\b"
+    r"|\bwhat\s+column\s+(?:corresponds?\s+to|is|matches?)\s+['\"]?(?P<term3>[\w\s\u00c0-\u024f]+?)['\"]?"
+    r"(?:\s+in\b|\s*\?|$)"
+    r"|\bsemantic\s+map\b.{0,60}\b['\"]?(?P<term4>[\w\s\u00c0-\u024f]+?)['\"]?\s*(?:for|in|of)\b",
+    re.IGNORECASE,
+)
+
+
+def _detect_semantic_lookup_intent(text: str, all_tables: list[str]) -> tuple[str, str | None] | None:
+    """Return (term, dataset_name | None) if the query is a semantic-map lookup."""
+    m = _SEMANTIC_LOOKUP_PATTERNS.search(text)
+    if not m:
+        return None
+    term = next(
+        (v.strip() for v in (m.group("term"), m.group("term2"), m.group("term3"), m.group("term4")) if v),
+        None,
+    )
+    if not term or len(term) < 2:
+        return None
+    # strip trailing noise words
+    term = re.sub(r"\s+(?:in|for|of|the|a|an|table|dataset|column|field)\s*$", "", term, flags=re.IGNORECASE).strip()
+    if not term:
+        return None
+    dataset: str | None = None
+    text_lower = text.lower()
+    for t in all_tables:
+        if t.lower() in text_lower:
+            dataset = t
+            break
+    return (term, dataset)
+
+
+def _build_semantic_map_reply(term: str, dataset: str | None, all_tables: list[str]) -> str:
+    """Query _semantic_map for `term` and return a formatted answer."""
+    conn = get_connection()
+    datasets_to_search = [dataset] if dataset else all_tables
+    if not datasets_to_search:
+        return f"No tables are loaded — cannot look up `{term}` in the semantic map."
+
+    # Search with LIKE for flexible partial matching (case-insensitive in DuckDB)
+    placeholders = ", ".join("?" * len(datasets_to_search))
+    try:
+        rows = conn.execute(
+            f"SELECT dataset_name, term, column_name, description "
+            f"FROM _semantic_map "
+            f"WHERE dataset_name IN ({placeholders}) "
+            f"  AND LOWER(term) LIKE LOWER(?) "
+            f"ORDER BY dataset_name, term",
+            datasets_to_search + [f"%{term}%"],
+        ).fetchall()
+    except Exception as exc:
+        return f"❌ Could not query `_semantic_map`: {exc}"
+
+    # Fallback: search by column_name too
+    if not rows:
+        try:
+            rows = conn.execute(
+                f"SELECT dataset_name, term, column_name, description "
+                f"FROM _semantic_map "
+                f"WHERE dataset_name IN ({placeholders}) "
+                f"  AND LOWER(column_name) LIKE LOWER(?) "
+                f"ORDER BY dataset_name, term",
+                datasets_to_search + [f"%{term}%"],
+            ).fetchall()
+        except Exception:
+            pass
+
+    if not rows:
+        scope = f"`{dataset}`" if dataset else "any loaded table"
+        return (
+            f"🔍 No semantic map entry found for **`{term}`** in {scope}.\n\n"
+            f"This term is not registered as an alias in `_semantic_map`. "
+            f"Try a related term, or check the available columns with: *show columns in {dataset or (all_tables[0] if all_tables else 'table')}*."
+        )
+
+    lines = [f"🗺️ Semantic map results for **`{term}`**:\n"]
+    lines.append("| Dataset | Alias / Term | → Column | Description |")
+    lines.append("|---------|-------------|----------|-------------|")
+    for ds, t, col, desc in rows:
+        lines.append(f"| `{ds}` | `{t}` | `{col}` | {desc or ''} |")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+
 
 def _build_empty_sql_message(explanation: str, user_query: str, all_tables: list[str]) -> str:
     """Build a friendly, informative message when sql_writer returns empty SQL."""
@@ -1106,6 +1198,13 @@ def orchestrator(state: AnalyticsState) -> dict:
     if _detect_meta_intent(current_query):
         reply = _build_meta_reply(current_query, all_tables)
         return {**base_reset, "final_answer": reply, "messages": [AIMessage(content=reply)]}
+
+    # ── Fast-path 6: semantic map lookup ───────────────────────────────────
+    sem_match = _detect_semantic_lookup_intent(current_query, all_tables)
+    if sem_match:
+        term, dataset = sem_match
+        sem_reply = _build_semantic_map_reply(term, dataset, all_tables)
+        return {**base_reset, "final_answer": sem_reply, "messages": [AIMessage(content=sem_reply)]}
 
     # ── LLM planning ───────────────────────────────────────────────────────
     ORCHESTRATOR_SYSTEM = f"""You are the Orchestrator of a DuckDB analytics agent.
