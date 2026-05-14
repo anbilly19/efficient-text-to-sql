@@ -238,21 +238,52 @@ def detect_niq_structure(conn, dataset_name: str) -> dict:
         return {"grain": "unknown", "period_col": None, "period_values": [], "error": str(exc)}
 
 
-# Default NIQ semantic map entries: (term, column_name, description)
+# ---------------------------------------------------------------------------
+# NIQ semantic map
+#
+# IMPORTANT: column_name values here must exactly match the real DuckDB column
+# names in the loaded NIQ file (as seen in _column_catalog / information_schema).
+#
+# Confirmed real column names from NIQ-Haushaltspaneldaten_synthetic.xlsx:
+#   Penetration (%)                        → penetration metric CY
+#   Penetration (%) VJ                     → penetration metric PY
+#   Penetration (%) vs. VJ (% Ver.)        → YoY delta for penetration
+#   Ausgaben pro Käuferhaushalt            → spend per buyer CY
+#   Ausgaben pro Käuferhaushalt VJ         → spend per buyer PY
+#   Ausgaben pro Käuferhaushalt vs. VJ ... → YoY delta for spend per buyer
+#   Käuferhaushalte                        → buying households (absolute count)
+#   Käuferhaushalte VJ                     → buying households PY
+# ---------------------------------------------------------------------------
+
+# Each entry: (term, column_name, description)
 # dataset_name is filled in at load time so aliases are scoped per dataset.
 _NIQ_SEMANTIC_TERMS: list[tuple[str, str, str]] = [
-    ("penetration",          "Penetration %",       "% of households buying at least once"),
-    ("Käuferreichweite",     "Penetration %",       "German: buyer reach (Penetration %)"),
-    ("käuferreichweite",     "Penetration %",       "German (lowercase): buyer reach"),
-    ("spend per buyer",      "Spend per Buyer",     "Average spend in € per buying household"),
-    ("Ausgaben je Käufer",   "Spend per Buyer",     "German: spend per buyer"),
-    ("ausgaben je käufer",   "Spend per Buyer",     "German (lowercase): spend per buyer"),
-    ("yoy",                  "YoY Change",          "Year-over-year change vs prior year"),
-    ("year on year",         "YoY Change",          "Year-over-year change vs prior year"),
-    ("year-on-year",         "YoY Change",          "Year-over-year change vs prior year"),
-    ("Veränderung zum Vorjahr", "YoY Change",       "German: change vs prior year"),
-    ("buyer penetration",    "Penetration %",       "Alias for penetration (buyer reach)"),
-    ("Haushaltsdurchdringung", "Penetration %",     "German: household penetration"),
+    # --- Penetration / Käuferreichweite ---
+    ("penetration",              "Penetration (%)",                    "% of households buying at least once (CY)"),
+    ("Käuferreichweite",         "Penetration (%)",                    "German: buyer reach → Penetration (%)"),
+    ("käuferreichweite",         "Penetration (%)",                    "German (lowercase): buyer reach → Penetration (%)"),
+    ("buyer reach",              "Penetration (%)",                    "Alias for Penetration (%)"),
+    ("buyer penetration",        "Penetration (%)",                    "Alias for Penetration (%)"),
+    ("Haushaltsdurchdringung",   "Penetration (%)",                    "German: household penetration → Penetration (%)"),
+    ("haushaltsdurchdringung",   "Penetration (%)",                    "German (lowercase): household penetration"),
+
+    # --- Spend per buyer / Ausgaben pro Käuferhaushalt ---
+    ("spend per buyer",          "Ausgaben pro Käuferhaushalt",        "Average spend in € per buying household (CY)"),
+    ("Ausgaben je Käufer",       "Ausgaben pro Käuferhaushalt",        "German: spend per buyer → Ausgaben pro Käuferhaushalt"),
+    ("ausgaben je käufer",       "Ausgaben pro Käuferhaushalt",        "German (lowercase): spend per buyer"),
+    ("Ausgaben pro Käufer",      "Ausgaben pro Käuferhaushalt",        "German variant: spend per buyer"),
+    ("ausgaben pro käufer",      "Ausgaben pro Käuferhaushalt",        "German (lowercase) variant: spend per buyer"),
+
+    # --- YoY / Veränderung ---
+    ("yoy",                      "Penetration (%) vs. VJ (% Ver.)",   "Year-over-year change (penetration default)"),
+    ("year on year",             "Penetration (%) vs. VJ (% Ver.)",   "Year-over-year change vs prior year"),
+    ("year-on-year",             "Penetration (%) vs. VJ (% Ver.)",   "Year-over-year change vs prior year"),
+    ("Veränderung zum Vorjahr",  "Penetration (%) vs. VJ (% Ver.)",   "German: change vs prior year → Penetration (%) vs. VJ (% Ver.)"),
+    ("veränderung zum vorjahr",  "Penetration (%) vs. VJ (% Ver.)",   "German (lowercase): change vs prior year"),
+
+    # --- Buying households ---
+    ("buying households",        "Käuferhaushalte",                    "Absolute count of buying households (CY)"),
+    ("Käuferhaushalte",          "Käuferhaushalte",                    "German: buying households"),
 ]
 
 
@@ -715,6 +746,10 @@ def load_niq_file(path: str, dataset_name: str) -> str:
     - Semantic map seeding: registers German/English marketing term aliases
       (Käuferreichweite, Ausgaben je Käufer, yoy, etc.) scoped to this dataset.
 
+    The semantic map entries point to the EXACT column names present in the
+    NIQ file (e.g. 'Penetration (%)' not 'Penetration %'). This ensures
+    lookup_semantic and search_semantic_lookup resolve aliases without errors.
+
     For multi-dataset NIQ support, use distinct dataset_names per extract
     (e.g. niq_panel_petfood, niq_panel_snacks). Repeated calls upsert safely.
 
@@ -760,7 +795,8 @@ def load_niq_file(path: str, dataset_name: str) -> str:
     except Exception as exc:
         return result + f" | WARNING: _table_context update failed: {exc}"
 
-    # Step 4: seed _semantic_map with German/English aliases scoped to this dataset
+    # Step 4: seed _semantic_map with German/English aliases scoped to this dataset.
+    # column_name values MUST match exact DuckDB column names from the NIQ file.
     niq_rows = [
         (term, dataset_name, col, desc)
         for term, col, desc in _NIQ_SEMANTIC_TERMS
@@ -770,7 +806,9 @@ def load_niq_file(path: str, dataset_name: str) -> str:
             """
             INSERT INTO _semantic_map (term, dataset_name, column_name, description)
             VALUES (?, ?, ?, ?)
-            ON CONFLICT (term, dataset_name) DO NOTHING
+            ON CONFLICT (term, dataset_name) DO UPDATE SET
+                column_name = excluded.column_name,
+                description = excluded.description
             """,
             niq_rows,
         )
@@ -778,7 +816,7 @@ def load_niq_file(path: str, dataset_name: str) -> str:
         return result + f" | WARNING: _semantic_map seeding failed: {exc}"
 
     period_info = (
-        f"Period values: {structure['period_values'][:5]}"
+        f"Periods: CY/PY detected in '{structure['period_col']}' → {structure['period_values'][:3]}"
         if structure.get("period_values")
         else "No period column detected"
     )
@@ -786,7 +824,7 @@ def load_niq_file(path: str, dataset_name: str) -> str:
         result
         + f" | NIQ grain: {grain}"
         + f" | {period_info}"
-        + f" | Seeded {len(niq_rows)} semantic aliases"
+        + f" | Seeded {len(niq_rows)} semantic alias(es)"
     )
 
 

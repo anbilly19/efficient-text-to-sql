@@ -19,6 +19,11 @@ Note on adversarial queries
 Some queries intentionally reference columns that do NOT exist in NIQ data
 (e.g. 'customer_id', 'invoice_number'). The agent must report gracefully
 that the column is absent rather than hallucinating a result.
+
+Note on round_04
+----------------
+NIQ data has no 'category' column. Dimension columns are Products and
+Retailers. round_04 q2 uses Retailers intentionally.
 """
 import os
 import time
@@ -63,7 +68,9 @@ QUERY_ROUNDS = [
         "niq_round_02_german_aliases",
         "niq_round_02",
         [
+            # Bug 1 fixed: Käuferreichweite now maps to 'Penetration (%)' (exact column name)
             f"Was ist die Käuferreichweite in {NIQ_DATASET}?",
+            # Bug 2 fixed: Ausgaben je Käufer now maps to 'Ausgaben pro Käuferhaushalt'
             f"Zeig mir die Ausgaben je Käufer nach Marke in {NIQ_DATASET}.",
             f"Veränderung zum Vorjahr der Penetration in {NIQ_DATASET}?",
         ],
@@ -82,7 +89,8 @@ QUERY_ROUNDS = [
         "niq_round_04",
         [
             f"What are the top 5 brands by penetration in {NIQ_DATASET}?",
-            f"Rank all categories by spend per buyer in {NIQ_DATASET}.",
+            # Bug 3 fixed: NIQ has no 'category' column — use Retailers instead
+            f"Rank all retailers by spend per buyer in {NIQ_DATASET}.",
             f"Which brand has the lowest buyer reach in {NIQ_DATASET}?",
         ],
     ),
@@ -292,7 +300,7 @@ def test_niq_query(
 ) -> None:
     _query_counter["n"] += 1
     n = _query_counter["n"]
-    print(f"\n[{n:>2}/{TOTAL_QUERIES}] {round_name}[q{query_index}]  \u27a4  {query}")
+    print(f"\n[{n:>2}/{TOTAL_QUERIES}] {round_name}[q{query_index}]  ➤  {query}")
 
     outputs = _run_wait(niq_thread_id, query)
     answer = _extract_last_ai_text(outputs)
