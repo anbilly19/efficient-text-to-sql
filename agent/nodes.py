@@ -462,8 +462,9 @@ def _resolve_niq_aliases(text: str, dataset_names: list[str]) -> str:
     """Replace NIQ semantic-map terms in *text* with their real column names.
 
     Queries _semantic_map for every dataset in *dataset_names*, then does a
-    case-insensitive, longest-term-first substitution so that e.g.
-    'Ausgaben je Käufer' is replaced before the shorter token 'Käufer'.
+    case-insensitive, longest-term-first substitution using whole-word (\\b)
+    boundaries so that short aliases (e.g. 'käufer') cannot match as a
+    substring inside longer tokens (e.g. 'käuferreichweite').
 
     Returns the rewritten text (unchanged if no aliases match or on any error).
     """
@@ -486,7 +487,20 @@ def _resolve_niq_aliases(text: str, dataset_names: list[str]) -> str:
     for term, col_name in rows:
         if not term or not col_name:
             continue
-        pattern = re.compile(re.escape(term), re.IGNORECASE)
+        # Skip self-mappings (term == column name) — they're identity entries
+        # seeded so searches can find columns by their own names, but they
+        # must not be substituted because the result would be a no-op at best
+        # and a garbled double-application at worst.
+        if term.strip().lower() == col_name.strip().lower():
+            continue
+        # Use Unicode-aware word boundaries: \b works poorly with umlauts.
+        # Wrap the term with (?<![\w\u00c0-\u024f]) / (?![\w\u00c0-\u024f])
+        # so that e.g. 'käufer' does not match inside 'käuferreichweite'.
+        boundary = r"(?<![\w\u00c0-\u024f])" + re.escape(term) + r"(?![\w\u00c0-\u024f])"
+        try:
+            pattern = re.compile(boundary, re.IGNORECASE)
+        except re.error:
+            continue
         resolved = pattern.sub(col_name, resolved)
 
     return resolved
@@ -963,7 +977,6 @@ def load_file_node(state: AnalyticsState) -> dict:
         if result.startswith("ERROR"):
             reply = f"❌ Failed to load NIQ file: {result}"
         else:
-            # Extract grain and period info from the result string for a richer reply
             grain_match = re.search(r"NIQ grain:\s*([^|]+)", result)
             grain_info = grain_match.group(1).strip() if grain_match else "detected"
             period_match = re.search(r"Period values:\s*([^|]+)", result)
@@ -1094,8 +1107,6 @@ def sql_writer(state: AnalyticsState) -> dict:
         if s.status == "done" and s.result and s.id != step.id
     )
 
-    # Show the resolved query if it differs from the original so the LLM
-    # always uses canonical column names, never raw German aliases.
     alias_note = ""
     if resolved_query != state.user_query:
         alias_note = (
@@ -1231,7 +1242,6 @@ def verifier(state: AnalyticsState) -> dict:
             "retry_count": state.retry_count,
         }
 
-    # ── Cardinality check ──────────────────────────────────────────────────
     cardinality_warning = ""
     if not is_error and state.last_query_metadata:
         conn = get_connection()
@@ -1256,7 +1266,6 @@ def verifier(state: AnalyticsState) -> dict:
         except Exception:
             pass
 
-    # ── JOIN key check ─────────────────────────────────────────────────────
     join_warnings: list[str] = []
     if not is_error and state.last_sql and "JOIN" in state.last_sql.upper():
         try:
@@ -1264,7 +1273,6 @@ def verifier(state: AnalyticsState) -> dict:
         except Exception:
             pass
 
-    # ── Schema hint (for error correction) ────────────────────────────────
     schema_hint = ""
     most_recent = _most_recent_table()
     if most_recent:
@@ -1273,7 +1281,6 @@ def verifier(state: AnalyticsState) -> dict:
         except Exception:
             pass
 
-    # ── Semantic gap detection ─────────────────────────────────────────────
     semantic_gap_block = ""
     if not is_error and state.last_sql and state.user_query:
         try:
