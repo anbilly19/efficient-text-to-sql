@@ -30,7 +30,7 @@ import requests
 
 LANGGRAPH_API_URL = os.getenv("LANGGRAPH_API_URL", "http://127.0.0.1:2024").rstrip("/")
 ASSISTANT_ID      = os.getenv("ASSISTANT_ID",      "fe096781-5601-53d2-b2f6-0d3403f7e9ca")
-NIQ_PATH          = os.getenv("NIQ_SYNTHETIC_PATH", "")
+NIQ_PATH          = os.getenv("NIQ_SYNTHETIC_PATH", "data/NIQ-Haushaltspaneldaten_synthetic.xlsx")
 NIQ_DATASET       = os.getenv("NIQ_DATASET_NAME",   "niq_panel")
 
 LOAD_NIQ_CMD = f"load {NIQ_PATH} as {NIQ_DATASET}" if NIQ_PATH else ""

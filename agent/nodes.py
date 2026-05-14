@@ -275,8 +275,8 @@ def _get_varchar_date_columns_multi(table_names: list[str]) -> dict[str, set[str
 def _sanitize_sql(sql: str, varchar_date_cols: dict[str, set[str]]) -> str:
     if not sql:
         return sql
-    sql = re.sub(r'"(\w+)"\"', r'"\1"', sql)
-    sql = re.sub(r'""\\b(\w+)"', r'"\1"', sql)
+    sql = re.sub(r'"(\w+)""', r'"\1"', sql)
+    sql = re.sub(r'""\b(\w+)"', r'"\1"', sql)
     for _table, cols in varchar_date_cols.items():
         for col in cols:
             col_pattern = rf'(?:"?\w+"?\.)?\"?{re.escape(col)}\"?'
