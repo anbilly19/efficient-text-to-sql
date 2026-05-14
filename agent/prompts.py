@@ -57,6 +57,27 @@ or rename any column. If a column name has spaces, wrap it in double quotes: "Co
 Output a single JSON object:
   {"sql": "<valid DuckDB SELECT statement>", "explanation": "<1-2 sentences>"}
 
+── ABSOLUTE COLUMN RULE (highest priority) ──────────────────────────
+- Every column name you write in SQL MUST appear verbatim in the schema provided.
+- NEVER invent a column name that is not listed (e.g. do not write buyer_id, marke,
+  brand_name, or any other name not shown in the schema).
+- If an ⚠️ NIQ alias resolution note is present in the prompt, treat the RESOLVED
+  column names as ground truth and use them verbatim — do not translate them back
+  or substitute synonyms.
+
+── NIQ panel rules (apply when table has a "Periods" column) ────────
+- YoY delta columns have names ending in "vs. VJ (% Ver.)". These columns only
+  contain real values for the CURRENT YEAR period row. When selecting a YoY delta
+  column, ALWAYS add a WHERE filter:
+    WHERE "Periods" = '<cy_period_label>'
+  where <cy_period_label> is the CY period string shown in the schema or alias note
+  (e.g. 'Letzte 12 M - 52 W bis 28/12/25'). Never return both period rows for a
+  YoY delta column — the PY row is always NULL by construction.
+- The column "Penetration (%) vs. VJ (% Ver.)" is the YoY change in penetration.
+  Select it directly; do not compute it manually from CY and PY columns.
+- "Ausgaben pro Käuferhaushalt" is spend per buying household — it is NOT a column
+  called buyer_id, spend_id, or any other invented name.
+
 ── DuckDB dialect rules ─────────────────────────────────────────────
 - Use DuckDB-native functions: STRFTIME, DATE_TRUNC, EPOCH, LIST_AGG, PIVOT, etc.
 - Always qualify column names with the table alias when joining multiple tables.
@@ -114,6 +135,11 @@ Verification checklist:
 6. GROUP BY completeness: all non-aggregated SELECT columns must appear in GROUP BY.
 7. VARCHAR date columns: confirm TRY_CAST(col AS DATE) was used before
    YEAR/MONTH/DATE_TRUNC. If not, verdict=fail with corrected_sql.
+8. NIQ YoY columns: if the SQL selects a column ending in "vs. VJ (% Ver.)" but
+   does NOT filter WHERE "Periods" = '<cy_label>', set verdict=fail with a corrected_sql
+   that adds the CY period filter (use the period label visible in the result rows).
+9. Invented columns: if the SQL references a column name not present in the schema
+   (e.g. buyer_id), set verdict=fail with corrected_sql using the correct schema column.
 
 Never fabricate data. Do not call any tools in this node.
 """
