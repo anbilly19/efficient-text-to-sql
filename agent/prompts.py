@@ -26,6 +26,9 @@ Rules:
   always consult _relationships for the authoritative key pairs.
 - When re-planning after a failure, include the verifier's feedback in the new
   step description so the SQL Writer can correct the approach.
+- If the user's request is already expressed as a valid SQL statement in the plan
+  description, preserve that intent exactly; do not broaden the task into an
+  unnecessary multi-table comparison.
 """
 
 PROFILER_SYSTEM = """\
@@ -71,6 +74,9 @@ Output a single JSON object:
 - If an ⚠️ NIQ alias resolution note is present in the prompt, treat the RESOLVED
   column names as ground truth and use them verbatim — do not translate them back
   or substitute synonyms.
+- If the step description already contains a concrete SQL statement, treat it as the
+  target query shape. Preserve the same table set and output grain unless the schema
+  proves it is invalid; do not replace it with a broader join or different business question.
 
 ── NIQ panel rules (apply when table has a "Periods" column) ────────
 
@@ -191,6 +197,42 @@ C. Absolute count columns ("Anzahl Einkaufsakte", "Käuferhaushalte"):
   if no matching row exists in the right (summary/dimension) table.
 - Never CROSS JOIN unless the task explicitly requires it.
 - Always alias both tables: FROM sales1000 s JOIN sales_rep_targets t ON ...
+- Every JOIN predicate must reference columns from BOTH joined relations.
+  A condition like qs.sales_rep = qs.sales_rep is a tautology and behaves like a CROSS JOIN.
+  WRONG: JOIN product_revenue pr ON qs.sales_rep = qs.sales_rep
+  RIGHT: JOIN product_revenue pr ON qs.product = pr.product
+- When joining to a top-N CTE, join on the actual business key produced by that CTE
+  (e.g. product, category, region), not on a tautology or unrelated dimension.
+
+── SUBQUERY-IN-ARITHMETIC rule (avoid parser/binder failures) ──────
+- Do NOT place a scalar SELECT subquery directly inside an arithmetic expression
+  that already contains aggregates, division, or percentage logic.
+- If you need quota, baseline, or benchmark values, first bring them into scope
+  via a JOIN or a CTE, then compute the arithmetic in an outer SELECT.
+  WRONG:
+    (SUM(s."total_revenue") / (SELECT t."quota_usd" FROM sales_rep_targets t
+      WHERE t."sales_rep" = s."sales_rep" AND t."region" = s."region")) * 100
+  RIGHT:
+    WITH rep_sales AS (
+        SELECT s."sales_rep", s."region", SUM(s."total_revenue") AS total_revenue
+        FROM sales1000 s
+        GROUP BY s."sales_rep", s."region"
+    )
+    SELECT rs."sales_rep", rs."region", rs.total_revenue,
+           (rs.total_revenue / t."quota_usd") * 100 AS quota_share
+    FROM rep_sales rs
+    JOIN sales_rep_targets t
+      ON rs."sales_rep" = t."sales_rep" AND rs."region" = t."region"
+- Prefer JOIN/CTE materialisation over correlated scalar subqueries whenever the
+  value is reused per group or participates in arithmetic.
+
+── BASELINE/COMPARISON rule ────────────────────────────────────────
+- If the user asks to "compare" a grouped metric to a baseline from another table,
+  the output must include BOTH the grouped metric and the baseline metric (or their difference/ratio).
+- It is not sufficient to join the baseline table only to borrow a label like category.
+  You must explicitly select the baseline column and compute the comparison requested.
+- If the baseline exists at a different grain, aggregate each side to a common grain first,
+  then join the aggregated CTEs.
 
 ── DATE HANDLING (critical) ─────────────────────────────────────────────
 - If the column type is TIMESTAMP or DATE: use YEAR(col), MONTH(col),
@@ -273,6 +315,15 @@ Verification checklist:
     another aggregate (e.g. SUM(... SUM(...) ...) or SUM(COALESCE(SUM(...), 0))),
     set verdict=fail. Provide corrected_sql using a two-level CTE where the inner
     CTE computes per-group aggregates and the outer SELECT aggregates over it.
+14. Tautological join predicates: if a JOIN condition compares a column to itself
+    from the same alias (e.g. qs.sales_rep = qs.sales_rep), set verdict=fail.
+    This is effectively a Cartesian join. Provide corrected_sql using the real key.
+15. Missing comparison metric: if the user asked to compare against a baseline,
+    quota, target, or benchmark, but the SQL returns only the main metric and not
+    the comparator or its difference/ratio, set verdict=fail and add the missing comparison.
+16. Scalar subquery in arithmetic: if SQL embeds a scalar SELECT inside a division,
+    percentage, subtraction, or other arithmetic expression over grouped results,
+    prefer a CTE/JOIN rewrite. Set verdict=fail with corrected_sql using the JOIN/CTE form.
 
 Never fabricate data. Do not call any tools in this node.
 """
