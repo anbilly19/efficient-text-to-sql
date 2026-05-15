@@ -1626,6 +1626,11 @@ def verifier(state: AnalyticsState) -> dict:
     preview = _rows_to_markdown(result)
 
     gap_warnings = _detect_semantic_gaps(user_query, sql, relevant_tables)
+    gap_section = (
+    f"Semantic gap warnings detected:\n{gap_warnings}"
+    if gap_warnings
+    else ""
+)
 
     VERIFIER_PROMPT = VERIFIER_SYSTEM + f"""
 
@@ -1638,7 +1643,7 @@ Row count: {row_count}
 Result preview:
 {preview}
 
-{("Semantic gap warnings detected:\n" + gap_warnings) if gap_warnings else ""}
+{gap_section}
 
 Evaluate the result. Output ONLY JSON:
 {{"verdict": "ok" | "retry" | "warning", "feedback": "..."}}

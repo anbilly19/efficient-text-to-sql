@@ -13,7 +13,7 @@ from typing import Literal
 from langgraph.graph import END, START, StateGraph
 
 from agent.nodes import (
-    execute_sql,
+    executor,
     load_file_node,
     orchestrator,
     profiler,
@@ -78,7 +78,7 @@ builder.add_node("orchestrator",   orchestrator)
 builder.add_node("load_file_node", load_file_node)
 builder.add_node("profiler",       profiler)
 builder.add_node("sql_writer",     sql_writer)
-builder.add_node("execute_sql",    execute_sql)
+builder.add_node("executor",    executor)
 builder.add_node("verifier",       verifier)
 
 builder.add_edge(START, "orchestrator")
@@ -92,10 +92,10 @@ builder.add_conditional_edges(
 
 builder.add_edge("load_file_node", END)
 builder.add_edge("profiler",       "sql_writer")
-builder.add_edge("sql_writer",     "execute_sql")
+builder.add_edge("sql_writer",     "executor")
 
 builder.add_conditional_edges(
-    "execute_sql",
+    "executor",
     route_after_execute,
     {"verifier": "verifier", "orchestrator": "orchestrator"},
 )
