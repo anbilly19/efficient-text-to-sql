@@ -204,6 +204,37 @@ C. Absolute count columns ("Anzahl Einkaufsakte", "Käuferhaushalte"):
 - When joining to a top-N CTE, join on the actual business key produced by that CTE
   (e.g. product, category, region), not on a tautology or unrelated dimension.
 
+── TOP-N PER GROUP rule (use window function CTE, not correlated IN) ─
+- When the question asks for "the top product", "highest-revenue item", or any
+  per-group maximum/minimum, NEVER use a correlated IN subquery in a JOIN predicate
+  to filter to the top row. That pattern produces fan-out (multiple rows per group).
+- The correct pattern is:
+  Step 1 — rank CTE: compute per-group rank using RANK() or ROW_NUMBER() inside
+           a window function, partitioned by the group key.
+  Step 2 — filter: WHERE rnk = 1 in an outer SELECT or JOIN.
+  WRONG (correlated IN — produces fan-out):
+    JOIN product_revenue pr
+      ON pr.product IN (
+        SELECT sa.product FROM sales1000 sa
+        WHERE sa.sales_rep = qg.sales_rep AND sa.region = qg.region
+      )
+  RIGHT (window function CTE):
+    WITH rep_top_product AS (
+        SELECT "sales_rep", "region", "product",
+               ROW_NUMBER() OVER (
+                   PARTITION BY "sales_rep", "region"
+                   ORDER BY SUM("total_revenue") DESC
+               ) AS rnk
+        FROM sales1000
+        GROUP BY "sales_rep", "region", "product"
+    )
+    -- then join: ON rtp."sales_rep" = qg.sales_rep AND rtp."region" = qg.region
+    --            AND rtp.rnk = 1
+- Apply the same pattern for "top category per rep", "best-selling product per region",
+  "most recent order per customer", and any other per-group argmax/argmin requirement.
+- After the rank CTE, filter to top-N products globally (if required) using a
+  separate CTE with ORDER BY ... LIMIT N, then INNER JOIN both CTEs on the product key.
+
 ── SUBQUERY-IN-ARITHMETIC rule (avoid parser/binder failures) ──────
 - Do NOT place a scalar SELECT subquery directly inside an arithmetic expression
   that already contains aggregates, division, or percentage logic.
@@ -324,6 +355,12 @@ Verification checklist:
 16. Scalar subquery in arithmetic: if SQL embeds a scalar SELECT inside a division,
     percentage, subtraction, or other arithmetic expression over grouped results,
     prefer a CTE/JOIN rewrite. Set verdict=fail with corrected_sql using the JOIN/CTE form.
+17. Top-N per group via correlated IN: if a JOIN ON clause uses a correlated IN
+    subquery to pick the top-ranked row per group (e.g. ON pr.product IN (SELECT
+    sa.product FROM ... WHERE sa.sales_rep = qg.sales_rep ...)), set verdict=fail.
+    This produces fan-out — one source row fans out to multiple joined rows.
+    Provide corrected_sql that uses a ROW_NUMBER() or RANK() window function CTE
+    partitioned by the group key, filtering WHERE rnk = 1 before joining.
 
 Never fabricate data. Do not call any tools in this node.
 """
