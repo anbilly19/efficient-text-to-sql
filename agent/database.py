@@ -384,8 +384,13 @@ def get_schema_context(table_names: list[str]) -> str:
     return "\n".join(lines)
 
 
-def get_table_summaries() -> str:
-    """Return a short listing of all registered tables with their summaries."""
+def get_table_summaries(allowed_tables: list[str] | None = None) -> str:
+    """Return a short listing of registered tables with their summaries.
+
+    Args:
+        allowed_tables: If provided, only tables in this list are returned.
+                        Pass None (default) to return all registered tables.
+    """
     conn = get_connection()
     rows = conn.execute(
         """
@@ -396,6 +401,8 @@ def get_table_summaries() -> str:
         ORDER BY dr.ingested_at
         """
     ).fetchall()
+    if allowed_tables is not None:
+        rows = [r for r in rows if r[0] in allowed_tables]
     if not rows:
         return "No tables loaded."
     lines = []

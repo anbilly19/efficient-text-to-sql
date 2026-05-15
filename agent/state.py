@@ -48,3 +48,8 @@ class AnalyticsState(BaseModel):
     # ── Final answer ──────────────────────────────────────────────
     final_answer: str = ""
     error: str = ""
+
+    # ── Table scoping (user-configured) ───────────────────────────
+    # None  -> all registered tables are visible (default)
+    # list  -> only these table names are visible in this thread
+    allowed_tables: list[str] | None = None
