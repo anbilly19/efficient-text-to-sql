@@ -52,7 +52,7 @@ def route_after_execute(
     The only exception is a hard SQL failure with no result to verify,
     in which case we go straight to orchestrator to surface the error.
     """
-    if state.error and not state.query_result:
+    if state.error and not state.last_query_result:
         return "orchestrator"
     return "verifier"
 
