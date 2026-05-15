@@ -17,10 +17,7 @@ from agent.prompts import (
 )
 from agent.state import AnalyticsState, PlanStep
 from agent.tools import (
-    ORCHESTRATOR_TOOLS,
     PROFILER_TOOLS,
-    SQL_WRITER_TOOLS,
-    get_schema,
     load_file,
     load_niq_file,
     run_sql,
@@ -183,12 +180,12 @@ _NIQ_DIMENSION_COLS = ["Products", "Retailers", "Demographics", "Geographies", "
 # ---------------------------------------------------------------------------
 
 _SEMANTIC_LOOKUP_PATTERNS = re.compile(
-    r"\bwhat\s+(?:does|do)\s+['\"]?(?P<term>[\w\s\u00c0-\u024f]+?)['\"]?\s+"
+    r"\bwhat\s+(?:does|do)\s+['\"']?(?P<term>[\w\s\u00c0-\u024f]+?)['\"']?\s+"
     r"(?:map\s+to|correspond\s+to|mean|stand\s+for|refer\s+to|translate\s+to)\b"
-    r"|\blook\s+up\s+['\"]?(?P<term2>[\w\s\u00c0-\u024f]+?)['\"]?\s+in\s+(?:the\s+)?semantic\s+map\b"
-    r"|\bwhat\s+column\s+(?:corresponds?\s+to|is|matches?)\s+['\"]?(?P<term3>[\w\s\u00c0-\u024f]+?)['\"]?"
+    r"|\blook\s+up\s+['\"']?(?P<term2>[\w\s\u00c0-\u024f]+?)['\"']?\s+in\s+(?:the\s+)?semantic\s+map\b"
+    r"|\bwhat\s+column\s+(?:corresponds?\s+to|is|matches?)\s+['\"']?(?P<term3>[\w\s\u00c0-\u024f]+?)['\"']?"
     r"(?:\s+in\b|\s*\?|$)"
-    r"|\bsemantic\s+map\b.{0,60}\b['\"]?(?P<term4>[\w\s\u00c0-\u024f]+?)['\"]?\s*(?:for|in|of)\b",
+    r"|\bsemantic\s+map\b.{0,60}\b['\"']?(?P<term4>[\w\s\u00c0-\u024f]+?)['\"']?\s*(?:for|in|of)\b",
     re.IGNORECASE,
 )
 
@@ -274,7 +271,7 @@ def _build_semantic_map_reply(term: str, dataset: str | None, all_tables: list[s
 def _build_empty_sql_message(explanation: str, user_query: str, all_tables: list[str]) -> str:
     """Build a friendly, informative message when sql_writer returns empty SQL."""
     # Extract the concept the user asked for from the explanation
-    concept_match = re.search(r"matching ['\"]?([\w\s]+)['\"]?", explanation, re.IGNORECASE)
+    concept_match = re.search(r"matching ['\"']?([\w\s]+)['\"']?", explanation, re.IGNORECASE)
     concept = concept_match.group(1).strip() if concept_match else ""
 
     # Collect dimension columns from the most relevant table
@@ -699,15 +696,15 @@ _META_PATTERNS = [
 ]
 
 _TABLE_NOT_FOUND_RE = re.compile(
-    r'(?:Table with name|Table|Catalog Error.*?table)\s+["\']?([\w]+)["\']?\s+does not exist'
-    r'|(?:relation|table)\s+["\']?([\w.]+)["\']?\s+does not exist'
+    r'(?:Table with name|Table|Catalog Error.*?table)\s+["\'']?([\w]+)["\'']?\s+does not exist'
+    r'|(?:relation|table)\s+["\'']?([\w.]+)["\'']?\s+does not exist'
     r'|([\w"]+)\s+not exist',
     re.IGNORECASE,
 )
 
 _BINDER_ERROR_RE = re.compile(
-    r'Binder Error[:\s]+Referenced column\s+["\']?([\w ]+)["\']?\s+not found'
-    r'|Binder Error[:\s]+.*?Column[\s]+["\']?([\w ]+)["\']?\s+not found',
+    r'Binder Error[:\s]+Referenced column\s+["\'']?([\w ]+)["\'']?\s+not found'
+    r'|Binder Error[:\s]+.*?Column[\s]+["\'']?([\w ]+)["\'']?\s+not found',
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -1461,152 +1458,152 @@ def sql_writer(state: AnalyticsState) -> dict:
         raw = search_semantic_lookup.invoke({"query": kw})
         for entry in json.loads(raw) if raw and not raw.startswith("ERROR") else []:
             key = f"{entry['dataset']}.{entry['column']}"
-            if key not in seen_cols and entry["dataset"] in relevant_tables:
+            if key not in seen_cols:
                 seen_cols.add(key)
                 semantic_hits.append(entry)
-    semantic_context = ""
+
+    semantic_block = ""
     if semantic_hits:
-        lines = ["=== Semantic column hints ==="]
+        lines = ["## Semantic Map Hints (user term → actual column name)"]
         for h in semantic_hits[:8]:
             lines.append(
-                f"  {h['dataset']}.{h['column']} ({h['type']}) — {h.get('description', '')}"
+                f"  '{h['term']}' → {h['dataset']}.{h['column']}"
+                + (f"  # {h['description']}" if h.get("description") else "")
             )
-        semantic_context = "\n".join(lines)
+        semantic_block = "\n".join(lines)
 
-    if state.retry_count > 0 and state.last_sql and state.last_sql.strip().upper().startswith("SELECT"):
-        sql = _sanitize_sql(state.last_sql, varchar_date_cols)
-        updated_plan = [
-            s.model_copy(update={"status": "running"}) if s.id == step.id else s
-            for s in state.plan
-        ]
-        return {"last_sql": sql, "plan": updated_plan, "verification_feedback": "", "current_step": step}
-
-    prior_step_notes = "\n".join(
-        f"- Step {s.id} ({s.description}): {s.result}"
-        for s in state.plan
-        if s.status == "done" and s.result and s.id != step.id
-    )
-
-    alias_note = ""
-    if resolved_query != state.user_query:
-        alias_note = (
-            f"\n⚠️  NIQ alias resolution applied:\n"
-            f"  Original : {state.user_query}\n"
-            f"  Resolved : {resolved_query}\n"
-            f"  Use the RESOLVED column names verbatim in SQL.\n"
-        )
-
-    cy_label = _get_niq_cy_label(relevant_tables[0]) if relevant_tables else None
-    cy_hint = (
-        f"\n📅 NIQ CY period label (use this literal string for WHERE \"Periods\" filter): "
-        f"'{cy_label}'\n"
-    ) if cy_label else ""
-
-    prompt = (
-        f"Sub-task: {resolved_step_desc}\n"
-        f"User question: {resolved_query}\n"
-        + alias_note
-        + cy_hint
-        + f"\n=== SCHEMA (use these table/column names verbatim) ===\n"
-        f"{schema_context}\n\n"
-        + (f"{relationships_block}\n\n" if relationships_block else "")
-        + (f"{semantic_context}\n\n" if semantic_context else "")
-        + f"=== MANDATORY DATE COLUMN RULES ===\n"
-        f"{cast_warnings if cast_warnings else '  (no date columns require special handling)'}\n\n"
-        f"Prior step results:\n{prior_step_notes or 'None'}\n\n"
-        f"Verifier feedback (if retry): {state.verification_feedback or 'None'}\n\n"
-        'Output JSON: {"sql": "...", "explanation": "..."}'
+    sql_prompt = SQL_WRITER_SYSTEM.format(
+        schema=schema_context,
+        cast_warnings=cast_warnings or "  (none)",
+        relationships=relationships_block or "  (none defined)",
+        semantic_map=semantic_block or "  (no hints)",
     )
 
     response = _llm().invoke(
-        [SystemMessage(content=SQL_WRITER_SYSTEM), HumanMessage(content=prompt)]
+        [
+            SystemMessage(content=sql_prompt),
+            HumanMessage(
+                content=(
+                    f"User question: {resolved_query}\n"
+                    f"Step description: {resolved_step_desc}\n"
+                    + (
+                        f"Previous attempt failed with: {state.verification_feedback}\n"
+                        if state.retry_count > 0 and state.verification_feedback
+                        else ""
+                    )
+                )
+            ),
+        ]
     )
-    parsed = _try_parse_json(_extract_text(response.content)) or {}
-    sql = parsed.get("sql", "")
 
-    if not sql and hasattr(response, "tool_calls") and response.tool_calls:
-        for tc in response.tool_calls:
-            args = tc.get("args") or {}
-            sql = args.get("query") or args.get("sql") or ""
-            if sql:
-                break
+    raw = _extract_text(response.content)
+    parsed_resp = _try_parse_json(raw) or {}
+    sql = parsed_resp.get("sql", "").strip()
+    explanation = parsed_resp.get("explanation", "")
 
-    if not sql or not sql.strip():
-        explanation = parsed.get("explanation", "")
+    if not sql:
         updated_plan = [
-            s.model_copy(update={"status": "failed", "result": explanation or "sql_writer produced empty SQL"})
-            if s.id == step.id
-            else s
+            s.model_copy(update={"status": "failed"}) if s.id == step.id else s
             for s in state.plan
         ]
-        err_msg = explanation or "sql_writer produced empty SQL"
         return {
             "last_sql": "",
             "plan": updated_plan,
-            "error": err_msg,
-            "current_step": step,
+            "error": explanation or "empty SQL",
+            "current_step": None,
         }
 
     sql = _sanitize_sql(sql, varchar_date_cols)
+
     updated_plan = [
         s.model_copy(update={"status": "running"}) if s.id == step.id else s
         for s in state.plan
     ]
-    return {"last_sql": sql, "plan": updated_plan, "verification_feedback": "", "current_step": step}
+    return {
+        "last_sql": sql,
+        "plan": updated_plan,
+        "verification_feedback": "",
+        "current_step": step,
+    }
 
 
 # ---------------------------------------------------------------------------
-# Node: execute_sql
+# Node: executor
 # ---------------------------------------------------------------------------
 
-def execute_sql(state: AnalyticsState) -> dict:
-    if not state.last_sql or not state.last_sql.strip():
-        def _fail_plan() -> list[PlanStep]:
-            return [
-                s.model_copy(update={"status": "failed", "result": "empty SQL"})
-                if state.current_step and s.id == state.current_step.id
+def executor(state: AnalyticsState) -> dict:
+    sql = state.last_sql
+    if not sql:
+        step = state.current_step
+        updated_plan = (
+            [
+                s.model_copy(update={"status": "failed", "result": "No SQL to execute."})
+                if s.id == step.id
                 else s
                 for s in state.plan
             ]
+            if step
+            else state.plan
+        )
         return {
-            "last_query_result": "ERROR: empty SQL",
+            "plan": updated_plan,
+            "last_query_result": "",
             "last_query_metadata": {},
-            "plan": _fail_plan(),
-            "error": "empty SQL",
+            "error": "No SQL to execute.",
+            "current_step": None,
         }
 
-    result = run_sql.invoke({"query": state.last_sql})
+    result_raw = run_sql.invoke({"query": sql})
 
-    def _updated_plan(status: str, msg: str = "") -> list[PlanStep]:
-        return [
-            s.model_copy(update={"status": status, "result": msg})
-            if state.current_step and s.id == state.current_step.id
+    step = state.current_step
+    if result_raw.startswith("ERROR"):
+        updated_plan = (
+            [
+                s.model_copy(update={"status": "failed", "result": result_raw})
+                if s.id == step.id
+                else s
+                for s in state.plan
+            ]
+            if step
+            else state.plan
+        )
+        return {
+            "plan": updated_plan,
+            "last_query_result": result_raw,
+            "last_query_metadata": {},
+            "error": result_raw,
+            "current_step": None,
+        }
+
+    try:
+        parsed = json.loads(result_raw)
+        rows = parsed.get("rows", [])
+        metadata = {
+            "row_count": parsed.get("row_count", len(rows)),
+            "columns": parsed.get("columns", list(rows[0].keys()) if rows else []),
+            "truncated": parsed.get("truncated", False),
+        }
+        result_str = json.dumps(rows)
+    except Exception:
+        result_str = result_raw
+        metadata = {}
+
+    updated_plan = (
+        [
+            s.model_copy(update={"status": "done", "result": result_str[:500]})
+            if s.id == step.id
             else s
             for s in state.plan
         ]
-
-    if result.startswith("ERROR"):
-        error_body = result[len("ERROR:"):].strip() if result.startswith("ERROR:") else result
-        if "Binder Error" in error_body:
-            return {
-                "last_query_result": result,
-                "last_query_metadata": {},
-                "plan": _updated_plan("failed", error_body),
-                "error": error_body,
-            }
-        return {
-            "last_query_result": result,
-            "last_query_metadata": {},
-            "plan": _updated_plan("failed", result),
-            "error": result,
-        }
-
-    parsed = json.loads(result)
+        if step
+        else state.plan
+    )
     return {
-        "last_query_result": json.dumps(parsed.get("rows", []), default=str),
-        "last_query_metadata": parsed.get("metadata", {}),
-        "plan": _updated_plan("done"),
+        "plan": updated_plan,
+        "last_query_result": result_str,
+        "last_query_metadata": metadata,
         "error": "",
+        "current_step": None,
     }
 
 
@@ -1615,135 +1612,66 @@ def execute_sql(state: AnalyticsState) -> dict:
 # ---------------------------------------------------------------------------
 
 def verifier(state: AnalyticsState) -> dict:
-    step = state.current_step
-    is_error = state.last_query_result.startswith("ERROR") if state.last_query_result else False
-    row_count = state.last_query_metadata.get("row_count", "unknown")
-    table_preview = _rows_to_markdown(state.last_query_result)
+    sql = state.last_sql
+    result = state.last_query_result
+    user_query = state.user_query
 
-    if is_error and state.error and "Binder Error" in state.error:
+    if not sql or not result or result.startswith("ERROR"):
+        return {"verification_verdict": "skip", "verification_feedback": ""}
+
+    all_tables = _all_table_names()
+    relevant_tables = _select_relevant_tables(user_query, all_tables)
+
+    row_count = state.last_query_metadata.get("row_count", "?")
+    preview = _rows_to_markdown(result)
+
+    gap_warnings = _detect_semantic_gaps(user_query, sql, relevant_tables)
+
+    VERIFIER_PROMPT = VERIFIER_SYSTEM + f"""
+
+User question: {user_query}
+
+SQL executed:
+{sql}
+
+Row count: {row_count}
+Result preview:
+{preview}
+
+{("Semantic gap warnings detected:\n" + gap_warnings) if gap_warnings else ""}
+
+Evaluate the result. Output ONLY JSON:
+{{"verdict": "ok" | "retry" | "warning", "feedback": "..."}}
+- "ok": result answers the question correctly
+- "retry": result is wrong or empty — include corrected SQL hint in feedback
+- "warning": result is technically correct but has a semantic gap noted above
+"""
+
+    response = _llm().invoke([HumanMessage(content=VERIFIER_PROMPT)])
+    raw = _extract_text(response.content)
+    parsed = _try_parse_json(raw) or {}
+    verdict = parsed.get("verdict", "ok")
+    feedback = parsed.get("feedback", "")
+
+    if verdict == "retry" and state.retry_count >= 2:
+        verdict = "warning"
+        feedback = f"Max retries reached. Last feedback: {feedback}"
+
+    if verdict == "retry":
+        step = state.current_step
+        updated_plan = (
+            [
+                s.model_copy(update={"status": "pending"}) if s.id == step.id else s
+                for s in state.plan
+            ]
+            if step
+            else state.plan
+        )
         return {
-            "verification_verdict": "fail",
-            "verification_feedback": state.error,
-            "current_step": None,
-            "retry_count": state.retry_count,
+            "verification_verdict": verdict,
+            "verification_feedback": feedback,
+            "plan": updated_plan,
+            "retry_count": state.retry_count + 1,
         }
 
-    cardinality_warning = ""
-    if not is_error and state.last_query_metadata:
-        conn = get_connection()
-        all_tables = _all_table_names()
-        try:
-            max_fact_rows = max(
-                (
-                    conn.execute(
-                        "SELECT row_count FROM _data_registry WHERE dataset_name = ?", [t]
-                    ).fetchone() or (0,)
-                )[0]
-                or 0
-                for t in all_tables
-            ) if all_tables else 0
-            result_rows = state.last_query_metadata.get("row_count", 0) or 0
-            if max_fact_rows > 0 and result_rows > max_fact_rows * 2:
-                cardinality_warning = (
-                    f"⚠️  Result has {result_rows} rows but the largest source table has "
-                    f"{max_fact_rows} rows — possible JOIN fan-out (Cartesian product). "
-                    "Verify GROUP BY and JOIN ON conditions."
-                )
-        except Exception:
-            pass
-
-    join_warnings: list[str] = []
-    if not is_error and state.last_sql and "JOIN" in state.last_sql.upper():
-        try:
-            join_warnings = validate_join_in_sql(state.last_sql)
-        except Exception:
-            pass
-
-    schema_hint = ""
-    most_recent = _most_recent_table()
-    if most_recent:
-        try:
-            schema_hint = get_schema_context([most_recent])
-        except Exception:
-            pass
-
-    semantic_gap_block = ""
-    if not is_error and state.last_sql and state.user_query:
-        try:
-            all_tables = _all_table_names()
-            gap_warnings = _detect_semantic_gaps(
-                state.user_query,
-                state.last_sql,
-                all_tables,
-            )
-            if gap_warnings:
-                semantic_gap_block = (
-                    "\n⚠️  SEMANTIC GAP DETECTED (dimension requested but missing from result):\n"
-                    + gap_warnings
-                    + "\n"
-                    "  → Set verdict=warning, do NOT set verdict=fail. "
-                    "The result is still valid for the dimensions that ARE present. "
-                    "Explain what was answered and what dimension is absent from the data.\n"
-                )
-        except Exception:
-            pass
-
-    if is_error:
-        prompt = (
-            f"Sub-task: {step.description if step else 'unknown'}\n"
-            f"SQL that failed:\n{state.last_sql}\n\n"
-            f"DuckDB error:\n{state.last_query_result}\n\n"
-            f"Schema hint:\n{schema_hint}\n\n"
-            "The SQL produced an error. Provide a corrected SQL query.\n"
-            'Output ONLY: {"verdict": "fail", "feedback": "<what was wrong>", "corrected_sql": "<fixed SQL>"}'
-        )
-    else:
-        join_warn_block = ""
-        if join_warnings:
-            join_warn_block = (
-                "\n⚠️  UNREGISTERED JOIN KEYS (must fix):\n"
-                + "\n".join(f"  - {w}" for w in join_warnings)
-                + "\n\n"
-            )
-        prompt = (
-            f"Sub-task: {step.description if step else 'unknown'}\n"
-            f"SQL executed:\n{state.last_sql}\n\n"
-            f"Row count: {row_count}\n"
-            f"First rows:\n{table_preview[:1500]}\n\n"
-            + (f"{cardinality_warning}\n\n" if cardinality_warning else "")
-            + join_warn_block
-            + semantic_gap_block
-            + "Verify whether the SQL correctly answers the sub-task.\n"
-            "- Correct → verdict=pass\n"
-            "- Clear bug (wrong column, bad filter, JOIN fan-out, unregistered join key) → verdict=fail with corrected_sql\n"
-            "- Missing dimension (semantic gap warning above) → verdict=warning with feedback explaining what is present vs absent\n"
-            "- Plausible but uncertain → verdict=warning (treated as pass)\n"
-            "- Do NOT call any tools.\n"
-            'Output ONLY: {"verdict": "pass|fail|warning", "feedback": "...", "corrected_sql": "(only if fail)"}'
-        )
-
-    response = _llm().invoke(
-        [SystemMessage(content=VERIFIER_SYSTEM), HumanMessage(content=prompt)]
-    )
-    parsed = _try_parse_json(_extract_text(response.content)) or {"verdict": "pass", "feedback": ""}
-    verdict = str(parsed.get("verdict", "pass"))
-    feedback = str(parsed.get("feedback", ""))
-    corrected_sql = parsed.get("corrected_sql", "")
-
-    new_status = "done" if verdict in ("pass", "warning") else "pending"
-    updated_plan = [
-        s.model_copy(update={"status": new_status, "result": feedback})
-        if step and s.id == step.id
-        else s
-        for s in state.plan
-    ]
-    updates: dict = {
-        "verification_verdict": verdict,
-        "verification_feedback": feedback,
-        "plan": updated_plan,
-        "current_step": None,
-        "retry_count": state.retry_count + 1,
-    }
-    if corrected_sql and verdict == "fail":
-        updates["last_sql"] = str(corrected_sql)
-    return updates
+    return {"verification_verdict": verdict, "verification_feedback": feedback}
