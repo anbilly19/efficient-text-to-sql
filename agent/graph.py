@@ -2,7 +2,7 @@
 
 Routing:
   chitchat/load  -> END
-  simple sql     -> sql_writer -> execute_sql -> orchestrator (synthesis) -> END
+  simple sql     -> sql_writer -> execute_sql -> verifier -> orchestrator -> END
   with profile   -> profiler -> sql_writer -> execute_sql -> verifier -> orchestrator -> END
   on fail        -> verifier -> sql_writer (max 2 retries) -> orchestrator -> END
 """
@@ -47,12 +47,14 @@ def route_after_orchestrator(
 def route_after_execute(
     state: AnalyticsState,
 ) -> Literal["verifier", "orchestrator"]:
-    """Skip verifier for simple single-sql plans (no profile step, no pending steps)."""
-    has_profile_step = any(s.type == "profile" for s in state.plan)
-    next_step = _next_pending_step(state)
-    if has_profile_step or next_step is not None:
-        return "verifier"
-    return "orchestrator"
+    """Always route through verifier after execution.
+
+    The only exception is a hard SQL failure with no result to verify,
+    in which case we go straight to orchestrator to surface the error.
+    """
+    if state.sql_error and not state.query_result:
+        return "orchestrator"
+    return "verifier"
 
 
 def route_after_verifier(
