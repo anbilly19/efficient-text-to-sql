@@ -18,7 +18,11 @@ import sys
 import textwrap
 from pathlib import Path
 
-# ── resolve project root so we can import agent.database ──────────────────
+# Force UTF-8 output on Windows so box-drawing chars don't crash cp1252
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
@@ -30,14 +34,15 @@ DB_PATH = os.getenv(
 )
 
 
-# ── helpers ───────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-SEP  = "\n" + "=" * 72 + "\n"
-SEP2 = "\n" + "-" * 60 + "\n"
+SEP = "\n" + "=" * 72 + "\n"
 
 
 def run(conn: duckdb.DuckDBPyConnection, label: str, sql: str) -> None:
-    print(f"\n{'─'*60}")
+    print("\n" + "-" * 60)
     print(f"[{label}]")
     print(textwrap.indent(sql.strip(), "  "))
     print()
@@ -45,7 +50,7 @@ def run(conn: duckdb.DuckDBPyConnection, label: str, sql: str) -> None:
         rows = conn.execute(sql).fetchall()
         desc = conn.description
         if not rows:
-            print("  ⚠  No rows returned.")
+            print("  [!] No rows returned.")
             return
         headers = [d[0] for d in desc]
         col_w = [
@@ -59,16 +64,18 @@ def run(conn: duckdb.DuckDBPyConnection, label: str, sql: str) -> None:
             print(fmt.format(*[str(v) for v in row]))
         if len(rows) > 20:
             print(f"  ... ({len(rows)} rows total, showing first 20)")
-        print(f"  → {len(rows)} row(s)")
+        print(f"  -> {len(rows)} row(s)")
     except Exception as exc:
-        print(f"  ❌  ERROR: {exc}")
+        print(f"  ERROR: {exc}")
 
 
 def section(title: str) -> None:
     print(SEP + f"  {title}" + SEP)
 
 
-# ── main ──────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     print(f"Connecting to: {DB_PATH}")
@@ -78,26 +85,26 @@ def main() -> None:
 
     conn = duckdb.connect(DB_PATH, read_only=True)
 
-    # ── 1. Inventory ──────────────────────────────────────────────────────
+    # --- 1. Inventory -------------------------------------------------------
     section("1. LOADED TABLES")
     run(conn, "data_registry",
         "SELECT dataset_name, row_count, column_count, source_file "
         "FROM _data_registry ORDER BY ingested_at")
 
-    # ── 2. Column schemas for the three relevant tables ───────────────────
+    # --- 2. Column schemas --------------------------------------------------
     section("2. COLUMN SCHEMAS")
     for tbl in ("sales1000", "sales_rep_targets", "product_metrics"):
         run(conn, f"columns: {tbl}",
             f"SELECT column_name, column_type, is_join_key "
             f"FROM _column_catalog WHERE dataset_name = '{tbl}' ORDER BY column_name")
 
-    # ── 3. Registered relationships ───────────────────────────────────────
+    # --- 3. Registered relationships ----------------------------------------
     section("3. REGISTERED RELATIONSHIPS")
     run(conn, "_relationships",
         "SELECT left_table, left_column, right_table, right_column, cardinality "
         "FROM _relationships ORDER BY relationship_id")
 
-    # ── 4. Region / sales_rep value overlap ───────────────────────────────
+    # --- 4. Join key overlap -------------------------------------------------
     section("4. JOIN KEY OVERLAP CHECK")
     run(conn, "distinct regions in sales1000",
         'SELECT DISTINCT "region" FROM sales1000 ORDER BY 1')
@@ -116,18 +123,17 @@ def main() -> None:
         ) s ON t."sales_rep" = s."sales_rep" AND t."region" = s."region"
         """)
 
-    # ── 5. product_metrics column names (resolve unit_price vs list_price) ─
+    # --- 5. product_metrics column names ------------------------------------
     section("5. PRODUCT_METRICS ACTUAL COLUMN NAMES")
     run(conn, "product_metrics columns",
         "SELECT column_name, column_type FROM _column_catalog "
         "WHERE dataset_name = 'product_metrics' ORDER BY column_name")
     run(conn, "product_metrics sample rows",
-        'SELECT * FROM product_metrics LIMIT 5')
+        "SELECT * FROM product_metrics LIMIT 5")
 
-    # ── 6. The 5 diagnostic queries ───────────────────────────────────────
+    # --- 6. Diagnostic queries ----------------------------------------------
     section("6. DIAGNOSTIC QUERIES")
 
-    # Q1 — below quota (split by region to see actual vs quota per region)
     run(conn, "Q1a: revenue vs quota per rep+region",
         """
         SELECT s."sales_rep", s."region",
@@ -141,7 +147,7 @@ def main() -> None:
         ORDER BY gap
         """)
 
-    run(conn, "Q1b: below-quota reps (HAVING gap < 0)",
+    run(conn, "Q1b: below-quota reps",
         """
         SELECT s."sales_rep", s."region",
                SUM(s."total_revenue")  AS actual_revenue,
@@ -155,7 +161,6 @@ def main() -> None:
         ORDER BY gap
         """)
 
-    # Q2 — quota attainment per rep+region
     run(conn, "Q2: quota attainment ranking",
         """
         SELECT t."region", t."sales_rep",
@@ -167,12 +172,11 @@ def main() -> None:
         ORDER BY t."region", attainment_pct DESC
         """)
 
-    # Q3 — total quota gap (quota minus actuals)
-    run(conn, "Q3: total quota gap across all regions",
+    run(conn, "Q3: total quota gap",
         """
         SELECT
-            SUM(t."quota_usd")         AS total_quota,
-            SUM(s.actual_revenue)      AS total_actual,
+            SUM(t."quota_usd")              AS total_quota,
+            SUM(s.actual_revenue)           AS total_actual,
             SUM(t."quota_usd") - SUM(s.actual_revenue) AS total_gap
         FROM sales_rep_targets t
         LEFT JOIN (
@@ -182,8 +186,7 @@ def main() -> None:
         ) s ON t."sales_rep" = s."sales_rep" AND t."region" = s."region"
         """)
 
-    # Q4 — below-quota reps selling top-5 revenue products (corrected)
-    run(conn, "Q4: top-5 products by revenue (sanity check)",
+    run(conn, "Q4: top-5 products by revenue",
         """
         SELECT "product", SUM("total_revenue") AS total_rev
         FROM sales1000
@@ -235,7 +238,6 @@ def main() -> None:
         ORDER BY bq.quota_gap DESC
         """)
 
-    # Q5 — quota share by category (fixed correlated subquery + GROUP BY)
     run(conn, "Q5: revenue share of quota by rep+category",
         """
         WITH rep_quota AS (
@@ -244,10 +246,10 @@ def main() -> None:
         )
         SELECT s."sales_rep",
                s."category",
-               SUM(s."total_revenue")                            AS category_revenue,
+               SUM(s."total_revenue")                              AS category_revenue,
                ROUND(
                    SUM(s."total_revenue") / MAX(q."quota_usd") * 100,
-               2)                                                AS quota_share_pct
+               2)                                                  AS quota_share_pct
         FROM sales1000 s
         JOIN rep_quota q
           ON s."sales_rep" = q."sales_rep" AND s."region" = q."region"
