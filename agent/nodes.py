@@ -102,7 +102,6 @@ def _try_parse_json(text: str) -> dict | None:
 
 
 def _all_table_names() -> list[str]:
-    """Return every table registered in _data_registry."""
     conn = get_connection()
     try:
         rows = conn.execute("SELECT dataset_name FROM _data_registry ORDER BY ingested_at").fetchall()
@@ -151,7 +150,6 @@ def _select_relevant_tables(user_query: str, all_tables: list[str]) -> list[str]
     """
     if len(all_tables) <= 1:
         return all_tables
-
     conn = get_connection()
     try:
         rows = conn.execute(
@@ -161,7 +159,6 @@ def _select_relevant_tables(user_query: str, all_tables: list[str]) -> list[str]
         ).fetchall()
     except Exception:
         return all_tables
-
     if not rows:
         return all_tables
 
@@ -188,7 +185,6 @@ def _select_relevant_tables(user_query: str, all_tables: list[str]) -> list[str]
             score += 2
 
         scored.append((score, dataset_name))
-
     selected = [name for score, name in scored if score > 0]
     if not selected:
         return _select_relevant_tables_llm(user_query, all_tables)
@@ -196,7 +192,6 @@ def _select_relevant_tables(user_query: str, all_tables: list[str]) -> list[str]
 
 
 def _select_relevant_tables_llm(user_query: str, all_tables: list[str]) -> list[str]:
-    """LLM fallback for table selection when keyword scoring yields no hits."""
     summaries = get_table_summaries()
     prompt = (
         f"The following tables are loaded in DuckDB:\n{summaries}\n\n"
@@ -334,11 +329,6 @@ _META_PATTERNS = [
     re.compile(r"\bare\s+(?:you|any\s+tables?)\s+(?:ready|set\s+up|configured)\b", re.IGNORECASE),
 ]
 
-# ---------------------------------------------------------------------------
-# Error pattern matchers
-# ---------------------------------------------------------------------------
-
-# DuckDB "table not found" — covers quoted/unquoted identifiers and truncated form
 _TABLE_NOT_FOUND_RE = re.compile(
     r'(?:Table with name|Table|Catalog Error.*?table)\s+["\'']?([\w]+)["\'']?\s+does not exist'
     r'|(?:relation|table)\s+["\'']?([\w.]+)["\'']?\s+does not exist'
@@ -353,7 +343,6 @@ _BINDER_ERROR_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
-# Extract candidate bindings DuckDB helpfully lists after the error
 _CANDIDATES_RE = re.compile(
     r'Candidate bindings:\s*([^\n]+)',
     re.IGNORECASE,
@@ -384,15 +373,12 @@ def _detect_meta_intent(text: str) -> bool:
 def _build_meta_reply(query: str, all_tables: list[str]) -> str:
     conn = get_connection()
     query_lower = query.lower()
-
     if not all_tables:
         return (
             "No tables are loaded yet. Upload a file with:\n"
             "`load file at <path> as <name>`"
         )
-
     mentioned = [t for t in all_tables if t.lower() in query_lower]
-
     if mentioned:
         lines = []
         for t in mentioned:
@@ -410,7 +396,6 @@ def _build_meta_reply(query: str, all_tables: list[str]) -> str:
             else:
                 lines.append(f"❌ **{t}** is not currently loaded.")
         return "\n".join(lines)
-
     rows = conn.execute(
         "SELECT dataset_name, row_count, column_count, ingested_at "
         "FROM _data_registry ORDER BY ingested_at"
@@ -455,14 +440,43 @@ def _resolve_user_query(state: AnalyticsState) -> str:
 
 
 # ---------------------------------------------------------------------------
+# NIQ alias resolution
+# ---------------------------------------------------------------------------
+
+def _resolve_niq_aliases(text: str, dataset_names: list[str]) -> str:
+    if not text or not dataset_names:
+        return text
+    conn = get_connection()
+    try:
+        placeholders = ", ".join("?" * len(dataset_names))
+        rows = conn.execute(
+            f"SELECT term, column_name FROM _semantic_map "
+            f"WHERE dataset_name IN ({placeholders}) "
+            f"ORDER BY LENGTH(term) DESC",
+            dataset_names,
+        ).fetchall()
+    except Exception:
+        return text
+    resolved = text
+    for term, col_name in rows:
+        if not term or not col_name:
+            continue
+        if term.strip().lower() == col_name.strip().lower():
+            continue
+        boundary = r"(?<![\w\u00c0-\u024f])" + re.escape(term) + r"(?![\w\u00c0-\u024f])"
+        try:
+            pattern = re.compile(boundary, re.IGNORECASE)
+        except re.error:
+            continue
+        resolved = pattern.sub(col_name, resolved)
+    return resolved
+
+
+# ---------------------------------------------------------------------------
 # Error message builders
 # ---------------------------------------------------------------------------
 
 def _build_table_not_found_message(error: str, sql: str, all_tables: list[str]) -> str | None:
-    """Rich user-facing message when DuckDB says a table does not exist.
-
-    Returns None when the error is not a table-not-found error.
-    """
     m = _TABLE_NOT_FOUND_RE.search(error)
     if not m:
         return None
@@ -470,7 +484,6 @@ def _build_table_not_found_message(error: str, sql: str, all_tables: list[str]) 
     missing = next((g.strip('"\'\ ') for g in m.groups() if g), None)
     if not missing:
         return None
-
     conn = get_connection()
     try:
         reg_rows = conn.execute(
@@ -478,7 +491,6 @@ def _build_table_not_found_message(error: str, sql: str, all_tables: list[str]) 
         ).fetchall()
     except Exception:
         reg_rows = []
-
     loaded_lines = [
         f"  • **{name}** (from `{Path(src).name if src else 'unknown'}`)"
         for name, src in reg_rows
@@ -499,7 +511,6 @@ def _build_table_not_found_message(error: str, sql: str, all_tables: list[str]) 
                 f"`load <file> as {missing}`"
             )
             break
-
     lines = [
         f"❌ **Table `{missing}` does not exist** in the current session.",
         "",
@@ -521,7 +532,6 @@ def _build_binder_error_message(error: str, sql: str) -> str | None:
     """
     if "Binder Error" not in error:
         return None
-
     bm = _BINDER_ERROR_RE.search(error)
     missing_col = next((g.strip('"\'\ ') for g in (bm.groups() if bm else []) if g), None)
 
@@ -556,25 +566,21 @@ def _build_binder_error_message(error: str, sql: str) -> str | None:
                     suggestions.append(f'`{tbl}."{col}"`')
 
     lines: list[str] = []
-
     if missing_col:
         lines.append(f'❌ **Column `{missing_col}` does not exist** in the loaded table(s).')
     else:
         lines.append('❌ **A column referenced in the query does not exist** in the loaded table(s).')
 
     lines.append("")
-
     if duckdb_candidates:
         lines.append(f"**DuckDB reported these available columns:** {', '.join(f'`{c}`' for c in duckdb_candidates)}")
         lines.append("")
-
     if catalog_cols:
         lines.append("**Full column list for the queried table(s):**")
         for tbl, cols in catalog_cols.items():
             col_list = ", ".join(f'"{c}"' for c in cols)
             lines.append(f"  • **{tbl}**: {col_list}")
         lines.append("")
-
     if suggestions:
         lines.append(f"💡 **Closest match(es):** {', '.join(suggestions)}")
         lines.append("Rephrase your question using one of those column names.")
@@ -583,7 +589,6 @@ def _build_binder_error_message(error: str, sql: str) -> str | None:
             f"💡 No column named `{missing_col}` exists in any loaded table. "
             "Please rephrase your question using one of the column names listed above."
         )
-
     return "\n".join(lines)
 
 
@@ -620,13 +625,8 @@ def _extract_select_columns(sql: str) -> set[str]:
     return tokens
 
 
-def _detect_semantic_gaps(
-    user_query: str,
-    sql: str,
-    table_names: list[str],
-) -> str:
+def _detect_semantic_gaps(user_query: str, sql: str, table_names: list[str]) -> str:
     conn = get_connection()
-
     catalog_cols: set[str] = set()
     for tbl in table_names:
         try:
@@ -639,14 +639,11 @@ def _detect_semantic_gaps(
                 catalog_cols.add(col.lower().replace(" ", "").replace("_", ""))
         except Exception:
             pass
-
     user_concepts = [
         w for w in re.findall(r'[a-zA-Z]{4,}', user_query.lower())
         if w not in _QUERY_STOPWORDS
     ]
-
     sql_cols = _extract_select_columns(sql)
-
     gaps: list[str] = []
     for concept in user_concepts:
         concept_norm = concept.replace(" ", "").replace("_", "")
@@ -681,7 +678,6 @@ def _detect_semantic_gaps(
                     f'  ⚠️  Concept "{concept}" was requested but is not in the SQL result.'
                     f'{suggestion} The query was answered on the available dimensions only.'
                 )
-
     return "\n".join(gaps)
 
 
@@ -805,7 +801,6 @@ def orchestrator(state: AnalyticsState) -> dict:
                 break
         if target_table is None and most_recent:
             target_table = most_recent
-
         if not all_tables:
             reply = "No tables are loaded yet. Load a file first with: `load file at <path> as <name>`."
         elif target_table:
@@ -815,10 +810,40 @@ def orchestrator(state: AnalyticsState) -> dict:
             reply = f"Here are all loaded tables:\n\n```\n{tables_summary}\n```"
         return {**base_reset, "final_answer": reply, "messages": [AIMessage(content=reply)]}
 
-    # ── Fast-path 3: META — agent-state questions ──────────────────────────
+    # ── Fast-path 3: distinct column values (e.g. 'what periods are available') ──
+    distinct_match = _detect_distinct_values_intent(current_query, all_tables)
+    if distinct_match:
+        tbl, col = distinct_match
+        sql = f'SELECT DISTINCT "{col}" FROM "{tbl}" ORDER BY 1'
+        result_raw = run_sql.invoke({"query": sql})
+        if result_raw.startswith("ERROR"):
+            reply = f"❌ Could not retrieve distinct values: {result_raw}"
+        else:
+            parsed_rows = json.loads(result_raw).get("rows", [])
+            vals = [str(r.get(col, "")) for r in parsed_rows]
+            reply = (
+                f"Available values for **{col}** in `{tbl}`:\n\n"
+                + "\n".join(f"  • `{v}`" for v in vals)
+            )
+        return {**base_reset, "final_answer": reply, "messages": [AIMessage(content=reply)]}
+
+    # ── Fast-path 4: grain / temporal granularity question ─────────────────
+    if _detect_grain_intent(current_query) and all_tables:
+        grain_reply = _build_grain_reply(current_query, all_tables)
+        if grain_reply:
+            return {**base_reset, "final_answer": grain_reply, "messages": [AIMessage(content=grain_reply)]}
+
+    # ── Fast-path 5: META — agent-state questions ──────────────────────────
     if _detect_meta_intent(current_query):
         reply = _build_meta_reply(current_query, all_tables)
         return {**base_reset, "final_answer": reply, "messages": [AIMessage(content=reply)]}
+
+    # ── Fast-path 6: semantic map lookup ───────────────────────────────────
+    sem_match = _detect_semantic_lookup_intent(current_query, all_tables)
+    if sem_match:
+        term, dataset = sem_match
+        sem_reply = _build_semantic_map_reply(term, dataset, all_tables)
+        return {**base_reset, "final_answer": sem_reply, "messages": [AIMessage(content=sem_reply)]}
 
     # ── LLM planning ───────────────────────────────────────────────────────
     ORCHESTRATOR_SYSTEM = f"""You are the Orchestrator of a DuckDB analytics agent.
@@ -1001,6 +1026,35 @@ def sql_writer(state: AnalyticsState) -> dict:
     if not relevant_tables:
         relevant_tables = [_most_recent_table()] if _most_recent_table() else all_tables
 
+    resolved_query = _resolve_niq_aliases(state.user_query, relevant_tables)
+    resolved_step_desc = _resolve_niq_aliases(step.description, relevant_tables)
+
+    if relevant_tables and state.retry_count == 0:
+        fast_sql = _niq_yoy_fast_path(resolved_query, relevant_tables[0])
+        if fast_sql:
+            updated_plan = [
+                s.model_copy(update={"status": "running"}) if s.id == step.id else s
+                for s in state.plan
+            ]
+            return {
+                "last_sql": fast_sql,
+                "plan": updated_plan,
+                "verification_feedback": "",
+                "current_step": step,
+            }
+        metric_sql = _niq_metric_fastpath(state.user_query, relevant_tables[0])
+        if metric_sql:
+            updated_plan = [
+                s.model_copy(update={"status": "running"}) if s.id == step.id else s
+                for s in state.plan
+            ]
+            return {
+                "last_sql": metric_sql,
+                "plan": updated_plan,
+                "verification_feedback": "",
+                "current_step": step,
+            }
+
     schema_context = get_schema_context(relevant_tables)
     cast_warnings = _get_date_cast_warnings(relevant_tables)
     varchar_date_cols = _get_varchar_date_columns_multi(relevant_tables)
@@ -1008,9 +1062,8 @@ def sql_writer(state: AnalyticsState) -> dict:
 
     keywords = [
         w
-        for w in re.findall(r"[a-zA-Z]{4,}", state.user_query.lower())
-        if w
-        not in {
+        for w in re.findall(r"[a-zA-Z]{4,}", resolved_query.lower())
+        if w not in {
             "what", "show", "list", "give", "find", "from", "that", "this",
             "with", "have", "does", "each", "many", "much", "more", "most",
             "last", "year", "month", "week", "date", "time", "when", "where", "which",
@@ -1048,10 +1101,27 @@ def sql_writer(state: AnalyticsState) -> dict:
         if s.status == "done" and s.result and s.id != step.id
     )
 
+    alias_note = ""
+    if resolved_query != state.user_query:
+        alias_note = (
+            f"\n⚠️  NIQ alias resolution applied:\n"
+            f"  Original : {state.user_query}\n"
+            f"  Resolved : {resolved_query}\n"
+            f"  Use the RESOLVED column names verbatim in SQL.\n"
+        )
+
+    cy_label = _get_niq_cy_label(relevant_tables[0]) if relevant_tables else None
+    cy_hint = (
+        f"\n📅 NIQ CY period label (use this literal string for WHERE \"Periods\" filter): "
+        f"'{cy_label}'\n"
+    ) if cy_label else ""
+
     prompt = (
-        f"Sub-task: {step.description}\n"
-        f"User question: {state.user_query}\n\n"
-        f"=== SCHEMA (use these table/column names verbatim) ===\n"
+        f"Sub-task: {resolved_step_desc}\n"
+        f"User question: {resolved_query}\n"
+        + alias_note
+        + cy_hint
+        + f"\n=== SCHEMA (use these table/column names verbatim) ===\n"
         f"{schema_context}\n\n"
         + (f"{relationships_block}\n\n" if relationships_block else "")
         + (f"{semantic_context}\n\n" if semantic_context else "")
@@ -1076,21 +1146,22 @@ def sql_writer(state: AnalyticsState) -> dict:
                 break
 
     if not sql or not sql.strip():
+        explanation = parsed.get("explanation", "")
         updated_plan = [
-            s.model_copy(update={"status": "failed", "result": "sql_writer produced empty SQL"})
+            s.model_copy(update={"status": "failed", "result": explanation or "sql_writer produced empty SQL"})
             if s.id == step.id
             else s
             for s in state.plan
         ]
+        err_msg = explanation or "sql_writer produced empty SQL"
         return {
             "last_sql": "",
             "plan": updated_plan,
-            "error": "sql_writer produced empty SQL",
+            "error": err_msg,
             "current_step": step,
         }
 
     sql = _sanitize_sql(sql, varchar_date_cols)
-
     updated_plan = [
         s.model_copy(update={"status": "running"}) if s.id == step.id else s
         for s in state.plan
@@ -1138,7 +1209,6 @@ def execute_sql(state: AnalyticsState) -> dict:
                 "plan": _updated_plan("failed", error_body),
                 "error": error_body,
             }
-
         return {
             "last_query_result": result,
             "last_query_metadata": {},
@@ -1173,7 +1243,6 @@ def verifier(state: AnalyticsState) -> dict:
             "retry_count": state.retry_count,
         }
 
-    # ── Cardinality check ──────────────────────────────────────────────────
     cardinality_warning = ""
     if not is_error and state.last_query_metadata:
         conn = get_connection()
@@ -1198,7 +1267,6 @@ def verifier(state: AnalyticsState) -> dict:
         except Exception:
             pass
 
-    # ── JOIN key check ─────────────────────────────────────────────────────
     join_warnings: list[str] = []
     if not is_error and state.last_sql and "JOIN" in state.last_sql.upper():
         try:
@@ -1206,7 +1274,6 @@ def verifier(state: AnalyticsState) -> dict:
         except Exception:
             pass
 
-    # ── Schema hint (for error correction) ────────────────────────────────
     schema_hint = ""
     most_recent = _most_recent_table()
     if most_recent:
@@ -1215,7 +1282,6 @@ def verifier(state: AnalyticsState) -> dict:
         except Exception:
             pass
 
-    # ── Semantic gap detection ─────────────────────────────────────────────
     semantic_gap_block = ""
     if not is_error and state.last_sql and state.user_query:
         try:

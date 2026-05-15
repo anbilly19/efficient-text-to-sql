@@ -22,11 +22,6 @@ _lock = threading.Lock()
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _DEFAULT_DB_PATH = _PROJECT_ROOT / ".local" / "duckdb" / "efficient-text-to-sql.duckdb"
 
-
-# ---------------------------------------------------------------------------
-# Connection
-# ---------------------------------------------------------------------------
-
 def get_connection() -> duckdb.DuckDBPyConnection:
     """Return the singleton DuckDB connection, initialising it on first call."""
     global _conn
@@ -52,11 +47,6 @@ def _add_column_if_missing(
     column: str,
     definition: str,
 ) -> None:
-    """ALTER TABLE ADD COLUMN only if the column does not already exist.
-
-    DuckDB does not support IF NOT EXISTS on ALTER TABLE ADD COLUMN, so we
-    check information_schema first.
-    """
     exists = conn.execute(
         """
         SELECT COUNT(*) FROM information_schema.columns
@@ -69,14 +59,6 @@ def _add_column_if_missing(
 
 
 def _ensure_metadata_tables(conn: duckdb.DuckDBPyConnection) -> None:
-    """Create all metadata tables if they do not exist, then migrate any
-    columns that are missing from older on-disk schemas.
-
-    Two-phase approach:
-      1. CREATE TABLE IF NOT EXISTS — no-op if the table already exists.
-      2. _add_column_if_missing() for every column added after the initial
-         schema so that existing .duckdb files are upgraded automatically.
-    """
     # ── _data_registry ─────────────────────────────────────────────────────────────
     conn.execute("""
         CREATE TABLE IF NOT EXISTS _data_registry (
@@ -112,6 +94,7 @@ def _ensure_metadata_tables(conn: duckdb.DuckDBPyConnection) -> None:
     _add_column_if_missing(conn, "_column_catalog", "is_join_key",   "BOOLEAN DEFAULT FALSE")
     _add_column_if_missing(conn, "_column_catalog", "description",   "VARCHAR")
     _add_column_if_missing(conn, "_column_catalog", "sample_values", "VARCHAR")
+
 
     # ── _relationships ──────────────────────────────────────────────────────────────
     conn.execute("""
@@ -190,7 +173,6 @@ def _auto_reattach_parquet(conn: duckdb.DuckDBPyConnection) -> None:
 # ---------------------------------------------------------------------------
 # Dynamic schema indexing
 # ---------------------------------------------------------------------------
-
 def index_table_schema(conn: duckdb.DuckDBPyConnection, dataset_name: str) -> None:
     """Introspect a newly loaded table and populate _column_catalog."""
     conn.execute(
@@ -343,12 +325,6 @@ def register_relationship(
 # ---------------------------------------------------------------------------
 
 def get_schema_context(table_names: list[str]) -> str:
-    """Return a schema block for the given tables with all column names
-    double-quoted so the LLM uses them verbatim in generated SQL.
-
-    CRITICAL: column names are shown in double-quotes exactly as they must
-    appear in DuckDB SQL.  The LLM must copy them character-for-character.
-    """
     conn = get_connection()
     lines = []
     for tbl in table_names:
@@ -386,7 +362,6 @@ def get_schema_context(table_names: list[str]) -> str:
                 if is_jk:        flags.append("join_key")
                 flag_str = ", ".join(flags)
                 desc_str = f" — {desc}" if desc else ""
-                # Column name is always double-quoted so the LLM copies it verbatim
                 lines.append(f'  "{col_name}" ({col_type}) [{flag_str}]{desc_str}')
                 if samples and samples != "[]":
                     lines.append(f"    samples: {samples}")
@@ -404,7 +379,6 @@ def get_schema_context(table_names: list[str]) -> str:
         if rels:
             lines.append("## Relationships (authoritative join keys — use ONLY these pairs)")
             for lt, lc, rt, rc, card in rels:
-                # Both sides quoted for clarity
                 lines.append(f'  "{lt}"."{lc}" → "{rt}"."{rc}"  ({card})')
 
     return "\n".join(lines)

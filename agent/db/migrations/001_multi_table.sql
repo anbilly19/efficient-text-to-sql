@@ -1,6 +1,0 @@
--- REMOVED: this migration seeded context for tables that were derived from
--- the fact table at setup time, which is the wrong design.
--- Table context is now auto-populated by load_file() when each Excel file is
--- uploaded via the agent.  See scripts/generate_test_data.py for test data.
---
--- This placeholder is kept so git history is readable.

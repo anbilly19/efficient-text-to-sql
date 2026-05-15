@@ -68,7 +68,6 @@ def set_join_key(
     column_name: str,
     conn: duckdb.DuckDBPyConnection | None = None,
 ) -> None:
-    """Mark *column_name* in *dataset_name* as a join key."""
     conn = conn or get_connection()
     conn.execute(
         "UPDATE _column_catalog SET is_join_key = TRUE "
@@ -83,7 +82,6 @@ def set_column_description(
     description: str,
     conn: duckdb.DuckDBPyConnection | None = None,
 ) -> None:
-    """Set a human-readable description for a catalog column."""
     conn = conn or get_connection()
     conn.execute(
         "UPDATE _column_catalog SET description = ? "
@@ -93,7 +91,6 @@ def set_column_description(
 
 
 def get_column_catalog(dataset_name: str, conn: duckdb.DuckDBPyConnection | None = None) -> list[dict]:
-    """Return the full _column_catalog for *dataset_name* as a list of dicts."""
     conn = conn or get_connection()
     rows = conn.execute(
         """
@@ -127,16 +124,6 @@ def list_relationships(
     tables: list[str] | None = None,
     conn: duckdb.DuckDBPyConnection | None = None,
 ) -> list[dict]:
-    """Return relationships, optionally scoped to a list of table names.
-
-    When *tables* is provided only rows where BOTH left_table AND right_table
-    are members of *tables* are returned.  This prevents unrelated tables from
-    leaking into a scoped query (e.g. asking for sales1000 + sales_rep_targets
-    must not return sales1000 <-> product_metrics rows).
-
-    Returns dicts with keys:
-        left_table, left_column, right_table, right_column, cardinality, description
-    """
     conn = conn or get_connection()
     if tables:
         rows = conn.execute(
@@ -170,12 +157,6 @@ def list_relationships(
 
 
 def validate_join_in_sql(sql: str, conn: duckdb.DuckDBPyConnection | None = None) -> list[str]:
-    """Best-effort check: return warning strings for JOIN patterns whose key
-    pairs are NOT registered in _relationships.
-
-    Only catches simple  t1.col = t2.col  patterns in ON clauses.
-    Returns [] when the SQL is clean (or the heuristic cannot parse it).
-    """
     import re
     conn = conn or get_connection()
     warnings: list[str] = []

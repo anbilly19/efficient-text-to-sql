@@ -1,6 +1,6 @@
 # Efficient Text-to-SQL — DuckDB Analytics Agent
 
-A **state-of-the-art multi-agent NL-to-SQL system** built with LangGraph, DuckDB, and OpenAI.
+A **multi-agent NL-to-SQL system** built with LangGraph, DuckDB, and OpenAI (or Ollama).  
 Zero LLM code execution — the LLM only produces SQL strings; all computation is deterministic.
 
 ## What's New — Multi-Table Support
@@ -28,77 +28,114 @@ All calls from `tools.py` into `agent.database` resolve through `sys.modules` at
 
 ---
 
-## Architecture
+---
+
+## Current State
+
+### What works today
+
+- **Multi-agent graph** — Orchestrator → Profiler → SQL Writer → Execute SQL → Verifier pipeline,
+  fully wired in LangGraph with `MemorySaver` for multi-turn conversation in Studio.
+- **File ingestion** — `load_file` accepts `.xlsx`, `.xls`, `.csv`, and `.parquet`;
+  Excel/CSV inputs are normalised to Parquet immediately on ingest.
+- **Persistence** — when `DUCKDB_PATH` points to a file, all metadata and data survive restarts;
+  `auto_reattach_parquet()` re-registers every previously loaded dataset as a DuckDB view on startup,
+  so analysts never re-upload.
+- **Schema catalog** — `_schema_catalog` stores column names, types, and sample values for every
+  loaded dataset; used by the Profiler and injected into SQL-writer prompts.
+- **Semantic lookup** — `_semantic_lookup` stores per-column statistics (distinct count, null
+  fraction, top samples, inferred description) generated automatically at ingest time.
+- **Business-term aliases** — `_semantic_map` maps natural-language terms to exact column names;
+  fully queryable by the agent and editable by the user via `register_alias` or the generated
+  CSV template.
+- **`load_file_node` graph node** — the orchestrator now routes `load …` intents to
+  `load_file_node` (previously the node existed but was never wired into the graph).
+- **Pluggable LLM backend** — `LLM_BACKEND=openai` (default) or `LLM_BACKEND=ollama`;
+  model and base URL configurable via env vars.
+- **CLI wrapper** (`cli.py`) — backend and model selectable as CLI flags without touching `.env`.
+
+### Architecture
 
 ```
 User Query
     │
     ▼
-┌─────────────┐     plan      ┌──────────────┐
-│ Orchestrator│──────────────▶│   set_step   │
-│  (planner)  │◀──── done ────│  (router)    │
-└─────────────┘               └──────┬───────┘
-        ▲                            │ profile? ─────▶ Profiler
-        │                            │ sql?     ─────▶ SQL Writer
-        │                                                   │
-        │                                            Execute SQL
-        │                                                   │
-        └──────────────── orchestrator ◀──── Verifier ◀────┘
+┌─────────────┐   load?    ┌──────────────────┐
+│ Orchestrator│────────────▶  load_file_node   │
+│  (planner)  │            └──────────────────┘
+│             │   plan     ┌──────────────┐
+│             │────────────▶   set_step   │
+│             │◀─── done ──│  (router)    │
+└─────────────┘            └──────┬───────┘
+        ▲                         │ profile? ──▶ Profiler
+        │                         │ sql?     ──▶ SQL Writer
+        │                                              │
+        │                                       Execute SQL
+        │                                              │
+        └──────────────── orchestrator ◀─── Verifier ◀┘
 ```
 
-**Agents:**
-- **Orchestrator** — decomposes the NL query into a plan, synthesises the final answer.
-- **Profiler** — explores column distributions to ground SQL semantics.
-- **SQL Writer** — generates precise DuckDB SQL (read-only SELECT only).
-- **Execute SQL** — deterministic node, no LLM, runs the query.
-- **Verifier** — cross-checks results with test queries and checksums.
+**Nodes:**
+
+| Node | Role |
+|---|---|
+| `orchestrator` | Decomposes NL query into a plan; synthesises the final answer |
+| `load_file_node` | Ingests Excel / CSV / Parquet → Parquet + DuckDB view + registry entry |
+| `profiler` | Explores column distributions to ground SQL semantics |
+| `sql_writer` | Generates precise, read-only DuckDB SQL |
+| `execute_sql` | Deterministic; runs the query, returns rows |
+| `verifier` | Cross-checks results with test queries and checksums |
+
+---
 
 ---
 
 ## Quick Start
 
 ### Prerequisites
+
 - [uv](https://docs.astral.sh/uv/) — fast Python package manager
 - Python ≥ 3.11
 - OpenAI API key
-- [Ollama](https://ollama.com/) running locally (if using local models)
 
-### 1. Install dependencies
+### 1 — Install
 
 ```bash
 uv sync --group dev
 ```
 
-### 2. Set environment variables
+### 2 — Configure
 
 ```bash
 cp .env.example .env
-# Edit .env and add your OPENAI_API_KEY
+# Edit .env — minimum: set OPENAI_API_KEY
+# For persistence also set DUCKDB_PATH and PARQUET_STORE (see below)
 ```
 
-### 3. Run LangGraph Studio
+### 3 — Run
 
 ```bash
-uv run langgraph dev
+# OpenAI (default)
+uv run cli.py
+
+# Ollama — local, no API key needed
+uv run cli.py --backend ollama
+uv run cli.py --backend ollama --model gemma4:e4b
 ```
 
-Open the URL printed in the terminal (usually `http://localhost:2024`) to chat with the agent in LangGraph Studio.
+Open the URL printed in the terminal (usually `http://localhost:2024`) to chat with the agent interactively in LangGraph Studio.
 
-### 4. Load datasets and start chatting
+### 4. Load a dataset and start chatting
+
+From a Python session or test script:
 
 ```python
 from agent.tools import load_file
-
-load_file.invoke({"path": "data/sample_sales_1000.xlsx",  "dataset_name": "sales1000"})
-load_file.invoke({"path": "data/sales_rep_targets.xlsx",  "dataset_name": "sales_rep_targets"})
-load_file.invoke({"path": "data/product_metrics.xlsx",    "dataset_name": "product_metrics"})
+load_file.invoke({"path": "data/sales.csv", "dataset_name": "sales"})
 ```
 
 Then ask in Studio:
-> *"Which sales reps are below quota? Show actual revenue vs target and the gap."*
-> *"Break down revenue by product category and compare to the baseline in product_metrics."*
-
----
+> *"What are the top 5 products by total revenue in Q4?"*
 
 ## Project Structure
 
@@ -106,28 +143,15 @@ Then ask in Studio:
 efficient-text-to-sql/
 ├── agent/
 │   ├── __init__.py
-│   ├── state.py            # AnalyticsState (Pydantic) + PlanStep
-│   ├── database.py         # DuckDB singleton, metadata tables, schema indexing
-│   ├── tools.py            # Deterministic @tool functions (lazy db dispatch)
-│   ├── prompts.py          # System prompts per node
-│   ├── nodes.py            # LangGraph node functions
-│   └── graph.py            # StateGraph → exports `graph` for Studio
-├── data/
-│   ├── sample_sales_1000.xlsx
-│   ├── sales_rep_targets.xlsx
-│   └── product_metrics.xlsx
-├── scripts/
-│   ├── seed_multi_table.py     # Seed all three tables + register join keys
-│   └── generate_test_data.py   # Regenerate synthetic test data
-├── tests/
-│   ├── test_multi_table.py             # Relationship detection, JOIN queries
-│   ├── test_multi_table_seed.py        # Seed data integrity
-│   ├── test_parquet_persistence.py     # Parquet + catalog correctness
-│   ├── test_table_selection.py         # Keyword-based table routing
-│   └── test_langgraph_query_rounds.py  # 40 live LLM round-trip queries
-├── langgraph.json
-├── pyproject.toml
-├── .env.example
+│   ├── state.py        # AnalyticsState (Pydantic) + PlanStep
+│   ├── database.py     # DuckDB singleton + _schema_catalog / _semantic_map
+│   ├── tools.py        # 6 deterministic @tool functions
+│   ├── prompts.py      # System prompts for each node
+│   ├── nodes.py        # LangGraph node functions
+│   └── graph.py        # StateGraph → exports `graph` for Studio
+├── langgraph.json      # LangGraph Studio config
+├── pyproject.toml      # uv project + dependencies
+├── .env.example        # Environment variable template
 └── README.md
 ```
 
@@ -151,18 +175,17 @@ pytest tests/test_langgraph_query_rounds.py -m "not round_12" -v
 
 ---
 
-## Key Design Decisions
+---
 
-| Decision | Rationale |
+## Tools Reference
+
+| Tool | Description |
 |---|---|
 | **Zero LLM code execution** | Safety + auditability — LLM outputs SQL strings only |
-| **DuckDB internal metadata** | No external Postgres; all catalog tables live inside DuckDB |
-| **Parquet persistence** | Each ingested file is stored as Parquet; views are re-attached on restart |
-| **Lazy `sys.modules` dispatch** | Prevents stale binding when `agent.database` is reset (tests + restarts) |
+| **DuckDB internal metadata** | No external Postgres; `_schema_catalog` + `_semantic_map` live inside DuckDB |
 | **MemorySaver checkpointer** | Multi-turn conversation in Studio without Redis/Postgres |
 | **uv** | Fastest Python dependency resolver; single `uv sync` installs everything |
-
----
+| **gpt-4o** | Best instruction-following for structured JSON outputs |
 
 ## Environment Variables
 
@@ -170,20 +193,6 @@ pytest tests/test_langgraph_query_rounds.py -m "not round_12" -v
 |---|---|---|---|
 | `OPENAI_API_KEY` | ✅ | — | Your OpenAI API key |
 | `OPENAI_MODEL` | ❌ | `gpt-4o` | Model name override |
-| `DUCKDB_PATH` | ❌ | `.local/duckdb/efficient-text-to-sql.duckdb` | Path to persistent DuckDB file |
-| `PARQUET_STORE` | ❌ | `.local/parquet/` | Directory for Parquet files |
+| `DUCKDB_PATH` | ❌ | `:memory:` | Path to a persistent DuckDB file |
 | `LANGSMITH_API_KEY` | ❌ | — | Enable LangSmith tracing |
 | `LANGCHAIN_TRACING_V2` | ❌ | — | Set to `true` to enable tracing |
-
----
-
-## Upcoming — NIQ Data Integration
-
-The next development phase targets real-world NIQ (NielsenIQ) retail datasets. Planned work:
-
-- **NIQ schema adapters** — column normalisation and type mapping for NIQ export formats (retailer, period, measure, hierarchy columns)
-- **Domain-aware semantic map** — pre-seed `_semantic_map` with NIQ business terms (`volume_sales`, `value_sales`, `weighted_distribution`, `numeric_distribution`, `SOM`, etc.)
-- **Period handling** — NIQ uses non-standard period keys (e.g. `P01 2024`); dedicated date parser and DuckDB macro for period-to-date conversion
-- **Hierarchy support** — product hierarchy (total market → category → subcategory → brand → SKU) and retail hierarchy (total → channel → banner → store) as first-class join dimensions
-- **Measure catalogue** — explicit registry of derived measures (share of market, rate of sale, price index) with formulas stored in `_semantic_map` so the SQL Writer can reconstruct them without guessing
-- **Multi-period comparisons** — rolling MAT, YTD, and vs-year-ago logic baked into the orchestrator planning step
