@@ -155,6 +155,31 @@ B. NIQ pre-aggregated metrics — aggregation rules (CRITICAL):
   Correct final-answer phrasing: "The average penetration rate is 0.155%."
   WRONG: "The penetration rate is 15.5%" (do not scale up).
 
+- NIQ RANKING / TOP-N / MIN / MAX RULE (critical):
+  Any question that ranks, tops, bottoms, or finds the min/max of a NIQ per-unit
+  metric ("Penetration (%)", "Ausgaben pro ...", "Einkaufsakte pro ...") by
+  "Products" or "Retailers" MUST use AVG() + GROUP BY. A bare SELECT of the raw
+  column without GROUP BY returns individual (Product, Retailer) rows — the same
+  product can appear multiple times and the ranking will be wrong.
+  WRONG (raw row select — no aggregation):
+    SELECT "Products", "Penetration (%)"
+    FROM niq_panel
+    WHERE "Periods" = 'Letzte 12 M - 52 W bis 28/12/25'
+    ORDER BY "Penetration (%)" DESC
+    LIMIT 5
+  RIGHT (aggregated per product — correct ranking):
+    SELECT "Products", AVG("Penetration (%)") AS avg_penetration
+    FROM niq_panel
+    WHERE "Periods" = 'Letzte 12 M - 52 W bis 28/12/25'
+    GROUP BY "Products"
+    ORDER BY avg_penetration DESC
+    LIMIT 5
+  This rule applies equally to:
+  - "top N products by penetration"
+  - "which product has the lowest/highest buyer reach"
+  - "rank retailers by spend per buyer"
+  - any ORDER BY + LIMIT on a NIQ per-unit metric without GROUP BY
+
 - Correct pattern for "spend per buyer by retailer":
     SELECT "Retailers", AVG("Ausgaben pro Käuferhaushalt") AS avg_spend_per_buyer
     FROM niq_panel
@@ -480,6 +505,21 @@ Verification checklist:
       GROUP BY "Products"
       HAVING AVG("Penetration (%) vs. VJ (% Ver.)") > 0
       ORDER BY yoy_delta DESC
+19. NIQ raw-row ranking without GROUP BY: if the SQL selects a NIQ per-unit metric
+    column ("Penetration (%)", "Ausgaben pro ...", "Einkaufsakte pro ...") directly
+    in SELECT without wrapping it in AVG(), and the query has an ORDER BY + LIMIT
+    or is otherwise intended to rank/find top-N/bottom-N/min/max by that metric,
+    set verdict=fail. A bare SELECT returns individual (Product, Retailer) rows —
+    the same product appears once per retailer and the ranking is misleading.
+    Provide corrected_sql that adds AVG(<metric>) AS <alias> and GROUP BY "Products"
+    (or "Retailers" as appropriate).
+    Example corrected pattern for "top 5 products by penetration":
+      SELECT "Products", AVG("Penetration (%)") AS avg_penetration
+      FROM niq_panel
+      WHERE "Periods" = 'Letzte 12 M - 52 W bis 28/12/25'
+      GROUP BY "Products"
+      ORDER BY avg_penetration DESC
+      LIMIT 5
 
 Never fabricate data. Do not call any tools in this node.
 """
