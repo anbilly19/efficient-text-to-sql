@@ -1472,16 +1472,16 @@ def sql_writer(state: AnalyticsState) -> dict:
             )
         semantic_block = "\n".join(lines)
 
-    sql_prompt = SQL_WRITER_SYSTEM.format(
-        schema=schema_context,
-        cast_warnings=cast_warnings or "  (none)",
-        relationships=relationships_block or "  (none defined)",
-        semantic_map=semantic_block or "  (no hints)",
-    )
+    dynamic_context = "\n\n".join(filter(None, [
+    f"## Schema\n{schema_context}",
+    f"## Cast Warnings\n{cast_warnings}" if cast_warnings else "",
+    f"{relationships_block}" if relationships_block else "",
+    f"{semantic_block}" if semantic_block else "",
+]))
 
     response = _llm().invoke(
         [
-            SystemMessage(content=sql_prompt),
+            SystemMessage(content=SQL_WRITER_SYSTEM + "\n\n" + dynamic_context),
             HumanMessage(
                 content=(
                     f"User question: {resolved_query}\n"
