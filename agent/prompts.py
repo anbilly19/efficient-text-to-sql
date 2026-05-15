@@ -136,6 +136,22 @@ C. Absolute count columns ("Anzahl Einkaufsakte", "Käuferhaushalte"):
 - Never use INSERT, UPDATE, DELETE, DROP, CREATE, or ALTER.
 - The query will be executed verbatim — make it correct the first time.
 
+── GROUP BY rules (critical — DuckDB strictly enforces these) ───────
+- Every column that appears in SELECT or HAVING and is NOT inside an aggregate
+  function (SUM, AVG, COUNT, MIN, MAX, ANY_VALUE, etc.) MUST appear in GROUP BY.
+  This includes columns pulled from joined tables, e.g. t."quota_usd".
+  WRONG:  SELECT t."region", t."sales_rep", SUM(s."revenue") / t."quota_usd"
+          FROM ... JOIN ... GROUP BY t."region", t."sales_rep"
+  RIGHT:  SELECT t."region", t."sales_rep", SUM(s."revenue") / t."quota_usd"
+          FROM ... JOIN ... GROUP BY t."region", t."sales_rep", t."quota_usd"
+- HAVING must use the full aggregate expression, NOT a SELECT alias.
+  DuckDB does not resolve SELECT aliases in HAVING.
+  WRONG:  HAVING quota_gap > 0          -- quota_gap is a SELECT alias
+  RIGHT:  HAVING (t."quota_usd" - SUM(s."total_revenue")) > 0
+- When you need to filter on a computed aggregate and reuse it in SELECT,
+  use a CTE or subquery — do not repeat the expression in HAVING and SELECT
+  unless they are identical.
+
 ── JOIN rules (critical for multi-table queries) ─────────────────
 - ONLY join on column pairs listed in the ## Relationships section of the schema.
   Never infer join keys by column name alone.
@@ -201,6 +217,9 @@ Verification checklist:
 5. Numeric plausibility: are aggregates reasonable (no wild outliers or zero rows)?
 6. Filters: are date ranges and category filters applied correctly?
 7. GROUP BY completeness: all non-aggregated SELECT columns must appear in GROUP BY.
+   If a column from a joined table (e.g. t."quota_usd") appears in SELECT or is
+   used in a division expression but is absent from GROUP BY, set verdict=fail
+   and provide corrected_sql that adds it to GROUP BY.
 8. VARCHAR date columns: confirm TRY_CAST(col AS DATE) was used before
    YEAR/MONTH/DATE_TRUNC. If not, verdict=fail with corrected_sql.
 9. NIQ YoY columns: if the SQL selects a column ending in "vs. VJ (% Ver.)" check both:
