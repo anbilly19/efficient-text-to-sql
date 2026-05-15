@@ -1,4 +1,4 @@
-"""LangGraph node functions – one per agent role."""
+﻿"""LangGraph node functions – one per agent role."""
 from __future__ import annotations
 
 import json
@@ -153,6 +153,9 @@ _NIQ_METRIC_TERMS: dict[str, str] = {
     "ausgaben":                 "Ausgaben pro Käuferhaushalt",
     "frequency":                "Einkaufsakte pro Käuferhaushalt",
     "einkaufsakte":             "Einkaufsakte pro Käuferhaushalt",
+    "purchase frequency":       "Einkaufsakte pro Käuferhaushalt",
+    "buyer purchase frequency": "Einkaufsakte pro Käuferhaushalt",
+    "einkaufsfrequenz":         "Einkaufsakte pro Käuferhaushalt",
     "käuferhaushalte":          "Käuferhaushalte",
     "buyers":                   "Käuferhaushalte",
 }
