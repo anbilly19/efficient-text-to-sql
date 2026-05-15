@@ -29,6 +29,15 @@ Rules:
 - If the user's request is already expressed as a valid SQL statement in the plan
   description, preserve that intent exactly; do not broaden the task into an
   unnecessary multi-table comparison.
+
+── NIQ final-answer interpretation rules (apply when answering NIQ panel questions) ─
+- "Penetration (%)" values in niq_panel are stored as RAW PERCENTAGE POINTS.
+  A value of 0.155 means 0.155 percent, NOT 15.5 percent.
+  NEVER multiply a Penetration (%) result by 100 when writing the final_answer.
+  Report it exactly as returned by the SQL (e.g. "The average penetration rate is 0.155%").
+- "Ausgaben pro Käuferhaushalt" values are in Euros. Report them with a € symbol.
+- YoY delta columns ("vs. VJ (% Ver.)") are already percentage-point changes.
+  Do not re-scale them.
 """
 
 PROFILER_SYSTEM = """\
@@ -81,22 +90,45 @@ Output a single JSON object:
 ── NIQ panel rules (apply when table has a "Periods" column) ────────
 
 A. YoY delta columns (names ending in "vs. VJ (% Ver.)"):
-- These columns only contain real values for the CURRENT YEAR period row.
+- These columns contain precomputed YoY % changes. Both CY and PY rows can have
+  nulls (≈15–20% null rate) — always add IS NOT NULL to any filter or HAVING.
 - When selecting a YoY delta column, ALWAYS:
   1. Filter: WHERE "Periods" = '<cy_period_label>'
      Use the CY period string from the schema or alias note
      (e.g. 'Letzte 12 M - 52 W bis 28/12/25').
-  2. GROUP BY the most granular dimension available (prefer "Products",
+  2. Add AND <yoy_col> IS NOT NULL in the WHERE clause.
+  3. GROUP BY the most granular dimension available (prefer "Products",
      then "Retailers"; use both if the question asks about both).
-  3. Use AVG(<yoy_col>) AS yoy_delta in the SELECT.
-  4. ORDER BY yoy_delta DESC (or ASC for bottom-N queries).
-  5. Add AND <yoy_col> IS NOT NULL to exclude launch-year nulls.
+  4. Use AVG(<yoy_col>) AS yoy_delta in the SELECT.
+  5. ORDER BY yoy_delta DESC (or ASC for bottom-N queries).
 - NEVER return a single-row ungrouped AVG across the entire table — that is
   meaningless for a YoY delta question.
 - NEVER use LAG(), window functions, or CY-minus-PY arithmetic to compute YoY
   delta. The column already contains the precomputed % change.
 - "Penetration (%) vs. VJ (% Ver.)" is the direct YoY penetration change column;
   select it as-is using the rules above.
+
+- YoY FILTER RULE (critical): when the user asks "which products had a POSITIVE
+  (or negative) YoY change", the sign filter MUST be applied AFTER grouping
+  using HAVING, NOT as a WHERE clause before GROUP BY.
+  Filtering with WHERE col > 0 before GROUP BY includes rows where only a single
+  (Product, Retailer) row is positive, even if the product's average is negative.
+  WRONG (pre-group filter — misclassifies products):
+    SELECT "Products", AVG("Penetration (%) vs. VJ (% Ver.)") AS yoy_delta
+    FROM niq_panel
+    WHERE "Periods" = 'Letzte 12 M - 52 W bis 28/12/25'
+      AND "Penetration (%) vs. VJ (% Ver.)" > 0
+    GROUP BY "Products"
+  RIGHT (post-group HAVING — correct product classification):
+    SELECT "Products", AVG("Penetration (%) vs. VJ (% Ver.)") AS yoy_delta
+    FROM niq_panel
+    WHERE "Periods" = 'Letzte 12 M - 52 W bis 28/12/25'
+      AND "Penetration (%) vs. VJ (% Ver.)" IS NOT NULL
+    GROUP BY "Products"
+    HAVING AVG("Penetration (%) vs. VJ (% Ver.)") > 0
+    ORDER BY yoy_delta DESC
+- This rule applies to ALL vs. VJ columns, not just Penetration.
+
 - Correct pattern for YoY penetration change by product:
     SELECT "Products",
            AVG("Penetration (%) vs. VJ (% Ver.)") AS yoy_penetration_delta
@@ -115,6 +147,14 @@ B. NIQ pre-aggregated metrics — aggregation rules (CRITICAL):
 - "Käuferhaushalte" is a COUNT of households — it is NOT an ID column.
   NEVER use COUNT(DISTINCT "Käuferhaushalte"); use SUM("Käuferhaushalte") to
   total up buying households, or AVG() if averaging across rows.
+
+- PENETRATION (%) UNIT SCALE (critical for final answer):
+  Values in "Penetration (%)" are stored as RAW PERCENTAGE POINTS.
+  Example: 0.155 means 0.155%, NOT 15.5%.
+  NEVER multiply by 100. Report the value exactly as returned by AVG().
+  Correct final-answer phrasing: "The average penetration rate is 0.155%."
+  WRONG: "The penetration rate is 15.5%" (do not scale up).
+
 - Correct pattern for "spend per buyer by retailer":
     SELECT "Retailers", AVG("Ausgaben pro Käuferhaushalt") AS avg_spend_per_buyer
     FROM niq_panel
@@ -424,6 +464,22 @@ Verification checklist:
       JOIN rep_top_product rtp
         ON qg."sales_rep" = rtp."sales_rep" AND qg."region" = rtp."region"
       ORDER BY qg.quota_gap ASC
+18. YoY pre-group sign filter: if the SQL filters a "vs. VJ (% Ver.)" column
+    with WHERE <col> > 0 (or < 0) BEFORE a GROUP BY, set verdict=fail.
+    This misclassifies products because it includes any (Product, Retailer) row
+    that is positive, even if the product's average across retailers is negative.
+    The sign filter MUST be applied AFTER grouping using HAVING.
+    Provide corrected_sql that:
+    - Moves the sign condition from WHERE to HAVING AVG(<col>) > 0 (or < 0)
+    - Keeps AND <col> IS NOT NULL in the WHERE clause
+    Example corrected pattern:
+      SELECT "Products", AVG("Penetration (%) vs. VJ (% Ver.)") AS yoy_delta
+      FROM niq_panel
+      WHERE "Periods" = 'Letzte 12 M - 52 W bis 28/12/25'
+        AND "Penetration (%) vs. VJ (% Ver.)" IS NOT NULL
+      GROUP BY "Products"
+      HAVING AVG("Penetration (%) vs. VJ (% Ver.)") > 0
+      ORDER BY yoy_delta DESC
 
 Never fabricate data. Do not call any tools in this node.
 """
