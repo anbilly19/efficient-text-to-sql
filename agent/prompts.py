@@ -152,6 +152,34 @@ C. Absolute count columns ("Anzahl Einkaufsakte", "Käuferhaushalte"):
   use a CTE or subquery — do not repeat the expression in HAVING and SELECT
   unless they are identical.
 
+── NESTED AGGREGATE rule (DuckDB forbids aggregate inside aggregate) ─
+- NEVER place an aggregate function inside another aggregate function.
+  DuckDB will raise: "aggregate function calls cannot be nested".
+  This error occurs any time you write SUM(... SUM(...) ...),
+  SUM(... COALESCE(SUM(...), 0) ...), AVG(... COUNT(...) ...), etc.
+- The correct pattern is a TWO-LEVEL CTE:
+  Step 1 — inner CTE: compute per-group aggregates (SUM, COALESCE, etc.)
+  Step 2 — outer SELECT: aggregate over the CTE results.
+  WRONG (nested aggregate — will error):
+    SELECT SUM(t."quota_usd" - COALESCE(SUM(s."total_revenue"), 0))
+    FROM sales_rep_targets t
+    LEFT JOIN sales1000 s ON t."sales_rep" = s."sales_rep"
+    GROUP BY t."quota_usd"
+  RIGHT (two-level CTE):
+    WITH rep_revenue AS (
+        SELECT t."sales_rep", t."region", t."quota_usd",
+               COALESCE(SUM(s."total_revenue"), 0) AS actual_revenue
+        FROM sales_rep_targets t
+        LEFT JOIN sales1000 s
+            ON t."sales_rep" = s."sales_rep" AND t."region" = s."region"
+        GROUP BY t."sales_rep", t."region", t."quota_usd"
+    )
+    SELECT SUM("quota_usd" - actual_revenue) AS total_quota_gap
+    FROM rep_revenue
+- This rule applies regardless of how many tables are joined or how the
+  outer aggregate is named. Always materialise intermediate aggregates
+  in a CTE before applying a second level of aggregation.
+
 ── JOIN rules (critical for multi-table queries) ─────────────────
 - ONLY join on column pairs listed in the ## Relationships section of the schema.
   Never infer join keys by column name alone.
@@ -241,6 +269,10 @@ Verification checklist:
     uses GROUP BY, but has NO WHERE "Periods" = '...' clause, set verdict=fail.
     The CY label is visible in the sub-task description or schema hint.
     Provide corrected_sql that adds WHERE "Periods" = '<cy_label>'.
+13. Nested aggregates: if the SQL contains an aggregate function nested inside
+    another aggregate (e.g. SUM(... SUM(...) ...) or SUM(COALESCE(SUM(...), 0))),
+    set verdict=fail. Provide corrected_sql using a two-level CTE where the inner
+    CTE computes per-group aggregates and the outer SELECT aggregates over it.
 
 Never fabricate data. Do not call any tools in this node.
 """
