@@ -34,6 +34,12 @@ Note on adversarial queries
 Some queries intentionally reference columns that do NOT exist in NIQ data
 (e.g. 'customer_id', 'invoice_number'). The agent must report gracefully
 that the column is absent rather than hallucinating a result.
+
+Note on table scoping
+---------------------
+Every run in this file passes allowed_tables=[NIQ_DATASET] in the input
+payload. This ensures the Orchestrator only sees niq_panel, even when other
+tables (sales1000, sales_rep_targets, etc.) are loaded in the same session.
 """
 import os
 import time
@@ -178,7 +184,7 @@ TOTAL_QUERIES = len(_ALL_QUERIES)
 
 
 # ---------------------------------------------------------------------------
-# Helpers  (identical to test_langgraph_query_rounds.py)
+# Helpers
 # ---------------------------------------------------------------------------
 
 class LangGraphTestError(AssertionError):
@@ -239,17 +245,27 @@ def _extract_last_ai_text(outputs: dict[str, Any]) -> str:
     return ""
 
 
-def _run_wait(thread_id: str, user_text: str) -> dict[str, Any]:
+def _run_wait(thread_id: str, user_text: str, allowed_tables: list[str] | None = None) -> dict[str, Any]:
+    """Submit a run and wait for completion.
+
+    allowed_tables restricts which tables the Orchestrator may use.
+    All NIQ tests pass [NIQ_DATASET] here to prevent the agent from
+    drifting onto sales1000 or other tables loaded in the same session.
+    """
+    agent_input: dict[str, Any] = {
+        "messages": [
+            {
+                "type": "human",
+                "content": [{"type": "text", "text": user_text}],
+            }
+        ]
+    }
+    if allowed_tables is not None:
+        agent_input["allowed_tables"] = allowed_tables
+
     payload = {
         "assistant_id": ASSISTANT_ID,
-        "input": {
-            "messages": [
-                {
-                    "type": "human",
-                    "content": [{"type": "text", "text": user_text}],
-                }
-            ]
-        },
+        "input": agent_input,
     }
 
     paths_to_try = [
@@ -301,6 +317,7 @@ def loaded_niq(niq_thread_id: str) -> None:
     """Load the NIQ panel file once for the whole test session."""
     if not NIQ_PATH:
         pytest.skip("NIQ_SYNTHETIC_PATH not set — skipping NIQ fixture setup")
+    # Load command does not need table scoping — it's a control command, not a query
     outputs = _run_wait(niq_thread_id, LOAD_NIQ_CMD)
     _assert_niq_loaded(outputs, LOAD_NIQ_CMD)
 
@@ -324,7 +341,9 @@ def test_niq_query(
     n = _query_counter["n"]
     print(f"\n[{n:>2}/{TOTAL_QUERIES}] {round_name}[q{query_index}]  ➤  {query}")
 
-    outputs = _run_wait(niq_thread_id, query)
+    # Scope every query strictly to niq_panel — prevents Orchestrator from
+    # picking sales1000 or other tables even if they are loaded in the session.
+    outputs = _run_wait(niq_thread_id, query, allowed_tables=[NIQ_DATASET])
     answer = _extract_last_ai_text(outputs)
     error = str(outputs.get("error", "") or "")
     result_text = str(outputs.get("last_query_result", "") or "")
