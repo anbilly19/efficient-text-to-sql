@@ -107,6 +107,14 @@ def _all_table_names() -> list[str]:
         return []
 
 
+def _visible_tables(state: AnalyticsState) -> list[str]:
+    """Return tables visible in this thread, honoring state.allowed_tables."""
+    all_t = _all_table_names()
+    if state.allowed_tables is None:
+        return all_t
+    return [t for t in all_t if t in state.allowed_tables]
+
+
 def _most_recent_table() -> str:
     conn = get_connection()
     try:
@@ -180,12 +188,12 @@ _NIQ_DIMENSION_COLS = ["Products", "Retailers", "Demographics", "Geographies", "
 # ---------------------------------------------------------------------------
 
 _SEMANTIC_LOOKUP_PATTERNS = re.compile(
-    r"\bwhat\s+(?:does|do)\s+['\"']?(?P<term>[\w\s\u00c0-\u024f]+?)['\"']?\s+"
+    r"\bwhat\s+(?:does|do)\s+['\"]?(?P<term>[\w\s\u00c0-\u024f]+?)['\"]?\s+"
     r"(?:map\s+to|correspond\s+to|mean|stand\s+for|refer\s+to|translate\s+to)\b"
-    r"|\blook\s+up\s+['\"']?(?P<term2>[\w\s\u00c0-\u024f]+?)['\"']?\s+in\s+(?:the\s+)?semantic\s+map\b"
-    r"|\bwhat\s+column\s+(?:corresponds?\s+to|is|matches?)\s+['\"']?(?P<term3>[\w\s\u00c0-\u024f]+?)['\"']?"
+    r"|\blook\s+up\s+['\"]?(?P<term2>[\w\s\u00c0-\u024f]+?)['\"]?\s+in\s+(?:the\s+)?semantic\s+map\b"
+    r"|\bwhat\s+column\s+(?:corresponds?\s+to|is|matches?)\s+['\"]?(?P<term3>[\w\s\u00c0-\u024f]+?)['\"]?"
     r"(?:\s+in\b|\s*\?|$)"
-    r"|\bsemantic\s+map\b.{0,60}\b['\"']?(?P<term4>[\w\s\u00c0-\u024f]+?)['\"']?\s*(?:for|in|of)\b",
+    r"|\bsemantic\s+map\b.{0,60}\b['\"]?(?P<term4>[\w\s\u00c0-\u024f]+?)['\"]?\s*(?:for|in|of)\b",
     re.IGNORECASE,
 )
 
@@ -266,12 +274,60 @@ def _build_semantic_map_reply(term: str, dataset: str | None, all_tables: list[s
 
 
 # ---------------------------------------------------------------------------
+# Fast-path 7: user-controlled table scope
+# ---------------------------------------------------------------------------
+
+_SCOPE_RESET_PATTERNS = re.compile(
+    r"\b(?:reset|clear|remove|lift|use all|show all)\b.{0,40}"
+    r"\b(?:scope|restriction|limit|tables?)\b",
+    re.IGNORECASE,
+)
+
+_SCOPE_PATTERNS = [
+    re.compile(
+        r"\b(?:limit|restrict|scope|only use|focus on|just use|use only)\b.{0,60}"
+        r"\b(?:tables?|datasets?)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bonly\s+(?:query|look at|use)\s+(?P<tables>[\w,\s]+)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:set|change|update)\s+(?:my\s+)?(?:table\s+)?scope\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bforget\s+(?:the\s+)?other\s+tables?\b", re.IGNORECASE),
+]
+
+
+def _detect_scope_intent(text: str, all_tables: list[str]) -> dict | None:
+    """
+    Returns:
+      {"action": "set", "tables": [...]}  – restrict to named tables
+      {"action": "reset"}                 – clear restriction
+      None                                – no scope intent
+    """
+    if _SCOPE_RESET_PATTERNS.search(text):
+        return {"action": "reset"}
+
+    lowered = text.lower()
+
+    for p in _SCOPE_PATTERNS:
+        if p.search(text):
+            mentioned = [t for t in all_tables if t.lower() in lowered]
+            if mentioned:
+                return {"action": "set", "tables": mentioned}
+    return None
+
+
+# ---------------------------------------------------------------------------
 
 
 def _build_empty_sql_message(explanation: str, user_query: str, all_tables: list[str]) -> str:
     """Build a friendly, informative message when sql_writer returns empty SQL."""
     # Extract the concept the user asked for from the explanation
-    concept_match = re.search(r"matching ['\"']?([\w\s]+)['\"']?", explanation, re.IGNORECASE)
+    concept_match = re.search(r"matching ['\"]?([\w\s]+)['\"]?", explanation, re.IGNORECASE)
     concept = concept_match.group(1).strip() if concept_match else ""
 
     # Collect dimension columns from the most relevant table
@@ -696,15 +752,15 @@ _META_PATTERNS = [
 ]
 
 _TABLE_NOT_FOUND_RE = re.compile(
-    r'(?:Table with name|Table|Catalog Error.*?table)\s+["\']?([\w]+)["\']?\s+does not exist'
-    r'|(?:relation|table)\s+["\']?([\w.]+)["\']?\s+does not exist'
+    r'(?:Table with name|Table|Catalog Error.*?table)\s+["\'']?([\w]+)["\'']?\s+does not exist'
+    r'|(?:relation|table)\s+["\'']?([\w.]+)["\'']?\s+does not exist'
     r'|([\w"]+)\s+not exist',
     re.IGNORECASE,
 )
 
 _BINDER_ERROR_RE = re.compile(
-    r'Binder Error[:\s]+Referenced column\s+["\']?([\w ]+)["\']?\s+not found'
-    r'|Binder Error[:\s]+.*?Column[\s]+["\']?([\w ]+)["\']?\s+not found',
+    r'Binder Error[:\s]+Referenced column\s+["\'']?([\w ]+)["\'']?\s+not found'
+    r'|Binder Error[:\s]+.*?Column[\s]+["\'']?([\w ]+)["\'']?\s+not found',
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -1065,9 +1121,9 @@ def _build_relationships_block(table_names: list[str]) -> str:
 
 def orchestrator(state: AnalyticsState) -> dict:
     current_query = _resolve_user_query(state)
-    all_tables = _all_table_names()
+    all_tables = _visible_tables(state)
     most_recent = _most_recent_table()
-    tables_summary = get_table_summaries()
+    tables_summary = get_table_summaries(allowed_tables=state.allowed_tables)
 
     base_reset: dict = {
         "user_query": current_query,
@@ -1202,6 +1258,31 @@ def orchestrator(state: AnalyticsState) -> dict:
         term, dataset = sem_match
         sem_reply = _build_semantic_map_reply(term, dataset, all_tables)
         return {**base_reset, "final_answer": sem_reply, "messages": [AIMessage(content=sem_reply)]}
+
+    # ── Fast-path 7: user-controlled table scope ────────────────────────────
+    scope_cmd = _detect_scope_intent(current_query, _all_table_names())
+    if scope_cmd:
+        if scope_cmd["action"] == "reset":
+            reply = "✅ Table scope cleared. I can now query all loaded tables."
+            return {
+                **base_reset,
+                "allowed_tables": None,
+                "final_answer": reply,
+                "messages": [AIMessage(content=reply)],
+            }
+        else:
+            scoped = scope_cmd["tables"]
+            names = ", ".join(f"`{t}`" for t in scoped)
+            reply = (
+                f"✅ Scope set. I'll only query {names} for this thread.\n\n"
+                "To reset, say: *use all tables* or *clear scope*."
+            )
+            return {
+                **base_reset,
+                "allowed_tables": scoped,
+                "final_answer": reply,
+                "messages": [AIMessage(content=reply)],
+            }
 
     # ── LLM planning ───────────────────────────────────────────────────────
     ORCHESTRATOR_SYSTEM = f"""You are the Orchestrator of a DuckDB analytics agent.
@@ -1402,7 +1483,7 @@ def sql_writer(state: AnalyticsState) -> dict:
     if step is None:
         return {"last_sql": "", "error": "No pending step found for sql_writer."}
 
-    all_tables = _all_table_names()
+    all_tables = _visible_tables(state)
     relevant_tables = _select_relevant_tables(
         state.user_query + " " + step.description, all_tables
     )
@@ -1619,7 +1700,7 @@ def verifier(state: AnalyticsState) -> dict:
     if not sql or not result or result.startswith("ERROR"):
         return {"verification_verdict": "skip", "verification_feedback": ""}
 
-    all_tables = _all_table_names()
+    all_tables = _visible_tables(state)
     relevant_tables = _select_relevant_tables(user_query, all_tables)
 
     row_count = state.last_query_metadata.get("row_count", "?")
