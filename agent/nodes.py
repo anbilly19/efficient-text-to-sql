@@ -1697,7 +1697,8 @@ def verifier(state: AnalyticsState) -> dict:
     result = state.last_query_result
     user_query = state.user_query
 
-    if not sql or not result or result.startswith("ERROR"):
+    # Skip only on hard SQL errors — not on empty SQL (which should retry)
+    if not sql or result.startswith("ERROR"):
         return {"verification_verdict": "skip", "verification_feedback": ""}
 
     all_tables = _visible_tables(state)
@@ -1708,10 +1709,10 @@ def verifier(state: AnalyticsState) -> dict:
 
     gap_warnings = _detect_semantic_gaps(user_query, sql, relevant_tables)
     gap_section = (
-    f"Semantic gap warnings detected:\n{gap_warnings}"
-    if gap_warnings
-    else ""
-)
+        f"Semantic gap warnings detected:\n{gap_warnings}"
+        if gap_warnings
+        else ""
+    )
 
     VERIFIER_PROMPT = VERIFIER_SYSTEM + f"""
 
@@ -1726,25 +1727,38 @@ Result preview:
 
 {gap_section}
 
-Evaluate the result. Output ONLY JSON:
-{{"verdict": "ok" | "retry" | "warning", "feedback": "..."}}
-- "ok": result answers the question correctly
-- "retry": result is wrong or empty — include corrected SQL hint in feedback
-- "warning": result is technically correct but has a semantic gap noted above
+Evaluate the result and return ONLY JSON with these exact verdict values:
+{{"verdict": "pass" | "fail" | "warning", "feedback": "...", "corrected_sql": "<only if verdict is fail>"}}
+- "pass": result correctly answers the question
+- "fail": result is wrong, empty, or has a SQL error — provide corrected_sql
+- "warning": result is technically correct but has a semantic gap
 """
 
     response = _llm().invoke([HumanMessage(content=VERIFIER_PROMPT)])
     raw = _extract_text(response.content)
     parsed = _try_parse_json(raw) or {}
-    verdict = parsed.get("verdict", "ok")
+    verdict = parsed.get("verdict", "pass")
     feedback = parsed.get("feedback", "")
+    corrected_sql = parsed.get("corrected_sql", "")
 
-    if verdict == "retry" and state.retry_count >= 2:
+    # Normalise legacy verdict strings in case model drifts back to old values
+    if verdict == "ok":
+        verdict = "pass"
+    elif verdict == "retry":
+        verdict = "fail"
+
+    if verdict == "fail" and state.retry_count >= 2:
         verdict = "warning"
         feedback = f"Max retries reached. Last feedback: {feedback}"
 
-    if verdict == "retry":
+    if verdict == "fail":
         step = state.current_step
+        # Use corrected_sql as the new feedback hint for sql_writer if provided
+        retry_feedback = (
+            f"{feedback}\nSuggested correction:\n{corrected_sql}"
+            if corrected_sql
+            else feedback
+        )
         updated_plan = (
             [
                 s.model_copy(update={"status": "pending"}) if s.id == step.id else s
@@ -1755,7 +1769,7 @@ Evaluate the result. Output ONLY JSON:
         )
         return {
             "verification_verdict": verdict,
-            "verification_feedback": feedback,
+            "verification_feedback": retry_feedback,
             "plan": updated_plan,
             "retry_count": state.retry_count + 1,
         }
