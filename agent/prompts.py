@@ -204,36 +204,63 @@ C. Absolute count columns ("Anzahl Einkaufsakte", "Käuferhaushalte"):
 - When joining to a top-N CTE, join on the actual business key produced by that CTE
   (e.g. product, category, region), not on a tautology or unrelated dimension.
 
-── TOP-N PER GROUP rule (use window function CTE, not correlated IN) ─
-- When the question asks for "the top product", "highest-revenue item", or any
-  per-group maximum/minimum, NEVER use a correlated IN subquery in a JOIN predicate
-  to filter to the top row. That pattern produces fan-out (multiple rows per group).
-- The correct pattern is:
-  Step 1 — rank CTE: compute per-group rank using RANK() or ROW_NUMBER() inside
-           a window function, partitioned by the group key.
-  Step 2 — filter: WHERE rnk = 1 in an outer SELECT or JOIN.
-  WRONG (correlated IN — produces fan-out):
-    JOIN product_revenue pr
-      ON pr.product IN (
-        SELECT sa.product FROM sales1000 sa
-        WHERE sa.sales_rep = qg.sales_rep AND sa.region = qg.region
-      )
-  RIGHT (window function CTE):
-    WITH rep_top_product AS (
-        SELECT "sales_rep", "region", "product",
-               ROW_NUMBER() OVER (
-                   PARTITION BY "sales_rep", "region"
-                   ORDER BY SUM("total_revenue") DESC
-               ) AS rnk
-        FROM sales1000
-        GROUP BY "sales_rep", "region", "product"
-    )
-    -- then join: ON rtp."sales_rep" = qg.sales_rep AND rtp."region" = qg.region
-    --            AND rtp.rnk = 1
-- Apply the same pattern for "top category per rep", "best-selling product per region",
-  "most recent order per customer", and any other per-group argmax/argmin requirement.
-- After the rank CTE, filter to top-N products globally (if required) using a
-  separate CTE with ORDER BY ... LIMIT N, then INNER JOIN both CTEs on the product key.
+── TOP-N PER GROUP rule ─────────────────────────────────────────────
+"Top product per rep", "best-selling item per region", "most recent order per customer"─
+any question that asks for the single best/worst/most-recent row within each group─
+MUST follow the four-CTE pattern below. Never use a correlated IN subquery in a
+JOIN ON clause; that produces one joined row per matching product, not one per rep.
+
+FOUR-CTE CANONICAL PATTERN
+(substitute real column names from the schema as needed)
+
+  WITH
+  -- 1. global top-N products by total revenue
+  top_products AS (
+      SELECT "product"
+      FROM sales1000
+      GROUP BY "product"
+      ORDER BY SUM("total_revenue") DESC
+      LIMIT 5                          -- change N as required
+  ),
+  -- 2. per-rep quota gap; keep only reps below quota
+  quota_gap AS (
+      SELECT t."sales_rep", t."region",
+             (t."quota_usd" - SUM(s."total_revenue")) AS quota_gap
+      FROM sales_rep_targets t
+      JOIN sales1000 s
+        ON t."sales_rep" = s."sales_rep" AND t."region" = s."region"
+      GROUP BY t."sales_rep", t."region", t."quota_usd"
+      HAVING (t."quota_usd" - SUM(s."total_revenue")) > 0
+  ),
+  -- 3. rank products within each (rep, region) by revenue
+  rep_product_rank AS (
+      SELECT "sales_rep", "region", "product",
+             ROW_NUMBER() OVER (
+                 PARTITION BY "sales_rep", "region"
+                 ORDER BY SUM("total_revenue") DESC
+             ) AS rnk
+      FROM sales1000
+      GROUP BY "sales_rep", "region", "product"
+  ),
+  -- 4. each rep's single top product, restricted to the global top-N set
+  rep_top_product AS (
+      SELECT rpr."sales_rep", rpr."region", rpr."product" AS top_product
+      FROM rep_product_rank rpr
+      JOIN top_products tp ON rpr."product" = tp."product"
+      WHERE rpr.rnk = 1
+  )
+  SELECT qg."sales_rep", qg."region", qg.quota_gap, rtp.top_product
+  FROM quota_gap qg
+  JOIN rep_top_product rtp
+    ON qg."sales_rep" = rtp."sales_rep" AND qg."region" = rtp."region"
+  ORDER BY qg.quota_gap ASC;
+
+Key invariants:
+- CTE 1 defines the global top-N set (product names only).
+- CTE 3 ranks ALL products per rep — do NOT pre-filter to the top-N set here.
+- CTE 4 narrows to rnk = 1 AND product IN top-N via a plain INNER JOIN (no correlated subquery).
+- The final SELECT joins quota_gap to rep_top_product on (sales_rep, region) — two columns,
+  both from different relations. Never join on a single-table tautology.
 
 ── SUBQUERY-IN-ARITHMETIC rule (avoid parser/binder failures) ──────
 - Do NOT place a scalar SELECT subquery directly inside an arithmetic expression
@@ -355,12 +382,48 @@ Verification checklist:
 16. Scalar subquery in arithmetic: if SQL embeds a scalar SELECT inside a division,
     percentage, subtraction, or other arithmetic expression over grouped results,
     prefer a CTE/JOIN rewrite. Set verdict=fail with corrected_sql using the JOIN/CTE form.
-17. Top-N per group via correlated IN: if a JOIN ON clause uses a correlated IN
-    subquery to pick the top-ranked row per group (e.g. ON pr.product IN (SELECT
-    sa.product FROM ... WHERE sa.sales_rep = qg.sales_rep ...)), set verdict=fail.
-    This produces fan-out — one source row fans out to multiple joined rows.
-    Provide corrected_sql that uses a ROW_NUMBER() or RANK() window function CTE
-    partitioned by the group key, filtering WHERE rnk = 1 before joining.
+17. Top-N per group via correlated IN: if a JOIN ON clause (or WHERE clause) uses a
+    correlated IN subquery to pick one product/item per group (e.g.
+    ON pr.product IN (SELECT sa.product FROM ... WHERE sa.sales_rep = qg.sales_rep ...)),
+    set verdict=fail. This produces fan-out — multiple joined rows per rep/region instead
+    of exactly one. Provide corrected_sql using the four-CTE canonical pattern:
+      WITH
+      top_products AS (
+          SELECT "product"
+          FROM sales1000
+          GROUP BY "product"
+          ORDER BY SUM("total_revenue") DESC
+          LIMIT 5
+      ),
+      quota_gap AS (
+          SELECT t."sales_rep", t."region",
+                 (t."quota_usd" - SUM(s."total_revenue")) AS quota_gap
+          FROM sales_rep_targets t
+          JOIN sales1000 s
+            ON t."sales_rep" = s."sales_rep" AND t."region" = s."region"
+          GROUP BY t."sales_rep", t."region", t."quota_usd"
+          HAVING (t."quota_usd" - SUM(s."total_revenue")) > 0
+      ),
+      rep_product_rank AS (
+          SELECT "sales_rep", "region", "product",
+                 ROW_NUMBER() OVER (
+                     PARTITION BY "sales_rep", "region"
+                     ORDER BY SUM("total_revenue") DESC
+                 ) AS rnk
+          FROM sales1000
+          GROUP BY "sales_rep", "region", "product"
+      ),
+      rep_top_product AS (
+          SELECT rpr."sales_rep", rpr."region", rpr."product" AS top_product
+          FROM rep_product_rank rpr
+          JOIN top_products tp ON rpr."product" = tp."product"
+          WHERE rpr.rnk = 1
+      )
+      SELECT qg."sales_rep", qg."region", qg.quota_gap, rtp.top_product
+      FROM quota_gap qg
+      JOIN rep_top_product rtp
+        ON qg."sales_rep" = rtp."sales_rep" AND qg."region" = rtp."region"
+      ORDER BY qg.quota_gap ASC
 
 Never fabricate data. Do not call any tools in this node.
 """
