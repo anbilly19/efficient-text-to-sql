@@ -28,6 +28,24 @@ from agent.db.catalog import validate_join_in_sql, list_relationships
 
 
 # ---------------------------------------------------------------------------
+# -- Fast-path 8 constants --
+_OVERALL_INTENT_PATTERNS = re.compile(
+    r'\b(overall|total|aggregate|across all|nationwide|market.?wide)\b',
+    re.IGNORECASE,
+)
+_NIQ_METRIC_TERMS = {
+    'penetration': 'Penetration (%)',
+    'buyers': 'Buyers',
+    'spend per buyer': 'Spend per Buyer',
+    'trips per buyer': 'Trips per Buyer',
+    'spend per trip': 'Spend per Trip',
+    'volume per buyer': 'Volume per Buyer',
+    'market share': 'Market Share (%)',
+}
+_NIQ_PANEL_LEVEL_METRICS = {
+    'Penetration (%)', 'Market Share (%)',
+}
+
 # LLM factory
 # ---------------------------------------------------------------------------
 
