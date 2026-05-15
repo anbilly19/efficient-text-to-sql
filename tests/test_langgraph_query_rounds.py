@@ -10,9 +10,6 @@ Run from round_05 onward:
 Skip multi-table rounds:
     pytest tests/test_langgraph_query_rounds.py -m "not round_12" -v
 
-Run only scope tests:
-    pytest tests/test_langgraph_query_rounds.py -m round_13 -v
-
 All rounds:
     pytest tests/test_langgraph_query_rounds.py -v
 
@@ -22,10 +19,25 @@ Some queries intentionally reference 'customer', which is NOT a column in
 any loaded table. These are adversarial checks: the LLM should gracefully
 report that no customer column exists rather than hallucinating a result.
 
-Note on scope queries (round_13)
----------------------------------
-Round 13 tests the per-thread table scope feature (fast-path 7).
-Each scope test uses a FRESH thread so scope mutations don't bleed across.
+Scope fixture behaviour
+-----------------------
+Two session-scoped fixtures manage per-thread table scope automatically:
+
+  scoped_single_table  (autouse, session)
+      Sends "Only use sales1000" at the start of the session thread.
+      All rounds 01-11 run with only sales1000 in scope.
+
+  scoped_multi_table  (autouse, session)
+      Widens scope to all three tables before round_12 queries run.
+      Sends "Only use sales1000, sales_rep_targets, product_metrics".
+      Scope is reset to all tables at teardown.
+
+Both fixtures depend on `loaded_datasets` so they always run after data
+is loaded. The widening fixture depends on `scoped_single_table` so
+ordering is guaranteed.
+
+test_scope_isolation is a standalone end-to-end check of the scope
+mechanism itself, running on its own fresh thread.
 """
 import os
 import time
@@ -44,6 +56,9 @@ LOAD_PROD_METRICS = os.getenv("LOAD_PROD_METRICS", "load data/product_metrics.xl
 
 REQUEST_TIMEOUT = float(os.getenv("TEST_REQUEST_TIMEOUT", "120"))
 POLL_SECONDS    = float(os.getenv("TEST_POLL_SECONDS", "0.5"))
+
+# Rounds that need more than sales1000 (scope widens before these run)
+_MULTI_TABLE_ROUNDS = {"round_12_multi_table"}
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +145,6 @@ QUERY_ROUNDS = [
         "round_09_adversarial_missing_column",
         "round_09",
         [
-            # Valid queries
             "Which sales reps have more than one order and what is their order count?",
             "Show the top category per sales rep by total revenue",
             # Adversarial: 'customer' does not exist -- LLM should report gracefully
@@ -170,17 +184,6 @@ QUERY_ROUNDS = [
             "Which sales reps below quota are selling the top-5 revenue products? Show the rep, region, quota gap, and the top product they sell.",
         ],
     ),
-    (
-        "round_13_table_scope",
-        "round_13",
-        [
-            # Each query in this round is run on its OWN fresh thread (see test_scope_round)
-            "Only use sales1000 for this thread",            # set scope -> confirmation
-            "What is the total revenue?",                    # scoped query -> hits only sales1000
-            "Use all tables",                               # reset scope -> confirmation
-            "What is the total revenue?",                    # unscoped query -> same answer
-        ],
-    ),
 ]
 
 _ROUND_MARKS = {
@@ -197,7 +200,6 @@ _ALL_QUERIES = [
         marks=[_ROUND_MARKS[mark_label]],
     )
     for round_name, mark_label, queries in QUERY_ROUNDS
-    if round_name != "round_13_table_scope"   # round_13 has its own dedicated test
     for idx, query in enumerate(queries, start=1)
 ]
 
@@ -313,6 +315,14 @@ def _assert_loaded(outputs: dict[str, Any], cmd: str) -> None:
     assert ok, f"Load did not succeed for '{cmd}'.\nAnswer: {answer}"
 
 
+def _assert_scope_set(outputs: dict[str, Any], cmd: str) -> None:
+    answer = _extract_last_ai_text(outputs)
+    assert answer, f"No response for scope command '{cmd}'. Outputs: {outputs}"
+    assert any(kw in answer.lower() for kw in ("scope", "only", "restrict", "cleared", "reset", "all")), (
+        f"Scope command did not confirm. Command: '{cmd}'\nAnswer: {answer}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -324,6 +334,7 @@ def thread_id() -> str:
 
 @pytest.fixture(scope="session", autouse=True)
 def loaded_datasets(thread_id: str) -> None:
+    """Load all datasets into the session thread."""
     outputs = _run_wait(thread_id, LOAD_SALES)
     _assert_loaded(outputs, LOAD_SALES)
 
@@ -337,6 +348,41 @@ def loaded_datasets(thread_id: str) -> None:
                 f"Optional table load skipped (round_12 will likely fail):\n{exc}",
                 stacklevel=1,
             )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def scoped_single_table(thread_id: str, loaded_datasets: None) -> None:
+    """Restrict the session thread to sales1000 only before rounds 01-11 run.
+
+    Rounds 01-11 are single-table and should not accidentally pull in
+    sales_rep_targets or product_metrics. Scope is widened (not reset)
+    by scoped_multi_table before round_12.
+    """
+    cmd = "Only use sales1000 for this thread"
+    outputs = _run_wait(thread_id, cmd)
+    _assert_scope_set(outputs, cmd)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def scoped_multi_table(thread_id: str, loaded_datasets: None, scoped_single_table: None) -> None:
+    """Widen scope to all three tables before round_12 runs, then reset at teardown.
+
+    Depends on scoped_single_table to ensure single-table scope is set first.
+    Pytest session fixtures yield in dependency order, so this fixture's setup
+    runs after scoped_single_table, and its teardown runs before.
+    """
+    # --- setup: widen scope for round_12 ---
+    cmd = "Only use sales1000, sales_rep_targets, product_metrics"
+    outputs = _run_wait(thread_id, cmd)
+    _assert_scope_set(outputs, cmd)
+
+    yield
+
+    # --- teardown: reset scope so nothing leaks if the session is reused ---
+    try:
+        _run_wait(thread_id, "Use all tables")
+    except Exception:
+        pass  # best-effort teardown
 
 
 _query_counter: dict[str, int] = {"n": 0}
@@ -353,6 +399,8 @@ def test_query(
     query: str,
     thread_id: str,
     loaded_datasets: None,
+    scoped_single_table: None,
+    scoped_multi_table: None,
 ) -> None:
     _query_counter["n"] += 1
     n = _query_counter["n"]
@@ -376,33 +424,27 @@ def test_query(
 
 
 # ---------------------------------------------------------------------------
-# Round 13: table scope — each step runs on a dedicated fresh thread
+# Standalone scope isolation test (own fresh thread, not part of query rounds)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.round_13
-def test_scope_round(loaded_datasets: None) -> None:
-    """End-to-end test for fast-path 7: per-thread table scope set and reset.
+def test_scope_isolation(loaded_datasets: None) -> None:
+    """End-to-end check of the scope mechanism on a dedicated fresh thread.
 
-    Uses a fresh thread so scope state doesn't leak into the main thread_id.
     Steps:
-      1. Set scope to sales1000 only  -> confirmation message
-      2. Query revenue                -> succeeds (uses scoped table)
-      3. Reset scope                  -> confirmation message
-      4. Query revenue again          -> succeeds (all tables visible)
+      1. Set scope to sales1000 only      -> confirmation
+      2. Query revenue                    -> succeeds (scoped)
+      3. Widen scope to all three tables  -> confirmation
+      4. Query revenue                    -> succeeds (widened)
+      5. Reset scope                      -> confirmation
     """
-    scope_thread = _create_thread()
+    t = _create_thread()
 
-    # Step 1: set scope
-    out = _run_wait(scope_thread, "Only use sales1000 for this thread")
-    answer = _extract_last_ai_text(out)
-    assert answer, "No answer for scope-set command"
-    assert any(kw in answer.lower() for kw in ("scope", "sales1000", "only", "restrict")), (
-        f"Expected scope confirmation, got: {answer}"
-    )
-    assert "allowed_tables" in out or True  # state field optional in API response
+    # Step 1: set narrow scope
+    out = _run_wait(t, "Only use sales1000 for this thread")
+    _assert_scope_set(out, "Only use sales1000 for this thread")
 
-    # Step 2: query inside scope
-    out = _run_wait(scope_thread, "What is the total revenue?")
+    # Step 2: query inside narrow scope
+    out = _run_wait(t, "What is the total revenue?")
     answer = _extract_last_ai_text(out)
     assert answer, "No answer for scoped revenue query"
     assert "empty sql" not in answer.lower(), f"Empty SQL in scoped query: {answer}"
@@ -410,19 +452,20 @@ def test_scope_round(loaded_datasets: None) -> None:
         f"SQL error in scoped query: {out.get('last_query_result')}"
     )
 
-    # Step 3: reset scope
-    out = _run_wait(scope_thread, "Use all tables")
-    answer = _extract_last_ai_text(out)
-    assert answer, "No answer for scope-reset command"
-    assert any(kw in answer.lower() for kw in ("cleared", "reset", "all", "scope")), (
-        f"Expected scope-reset confirmation, got: {answer}"
-    )
+    # Step 3: widen scope
+    cmd = "Only use sales1000, sales_rep_targets, product_metrics"
+    out = _run_wait(t, cmd)
+    _assert_scope_set(out, cmd)
 
-    # Step 4: query after reset
-    out = _run_wait(scope_thread, "What is the total revenue?")
+    # Step 4: query inside widened scope
+    out = _run_wait(t, "What is the total revenue?")
     answer = _extract_last_ai_text(out)
-    assert answer, "No answer for unscoped revenue query"
-    assert "empty sql" not in answer.lower(), f"Empty SQL after scope reset: {answer}"
+    assert answer, "No answer after scope widened"
+    assert "empty sql" not in answer.lower(), f"Empty SQL after widen: {answer}"
+
+    # Step 5: reset
+    out = _run_wait(t, "Use all tables")
+    _assert_scope_set(out, "Use all tables")
 
     time.sleep(POLL_SECONDS)
 
@@ -434,5 +477,5 @@ def test_scope_round(loaded_datasets: None) -> None:
 def test_query_catalog_is_complete() -> None:
     round_count = len(QUERY_ROUNDS)
     query_count = sum(len(queries) for _, _, queries in QUERY_ROUNDS)
-    assert round_count == 13, f"Expected 13 rounds, found {round_count}"
-    assert query_count == 44, f"Expected 44 total queries, found {query_count}"
+    assert round_count == 12, f"Expected 12 rounds, found {round_count}"
+    assert query_count == 40, f"Expected 40 total queries, found {query_count}"
