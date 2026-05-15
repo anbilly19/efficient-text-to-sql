@@ -1464,10 +1464,10 @@ def sql_writer(state: AnalyticsState) -> dict:
 
     semantic_block = ""
     if semantic_hits:
-        lines = ["## Semantic Map Hints (user term → actual column name)"]
+        lines = ["## Semantic Map Hints (keyword → actual column name)"]
         for h in semantic_hits[:8]:
             lines.append(
-                f"  '{h['term']}' → {h['dataset']}.{h['column']}"
+                f"  '{h['column']}' in {h['dataset']}"
                 + (f"  # {h['description']}" if h.get("description") else "")
             )
         semantic_block = "\n".join(lines)
