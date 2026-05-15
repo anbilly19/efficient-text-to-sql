@@ -176,17 +176,34 @@ You must return a JSON verdict:
   }
 
 Verification checklist:
-1. Row count expectations: does the result size match the query type?
-2. JOIN fan-out: if a cardinality warning was given, the JOIN ON clause is probably
+1. Result shape vs. question intent (GENERIC — check this first):
+   Before anything else, ask: does the shape of the result match what the user
+   actually asked for?
+   - If the question expects a SINGLE value or summary (e.g. "what is the average X",
+     "how many total Y", "what is the overall Z", "average of those averages") but
+     the SQL returns multiple rows (one per group), the query stopped one aggregation
+     short. Set verdict=fail and provide corrected_sql that wraps the grouped query
+     in an outer aggregation (AVG / SUM / COUNT as appropriate).
+   - If the question expects a BREAKDOWN or ranking (e.g. "per rep", "by region",
+     "top N", "for each category") but the SQL returns a single row, the GROUP BY
+     or window function is missing. Set verdict=fail.
+   - If the question asks for a list or distribution but the result has far fewer
+     rows than expected given the data, the WHERE or HAVING clause is likely too
+     restrictive. Set verdict=warning.
+   This check is intentionally broad — apply it to any mismatch between the
+   natural-language intent and the result shape, regardless of SQL complexity.
+
+2. Row count expectations: does the result size match the query type?
+3. JOIN fan-out: if a cardinality warning was given, the JOIN ON clause is probably
    wrong — set verdict=fail and provide corrected_sql with the right ON pair.
-3. Unregistered join keys: if a join-key warning is present (columns not in
+4. Unregistered join keys: if a join-key warning is present (columns not in
    _relationships), set verdict=fail. Use the registered pair from ## Relationships.
-4. Numeric plausibility: are aggregates reasonable (no wild outliers or zero rows)?
-5. Filters: are date ranges and category filters applied correctly?
-6. GROUP BY completeness: all non-aggregated SELECT columns must appear in GROUP BY.
-7. VARCHAR date columns: confirm TRY_CAST(col AS DATE) was used before
+5. Numeric plausibility: are aggregates reasonable (no wild outliers or zero rows)?
+6. Filters: are date ranges and category filters applied correctly?
+7. GROUP BY completeness: all non-aggregated SELECT columns must appear in GROUP BY.
+8. VARCHAR date columns: confirm TRY_CAST(col AS DATE) was used before
    YEAR/MONTH/DATE_TRUNC. If not, verdict=fail with corrected_sql.
-8. NIQ YoY columns: if the SQL selects a column ending in "vs. VJ (% Ver.)" check both:
+9. NIQ YoY columns: if the SQL selects a column ending in "vs. VJ (% Ver.)" check both:
    a. Missing CY period filter: if WHERE "Periods" = '<cy_label>' is absent,
       set verdict=fail with corrected_sql that adds the filter.
    b. Missing GROUP BY: if the query has no GROUP BY clause (i.e. returns a single
@@ -195,13 +212,13 @@ Verification checklist:
       plus AND <yoy_col> IS NOT NULL in the WHERE clause.
    c. LAG() or window function used instead of direct column select: set verdict=fail
       with corrected_sql that selects the column directly with AVG().
-9. Invented columns: if the SQL references a column name not present in the schema
-   (e.g. buyer_id), set verdict=fail with corrected_sql using the correct schema column.
-10. NIQ aggregation: if the SQL aggregates a NIQ per-unit metric (column starting with
+10. Invented columns: if the SQL references a column name not present in the schema
+    (e.g. buyer_id), set verdict=fail with corrected_sql using the correct schema column.
+11. NIQ aggregation: if the SQL aggregates a NIQ per-unit metric (column starting with
     "Ausgaben pro", "Einkaufsakte pro", or "Penetration (%)") using SUM() or
     SUM(metric)/COUNT(something), set verdict=fail. The correct aggregation is AVG().
     Provide corrected_sql replacing the wrong aggregate with AVG().
-11. NIQ missing Periods filter: if the SQL queries a table with a "Periods" column,
+12. NIQ missing Periods filter: if the SQL queries a table with a "Periods" column,
     uses GROUP BY, but has NO WHERE "Periods" = '...' clause, set verdict=fail.
     The CY label is visible in the sub-task description or schema hint.
     Provide corrected_sql that adds WHERE "Periods" = '<cy_label>'.
