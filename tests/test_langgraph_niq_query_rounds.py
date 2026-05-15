@@ -14,16 +14,26 @@ Skip if no NIQ file is available:
     Tests that require NIQ_SYNTHETIC_PATH are auto-skipped when the env var
     is not set, so CI passes without a real Excel fixture.
 
+Note on column names
+--------------------
+niq_panel dimension columns are:
+  - "Products"   (brand / product level)
+  - "Retailers"  (retailer level)
+  - "Periods"    (CY / PY period label)
+
+Key metric columns:
+  - "Penetration (%)"                   household reach
+  - "Penetration (%) vs. VJ (% Ver.)"   YoY delta of household reach
+  - "Ausgaben pro Käuferhaushalt"        spend per buying household
+  - "Einkaufsakte pro Käuferhaushalt"    purchase frequency per buyer
+  - "Käuferhaushalte"                    count of buying households
+  - "Anzahl Einkaufsakte"                total purchase acts
+
 Note on adversarial queries
 ---------------------------
 Some queries intentionally reference columns that do NOT exist in NIQ data
 (e.g. 'customer_id', 'invoice_number'). The agent must report gracefully
 that the column is absent rather than hallucinating a result.
-
-Note on round_04
-----------------
-NIQ data has no 'category' column. Dimension columns are Products and
-Retailers. round_04 q2 uses Retailers intentionally.
 """
 import os
 import time
@@ -50,8 +60,7 @@ NIQ_SKIP = pytest.mark.skipif(
 
 
 # ---------------------------------------------------------------------------
-# Query rounds
-# Each entry: (round_id, mark_label, [queries])
+# Query rounds — all queries scoped to real niq_panel column names
 # ---------------------------------------------------------------------------
 
 QUERY_ROUNDS = [
@@ -59,78 +68,91 @@ QUERY_ROUNDS = [
         "niq_round_01_basic_aggregations",
         "niq_round_01",
         [
-            f"What is the overall penetration rate in the {NIQ_DATASET} table?",
-            f"What is the average spend per buyer across all brands in {NIQ_DATASET}?",
-            f"How many distinct brands are in {NIQ_DATASET}?",
+            # Products is the correct dimension column (not 'brands')
+            f"How many distinct products are in {NIQ_DATASET}?",
+            # Penetration (%) is the column name; Käuferreichweite is a German alias for it
+            f"What is the overall penetration rate in {NIQ_DATASET}?",
+            # Ausgaben pro Käuferhaushalt is the correct column name
+            f"What is the average spend per buying household across all products in {NIQ_DATASET}?",
         ],
     ),
     (
         "niq_round_02_german_aliases",
         "niq_round_02",
         [
-            # Bug 1 fixed: Käuferreichweite now maps to 'Penetration (%)' (exact column name)
-            f"Was ist die Käuferreichweite in {NIQ_DATASET}?",
-            # Bug 2 fixed: Ausgaben je Käufer now maps to 'Ausgaben pro Käuferhaushalt'
-            f"Zeig mir die Ausgaben je Käufer nach Marke in {NIQ_DATASET}.",
-            f"Veränderung zum Vorjahr der Penetration in {NIQ_DATASET}?",
+            # Käuferreichweite → Penetration (%): agent must resolve alias
+            f"Was ist die Käuferreichweite nach Produkt in {NIQ_DATASET}?",
+            # Ausgaben je Käufer → Ausgaben pro Käuferhaushalt
+            f"Zeig mir die Ausgaben je Käufer nach Produkt in {NIQ_DATASET}.",
+            # Einkaufsfrequenz → Einkaufsakte pro Käuferhaushalt
+            f"Wie hoch ist die Einkaufsfrequenz pro Käufer nach Produkt in {NIQ_DATASET}?",
         ],
     ),
     (
         "niq_round_03_yoy_comparison",
         "niq_round_03",
         [
-            f"Which brands had a positive YoY change in penetration in {NIQ_DATASET}?",
-            f"Show me CY vs PY spend per buyer for every brand in {NIQ_DATASET}.",
-            f"What is the average year-on-year change in buyer frequency in {NIQ_DATASET}?",
+            # YoY column: 'Penetration (%) vs. VJ (% Ver.)'
+            f"Which products had a positive YoY change in penetration in {NIQ_DATASET}?",
+            # Spend per buyer YoY — agent must handle CY period filter
+            f"Show me the YoY change in spend per buying household by product in {NIQ_DATASET}.",
+            # Purchase frequency YoY
+            f"What is the average year-on-year change in buyer purchase frequency in {NIQ_DATASET}?",
         ],
     ),
     (
         "niq_round_04_ranking_topn",
         "niq_round_04",
         [
-            f"What are the top 5 brands by penetration in {NIQ_DATASET}?",
-            # Bug 3 fixed: NIQ has no 'category' column — use Retailers instead
-            f"Rank all retailers by spend per buyer in {NIQ_DATASET}.",
-            f"Which brand has the lowest buyer reach in {NIQ_DATASET}?",
+            # Products dimension — correct column
+            f"What are the top 5 products by penetration in {NIQ_DATASET}?",
+            # Retailers dimension — correct column
+            f"Rank all retailers by spend per buying household in {NIQ_DATASET}.",
+            # Bottom of the ranking
+            f"Which product has the lowest buyer reach in {NIQ_DATASET}?",
         ],
     ),
     (
         "niq_round_05_filtering",
         "niq_round_05",
         [
-            f"Show brands in {NIQ_DATASET} with penetration above 20%.",
-            f"Filter {NIQ_DATASET} to brands where YoY spend per buyer growth is negative.",
-            f"Which products in {NIQ_DATASET} have both penetration above 10% and spend per buyer above 50?",
+            f"Show products in {NIQ_DATASET} with penetration above 20%.",
+            f"Filter {NIQ_DATASET} to products where YoY spend per buying household growth is negative.",
+            f"Which products in {NIQ_DATASET} have both penetration above 10% and spend per buying household above 50?",
         ],
     ),
     (
         "niq_round_06_grain_period",
         "niq_round_06",
         [
-            f"What periods are available in {NIQ_DATASET}?",
-            f"Show me all annual figures for penetration in {NIQ_DATASET}.",
-            f"What is the grain of {NIQ_DATASET} — annual, monthly, or quarterly?",
+            # Periods column exists in niq_panel
+            f"What period labels are available in the Periods column of {NIQ_DATASET}?",
+            f"Show me the penetration for each product for the current year period in {NIQ_DATASET}.",
+            f"How many distinct period values are in {NIQ_DATASET}?",
         ],
     ),
     (
         "niq_round_07_adversarial_missing_column",
         "niq_round_07",
         [
-            # Valid query
-            f"What is the total volume by brand in {NIQ_DATASET}?",
-            # Adversarial: 'customer_id' does not exist in NIQ data
+            # Valid query using real column
+            f"What is the total number of purchase acts by product in {NIQ_DATASET}?",
+            # Adversarial: 'customer_id' does not exist in NIQ data — agent must say so
             f"Show me the top customers by invoice number in {NIQ_DATASET}.",
-            # Adversarial: 'store_id' does not exist in NIQ data
-            f"Which store_id had the highest revenue in {NIQ_DATASET}?",
+            # Adversarial: 'brands' does not exist — the real column is 'Products'
+            f"How many distinct brands are in {NIQ_DATASET}?",
         ],
     ),
     (
         "niq_round_08_semantic_map_lookup",
         "niq_round_08",
         [
+            # Alias lookup: Käuferreichweite → Penetration (%)
             f"What does 'Käuferreichweite' map to in {NIQ_DATASET}?",
-            f"Look up 'yoy' in the semantic map for {NIQ_DATASET}.",
+            # Alias lookup: Haushaltsdurchdringung → Penetration (%)
             f"What column corresponds to 'Haushaltsdurchdringung' in {NIQ_DATASET}?",
+            # Alias lookup: Ausgaben je Käufer → Ausgaben pro Käuferhaushalt
+            f"What column does 'Ausgaben je Käufer' map to in {NIQ_DATASET}?",
         ],
     ),
 ]
