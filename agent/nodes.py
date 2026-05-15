@@ -1262,6 +1262,59 @@ def orchestrator(state: AnalyticsState) -> dict:
         sem_reply = _build_semantic_map_reply(term, dataset, all_tables)
         return {**base_reset, "final_answer": sem_reply, "messages": [AIMessage(content=sem_reply)]}
 
+    # -- Fast-path 8: overall/aggregate NIQ scalar --
+    if all_tables and _OVERALL_INTENT_PATTERNS.search(current_query):
+        q_lower = current_query.lower()
+        matched_metric = None
+        matched_col = None
+        target_tbl = next((t for t in all_tables if t.lower() in q_lower), None) or most_recent
+        if target_tbl:
+            for term, col_fragment in _NIQ_METRIC_TERMS.items():
+                if term in q_lower:
+                    matched_metric = col_fragment
+                    break
+            if not matched_metric and 'penetration' in q_lower:
+                matched_metric = 'Penetration (%)'
+            if matched_metric:
+                conn = get_connection()
+                try:
+                    rows_c = conn.execute(
+                        'SELECT column_name FROM _column_catalog WHERE dataset_name = ?',
+                        [target_tbl],
+                    ).fetchall()
+                    for (col,) in rows_c:
+                        if matched_metric.lower() in col.lower() and 'vs.' not in col and 'VJ' not in col:
+                            matched_col = col
+                            break
+                except Exception:
+                    pass
+            if matched_col:
+                cy_label = _get_niq_cy_label(target_tbl)
+                is_panel_level = matched_col in _NIQ_PANEL_LEVEL_METRICS or 'Penetration' in matched_col
+                agg_fn = 'MAX' if is_panel_level else 'AVG'
+                q = chr(34)
+                sq = chr(39)
+                period_filter = 'WHERE ' + q + 'Periods' + q + ' = ' + sq + (cy_label or '') + sq if cy_label else ''
+                sql_overall = (
+                    'SELECT ' + agg_fn + '(' + q + matched_col + q + ') AS value\n'
+                    + 'FROM ' + q + target_tbl + q + '\n'
+                    + period_filter
+                ).strip()
+                result_raw = run_sql.invoke({'query': sql_overall})
+                if not result_raw.startswith('ERROR'):
+                    try:
+                        val = json.loads(result_raw).get('rows', [{}])[0].get('value')
+                        period_note = ' (period: ' + (cy_label or '') + ')' if cy_label else ''
+                        pct = '%' in matched_col
+                        formatted = str(round(float(val), 2)) + ('%' if pct else '') if val is not None else 'N/A'
+                        reply = (
+                            'The overall ' + matched_col + ' in ' + target_tbl
+                            + period_note + ' is ' + formatted + '.'
+                        )
+                        return {**base_reset, 'final_answer': reply, 'messages': [AIMessage(content=reply)]}
+                    except Exception:
+                        pass
+
     # ── Fast-path 7: user-controlled table scope ────────────────────────────
     scope_cmd = _detect_scope_intent(current_query, _all_table_names())
     if scope_cmd:
@@ -1287,7 +1340,7 @@ def orchestrator(state: AnalyticsState) -> dict:
                 "messages": [AIMessage(content=reply)],
             }
 
-    # ── LLM planning ───────────────────────────────────────────────────────
+
     ORCHESTRATOR_SYSTEM = f"""You are the Orchestrator of a DuckDB analytics agent.
 
 Loaded tables:
