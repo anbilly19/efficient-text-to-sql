@@ -1,7 +1,8 @@
 """
 tests/test_niq_table_selection.py
 ----------------------------------
-Unit tests for the NIQ-aware keyword scoring inside _select_relevant_tables.
+Unit tests for the NIQ-aware keyword scoring inside _select_relevant_tables,
+and for the allowed_tables scope filter used by _visible_tables.
 
 Fully self-contained: no imports from agent.*, no LLM, no env vars, no files.
 Mirrors the pattern of test_table_selection.py exactly.
@@ -75,6 +76,13 @@ def _score_tables_niq(
     if not selected:
         return all_tables
     return selected
+
+
+def _apply_scope(all_tables: list[str], allowed_tables: list[str] | None) -> list[str]:
+    """Inline reimplementation of _visible_tables filtering logic."""
+    if allowed_tables is None:
+        return all_tables
+    return [t for t in all_tables if t in allowed_tables]
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +227,6 @@ class TestNIQBonus:
             "What is the buyer penetration?",
             ["niq_panel", "sales"],
         )
-        # sales has no NIQ tags and no keyword match on 'buyer' or 'penetration'
         assert "sales" not in selected
 
     def test_revenue_query_does_not_trigger_niq_bonus(self, conn_single_niq):
@@ -229,7 +236,6 @@ class TestNIQBonus:
             "What is total revenue by region?",
             ["niq_panel", "sales"],
         )
-        # 'revenue' and 'region' are in sales summary/tags
         assert "sales" in selected
 
 
@@ -331,3 +337,57 @@ class TestFallback:
             ["niq_panel"],
         )
         assert selected == ["niq_panel"]
+
+
+# ---------------------------------------------------------------------------
+# TestScopedTableFilter — allowed_tables filtering (mirrors _visible_tables)
+# ---------------------------------------------------------------------------
+
+class TestScopedTableFilter:
+    """Verify that the allowed_tables scope correctly filters the candidate list
+    before scoring, matching what _visible_tables(state) does in production."""
+
+    ALL = ["niq_panel_petfood", "niq_panel_snacks", "sales"]
+
+    def test_none_scope_passes_all_tables(self):
+        visible = _apply_scope(self.ALL, None)
+        assert visible == self.ALL
+
+    def test_single_table_scope(self):
+        visible = _apply_scope(self.ALL, ["niq_panel_petfood"])
+        assert visible == ["niq_panel_petfood"]
+
+    def test_two_table_scope(self):
+        visible = _apply_scope(self.ALL, ["niq_panel_petfood", "sales"])
+        assert set(visible) == {"niq_panel_petfood", "sales"}
+        assert "niq_panel_snacks" not in visible
+
+    def test_empty_scope_returns_empty(self):
+        visible = _apply_scope(self.ALL, [])
+        assert visible == []
+
+    def test_unknown_table_in_scope_ignored(self):
+        visible = _apply_scope(self.ALL, ["ghost_table"])
+        assert visible == []
+
+    def test_scope_then_score_niq_query(self, conn_two_niq):
+        """Score runs only over scoped tables; snacks is hidden."""
+        scoped = _apply_scope(self.ALL, ["niq_panel_petfood", "sales"])
+        selected = _score_tables_niq(
+            conn_two_niq,
+            "What is the penetration for petfood?",
+            scoped,
+        )
+        assert "niq_panel_petfood" in selected
+        assert "niq_panel_snacks" not in selected
+
+    def test_scope_blocks_niq_table_from_generic_query(self, conn_two_niq):
+        """When NIQ tables are scoped out, a NIQ query can only hit sales."""
+        scoped = _apply_scope(self.ALL, ["sales"])
+        selected = _score_tables_niq(
+            conn_two_niq,
+            "xyzzy foobar quux",
+            scoped,
+        )
+        assert "niq_panel_petfood" not in selected
+        assert "niq_panel_snacks" not in selected

@@ -3,14 +3,16 @@ tests/test_niq_routing.py
 --------------------------
 Tests for the NIQ auto-routing logic in agent/nodes.py:
 
-  _is_niq_file()    — detection heuristic (always runs, no env var needed)
-  load_file_node()  — routing branch (full integration, needs NIQ_SYNTHETIC_PATH)
+  _is_niq_file()         — detection heuristic (always runs, no env var needed)
+  _detect_scope_intent() — table-scope fast-path (always runs)
+  _visible_tables()      — per-thread scope filter (always runs)
+  load_file_node()       — routing branch (full integration, needs NIQ_SYNTHETIC_PATH)
 
 Isolation model: mirrors test_parquet_persistence.py exactly.
   - Module fixture _module_env: DUCKDB_PATH=:memory:, fresh agent.* import.
   - Per-test _fresh_conn: reset _conn between tests.
 
-Detection-only tests (TestIsNiqFile) always run.
+Detection-only tests (TestIsNiqFile, TestScopeIntent, TestVisibleTables) always run.
 Routing integration tests (TestLoadFileNodeRouting) skip when
 NIQ_SYNTHETIC_PATH is not set.
 
@@ -97,6 +99,24 @@ def _fresh_conn(_module_env):
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_state(path: str = "", dataset: str = "", allowed_tables=None):
+    """Build a minimal AnalyticsState for node tests."""
+    from agent.state import AnalyticsState
+    from langchain_core.messages import HumanMessage
+    query = f"load file at {path} as {dataset}" if path else ""
+    return AnalyticsState(
+        messages=[HumanMessage(content=query)] if query else [],
+        user_query=query,
+        load_file_path=path or None,
+        load_file_dataset=dataset or None,
+        allowed_tables=allowed_tables,
+    )
+
+
+# ---------------------------------------------------------------------------
 # TestIsNiqFile — always runs, no synthetic file needed
 # ---------------------------------------------------------------------------
 
@@ -145,6 +165,133 @@ class TestIsNiqFile:
 
 
 # ---------------------------------------------------------------------------
+# TestScopeIntent — _detect_scope_intent() unit tests
+# ---------------------------------------------------------------------------
+
+class TestScopeIntent:
+    """Unit tests for _detect_scope_intent() pattern matching."""
+
+    ALL_TABLES = ["sales1000", "niq_panel", "product_metrics"]
+
+    def test_restrict_to_single_table(self):
+        result = _nodes()._detect_scope_intent(
+            "Only use sales1000 for this thread", self.ALL_TABLES
+        )
+        assert result is not None
+        assert result["action"] == "set"
+        assert "sales1000" in result["tables"]
+
+    def test_limit_to_two_tables(self):
+        result = _nodes()._detect_scope_intent(
+            "Limit tables to sales1000 and niq_panel", self.ALL_TABLES
+        )
+        assert result is not None
+        assert result["action"] == "set"
+        assert "sales1000" in result["tables"]
+        assert "niq_panel" in result["tables"]
+
+    def test_focus_on_table(self):
+        result = _nodes()._detect_scope_intent(
+            "Focus on niq_panel only", self.ALL_TABLES
+        )
+        assert result is not None
+        assert result["action"] == "set"
+        assert "niq_panel" in result["tables"]
+
+    def test_scope_reset_clear(self):
+        result = _nodes()._detect_scope_intent(
+            "Reset scope", self.ALL_TABLES
+        )
+        assert result is not None
+        assert result["action"] == "reset"
+
+    def test_scope_reset_use_all(self):
+        result = _nodes()._detect_scope_intent(
+            "Use all tables", self.ALL_TABLES
+        )
+        assert result is not None
+        assert result["action"] == "reset"
+
+    def test_scope_reset_clear_restriction(self):
+        result = _nodes()._detect_scope_intent(
+            "Clear table restriction", self.ALL_TABLES
+        )
+        assert result is not None
+        assert result["action"] == "reset"
+
+    def test_plain_query_is_none(self):
+        result = _nodes()._detect_scope_intent(
+            "What is the total revenue?", self.ALL_TABLES
+        )
+        assert result is None
+
+    def test_scope_intent_with_unknown_table_is_none(self):
+        """Named table not in all_tables -> no tables matched -> no scope set."""
+        result = _nodes()._detect_scope_intent(
+            "Only use ghost_table", self.ALL_TABLES
+        )
+        assert result is None
+
+    def test_forget_other_tables_triggers_scope(self):
+        result = _nodes()._detect_scope_intent(
+            "Forget the other tables and just use niq_panel", self.ALL_TABLES
+        )
+        assert result is not None
+        assert result["action"] == "set"
+        assert "niq_panel" in result["tables"]
+
+
+# ---------------------------------------------------------------------------
+# TestVisibleTables — _visible_tables() filtering
+# ---------------------------------------------------------------------------
+
+class TestVisibleTables:
+    """Unit tests for _visible_tables() honoring state.allowed_tables."""
+
+    def _seed_registry(self, tables: list[str]):
+        """Insert rows into _data_registry for the given table names."""
+        conn = _db().get_connection()
+        for t in tables:
+            conn.execute(
+                "INSERT OR IGNORE INTO _data_registry "
+                "(dataset_name, parquet_path, row_count, column_count, ingested_at, source_file) "
+                "VALUES (?, ?, ?, ?, current_timestamp, ?)",
+                [t, f"/tmp/{t}.parquet", 100, 5, f"/tmp/{t}.xlsx"],
+            )
+
+    def test_no_restriction_returns_all(self):
+        self._seed_registry(["sales1000", "niq_panel"])
+        state = _make_state(allowed_tables=None)
+        visible = _nodes()._visible_tables(state)
+        assert set(visible) == {"sales1000", "niq_panel"}
+
+    def test_restriction_filters_correctly(self):
+        self._seed_registry(["sales1000", "niq_panel", "product_metrics"])
+        state = _make_state(allowed_tables=["niq_panel"])
+        visible = _nodes()._visible_tables(state)
+        assert visible == ["niq_panel"]
+
+    def test_restriction_to_multiple_tables(self):
+        self._seed_registry(["sales1000", "niq_panel", "product_metrics"])
+        state = _make_state(allowed_tables=["sales1000", "product_metrics"])
+        visible = _nodes()._visible_tables(state)
+        assert set(visible) == {"sales1000", "product_metrics"}
+        assert "niq_panel" not in visible
+
+    def test_restriction_to_nonexistent_table_returns_empty(self):
+        self._seed_registry(["sales1000"])
+        state = _make_state(allowed_tables=["ghost_table"])
+        visible = _nodes()._visible_tables(state)
+        assert visible == []
+
+    def test_empty_restriction_list_returns_empty(self):
+        self._seed_registry(["sales1000", "niq_panel"])
+        state = _make_state(allowed_tables=[])
+        visible = _nodes()._visible_tables(state)
+        assert visible == []
+
+
+# ---------------------------------------------------------------------------
 # TestLoadFileNodeRouting — requires NIQ_SYNTHETIC_PATH
 # ---------------------------------------------------------------------------
 
@@ -155,20 +302,9 @@ class TestIsNiqFile:
 class TestLoadFileNodeRouting:
     """Integration tests: load_file_node must auto-route NIQ files to load_niq_file."""
 
-    def _make_state(self, path: str, dataset: str):
-        """Build a minimal AnalyticsState-like object for load_file_node."""
-        from agent.state import AnalyticsState
-        from langchain_core.messages import HumanMessage
-        return AnalyticsState(
-            messages=[HumanMessage(content=f"load file at {path} as {dataset}")],
-            user_query=f"load file at {path} as {dataset}",
-            load_file_path=path,
-            load_file_dataset=dataset,
-        )
-
     def test_niq_file_routes_to_niq_loader(self):
         """load_file_node reply must contain NIQ panel confirmation markers."""
-        state = self._make_state(NIQ_SYNTHETIC_PATH, "niq_panel")
+        state = _make_state(NIQ_SYNTHETIC_PATH, "niq_panel")
         result = _nodes().load_file_node(state)
         reply = result["final_answer"]
         assert "NIQ panel loaded" in reply, (
@@ -176,7 +312,7 @@ class TestLoadFileNodeRouting:
         )
 
     def test_niq_routing_reply_contains_grain(self):
-        state = self._make_state(NIQ_SYNTHETIC_PATH, "niq_panel")
+        state = _make_state(NIQ_SYNTHETIC_PATH, "niq_panel")
         result = _nodes().load_file_node(state)
         reply = result["final_answer"]
         assert "grain" in reply.lower(), (
@@ -185,17 +321,16 @@ class TestLoadFileNodeRouting:
 
     def test_niq_routing_reply_contains_example_terms(self):
         """Confirmation reply must mention NIQ-specific example queries."""
-        state = self._make_state(NIQ_SYNTHETIC_PATH, "niq_panel")
+        state = _make_state(NIQ_SYNTHETIC_PATH, "niq_panel")
         result = _nodes().load_file_node(state)
         reply = result["final_answer"]
-        # At least one German/NIQ term should appear in the example query hint
         niq_hints = ["penetration", "K\u00e4uferreichweite", "spend per buyer", "YoY"]
         assert any(hint in reply for hint in niq_hints), (
             f"Expected at least one NIQ hint in reply, got:\n{reply}"
         )
 
     def test_niq_routing_registers_in_data_registry(self):
-        state = self._make_state(NIQ_SYNTHETIC_PATH, "niq_panel")
+        state = _make_state(NIQ_SYNTHETIC_PATH, "niq_panel")
         _nodes().load_file_node(state)
         row = _db().get_connection().execute(
             "SELECT dataset_name FROM _data_registry WHERE dataset_name = 'niq_panel'"
@@ -203,7 +338,7 @@ class TestLoadFileNodeRouting:
         assert row is not None, "_data_registry must have niq_panel after load_file_node"
 
     def test_niq_routing_sets_niq_tags_in_table_context(self):
-        state = self._make_state(NIQ_SYNTHETIC_PATH, "niq_panel")
+        state = _make_state(NIQ_SYNTHETIC_PATH, "niq_panel")
         _nodes().load_file_node(state)
         row = _db().get_connection().execute(
             "SELECT tags FROM _table_context WHERE dataset_name = 'niq_panel'"
@@ -213,7 +348,7 @@ class TestLoadFileNodeRouting:
 
     def test_niq_routing_load_file_path_cleared_after(self):
         """State cleanup: load_file_path must be None in the returned dict."""
-        state = self._make_state(NIQ_SYNTHETIC_PATH, "niq_panel")
+        state = _make_state(NIQ_SYNTHETIC_PATH, "niq_panel")
         result = _nodes().load_file_node(state)
         assert result["load_file_path"] is None
         assert result["load_file_dataset"] is None
@@ -225,7 +360,7 @@ class TestLoadFileNodeRouting:
         pd.DataFrame({"order_id": [1, 2], "revenue": [100.0, 200.0]}).to_csv(
             generic_path, index=False
         )
-        state = self._make_state(str(generic_path), "sales")
+        state = _make_state(str(generic_path), "sales")
         result = _nodes().load_file_node(state)
         reply = result["final_answer"]
         assert "NIQ panel loaded" not in reply, (

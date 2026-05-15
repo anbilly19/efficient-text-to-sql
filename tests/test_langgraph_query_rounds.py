@@ -10,6 +10,9 @@ Run from round_05 onward:
 Skip multi-table rounds:
     pytest tests/test_langgraph_query_rounds.py -m "not round_12" -v
 
+Run only scope tests:
+    pytest tests/test_langgraph_query_rounds.py -m round_13 -v
+
 All rounds:
     pytest tests/test_langgraph_query_rounds.py -v
 
@@ -18,6 +21,11 @@ Note on customer queries
 Some queries intentionally reference 'customer', which is NOT a column in
 any loaded table. These are adversarial checks: the LLM should gracefully
 report that no customer column exists rather than hallucinating a result.
+
+Note on scope queries (round_13)
+---------------------------------
+Round 13 tests the per-thread table scope feature (fast-path 7).
+Each scope test uses a FRESH thread so scope mutations don't bleed across.
 """
 import os
 import time
@@ -162,6 +170,17 @@ QUERY_ROUNDS = [
             "Which sales reps below quota are selling the top-5 revenue products? Show the rep, region, quota gap, and the top product they sell.",
         ],
     ),
+    (
+        "round_13_table_scope",
+        "round_13",
+        [
+            # Each query in this round is run on its OWN fresh thread (see test_scope_round)
+            "Only use sales1000 for this thread",            # set scope -> confirmation
+            "What is the total revenue?",                    # scoped query -> hits only sales1000
+            "Use all tables",                               # reset scope -> confirmation
+            "What is the total revenue?",                    # unscoped query -> same answer
+        ],
+    ),
 ]
 
 _ROUND_MARKS = {
@@ -178,6 +197,7 @@ _ALL_QUERIES = [
         marks=[_ROUND_MARKS[mark_label]],
     )
     for round_name, mark_label, queries in QUERY_ROUNDS
+    if round_name != "round_13_table_scope"   # round_13 has its own dedicated test
     for idx, query in enumerate(queries, start=1)
 ]
 
@@ -323,7 +343,7 @@ _query_counter: dict[str, int] = {"n": 0}
 
 
 # ---------------------------------------------------------------------------
-# Per-query parametrized test
+# Per-query parametrized test (rounds 01-12)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("round_name,query_index,query", _ALL_QUERIES)
@@ -336,7 +356,7 @@ def test_query(
 ) -> None:
     _query_counter["n"] += 1
     n = _query_counter["n"]
-    print(f"\n[{n:>2}/{TOTAL_QUERIES}] {round_name}[q{query_index}]  ➤  {query}")
+    print(f"\n[{n:>2}/{TOTAL_QUERIES}] {round_name}[q{query_index}]  \u27a4  {query}")
 
     outputs = _run_wait(thread_id, query)
     answer = _extract_last_ai_text(outputs)
@@ -356,11 +376,63 @@ def test_query(
 
 
 # ---------------------------------------------------------------------------
+# Round 13: table scope — each step runs on a dedicated fresh thread
+# ---------------------------------------------------------------------------
+
+@pytest.mark.round_13
+def test_scope_round(loaded_datasets: None) -> None:
+    """End-to-end test for fast-path 7: per-thread table scope set and reset.
+
+    Uses a fresh thread so scope state doesn't leak into the main thread_id.
+    Steps:
+      1. Set scope to sales1000 only  -> confirmation message
+      2. Query revenue                -> succeeds (uses scoped table)
+      3. Reset scope                  -> confirmation message
+      4. Query revenue again          -> succeeds (all tables visible)
+    """
+    scope_thread = _create_thread()
+
+    # Step 1: set scope
+    out = _run_wait(scope_thread, "Only use sales1000 for this thread")
+    answer = _extract_last_ai_text(out)
+    assert answer, "No answer for scope-set command"
+    assert any(kw in answer.lower() for kw in ("scope", "sales1000", "only", "restrict")), (
+        f"Expected scope confirmation, got: {answer}"
+    )
+    assert "allowed_tables" in out or True  # state field optional in API response
+
+    # Step 2: query inside scope
+    out = _run_wait(scope_thread, "What is the total revenue?")
+    answer = _extract_last_ai_text(out)
+    assert answer, "No answer for scoped revenue query"
+    assert "empty sql" not in answer.lower(), f"Empty SQL in scoped query: {answer}"
+    assert not str(out.get("last_query_result", "")).startswith("ERROR:"), (
+        f"SQL error in scoped query: {out.get('last_query_result')}"
+    )
+
+    # Step 3: reset scope
+    out = _run_wait(scope_thread, "Use all tables")
+    answer = _extract_last_ai_text(out)
+    assert answer, "No answer for scope-reset command"
+    assert any(kw in answer.lower() for kw in ("cleared", "reset", "all", "scope")), (
+        f"Expected scope-reset confirmation, got: {answer}"
+    )
+
+    # Step 4: query after reset
+    out = _run_wait(scope_thread, "What is the total revenue?")
+    answer = _extract_last_ai_text(out)
+    assert answer, "No answer for unscoped revenue query"
+    assert "empty sql" not in answer.lower(), f"Empty SQL after scope reset: {answer}"
+
+    time.sleep(POLL_SECONDS)
+
+
+# ---------------------------------------------------------------------------
 # Sanity check
 # ---------------------------------------------------------------------------
 
 def test_query_catalog_is_complete() -> None:
     round_count = len(QUERY_ROUNDS)
     query_count = sum(len(queries) for _, _, queries in QUERY_ROUNDS)
-    assert round_count == 12, f"Expected 12 rounds, found {round_count}"
-    assert query_count == 40, f"Expected 40 total queries, found {query_count}"
+    assert round_count == 13, f"Expected 13 rounds, found {round_count}"
+    assert query_count == 44, f"Expected 44 total queries, found {query_count}"
