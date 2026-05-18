@@ -1,10 +1,11 @@
 """LangGraph StateGraph assembly.
 
 Routing:
-  chitchat/load  -> END
-  simple sql     -> sql_writer -> execute_sql -> verifier -> orchestrator -> END
-  with profile   -> profiler -> sql_writer -> execute_sql -> verifier -> orchestrator -> END
-  on fail        -> verifier -> sql_writer (max 2 retries) -> orchestrator -> END
+  ingestion       -> kg_ingest_node -> END
+  chitchat/load   -> END
+  simple sql      -> sql_writer -> execute_sql -> verifier -> orchestrator -> END
+  with profile    -> profiler -> sql_writer -> execute_sql -> verifier -> orchestrator -> END
+  on fail         -> verifier -> sql_writer (max 2 retries) -> orchestrator -> END
 """
 from __future__ import annotations
 
@@ -20,10 +21,11 @@ from agent.nodes import (
     sql_writer,
     verifier,
 )
+from agent.nodes_kg import kg_ingest_node
 from agent.state import AnalyticsState, PlanStep
 
 MAX_RETRIES = 2
-MAX_PLAN_STEPS = 5  # hard cap to prevent infinite re-planning
+MAX_PLAN_STEPS = 5
 
 
 def _next_pending_step(state: AnalyticsState) -> PlanStep | None:
@@ -32,10 +34,11 @@ def _next_pending_step(state: AnalyticsState) -> PlanStep | None:
 
 def route_after_orchestrator(
     state: AnalyticsState,
-) -> Literal["load_file_node", "profiler", "sql_writer", "__end__"]:
+) -> Literal["kg_ingest_node", "load_file_node", "profiler", "sql_writer", "__end__"]:
+    if state.ingestion_mode:
+        return "kg_ingest_node"
     if state.load_file_path:
         return "load_file_node"
-    # Hard cap: bail out if plan grew too large (re-planning loop)
     if len(state.plan) > MAX_PLAN_STEPS:
         return END
     step = _next_pending_step(state)
@@ -47,11 +50,6 @@ def route_after_orchestrator(
 def route_after_execute(
     state: AnalyticsState,
 ) -> Literal["verifier", "orchestrator"]:
-    """Always route through verifier after execution.
-
-    The only exception is a hard SQL failure with no result to verify,
-    in which case we go straight to orchestrator to surface the error.
-    """
     if state.error and not state.last_query_result:
         return "orchestrator"
     return "verifier"
@@ -60,7 +58,6 @@ def route_after_execute(
 def route_after_verifier(
     state: AnalyticsState,
 ) -> Literal["orchestrator", "sql_writer"]:
-    # Hard stop: always go to orchestrator after MAX_RETRIES
     if state.retry_count >= MAX_RETRIES:
         return "orchestrator"
     if state.verification_verdict == "fail":
@@ -75,10 +72,11 @@ def route_after_verifier(
 builder = StateGraph(AnalyticsState)
 
 builder.add_node("orchestrator",   orchestrator)
+builder.add_node("kg_ingest_node", kg_ingest_node)
 builder.add_node("load_file_node", load_file_node)
 builder.add_node("profiler",       profiler)
 builder.add_node("sql_writer",     sql_writer)
-builder.add_node("executor",    executor)
+builder.add_node("executor",       executor)
 builder.add_node("verifier",       verifier)
 
 builder.add_edge(START, "orchestrator")
@@ -86,10 +84,16 @@ builder.add_edge(START, "orchestrator")
 builder.add_conditional_edges(
     "orchestrator",
     route_after_orchestrator,
-    {"load_file_node": "load_file_node", "profiler": "profiler",
-     "sql_writer": "sql_writer", END: END},
+    {
+        "kg_ingest_node": "kg_ingest_node",
+        "load_file_node": "load_file_node",
+        "profiler":       "profiler",
+        "sql_writer":     "sql_writer",
+        END:              END,
+    },
 )
 
+builder.add_edge("kg_ingest_node", END)
 builder.add_edge("load_file_node", END)
 builder.add_edge("profiler",       "sql_writer")
 builder.add_edge("sql_writer",     "executor")

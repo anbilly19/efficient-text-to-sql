@@ -53,3 +53,10 @@ class AnalyticsState(BaseModel):
     # None  -> all registered tables are visible (default)
     # list  -> only these table names are visible in this thread
     allowed_tables: list[str] | None = None
+
+    # ── KG ingestion mode ─────────────────────────────────────────
+    # Set by orchestrator when user intent is KG ingestion.
+    # ingestion_mode=True routes to kg_ingest_node; cleared after ingestion.
+    ingestion_mode: bool = False
+    kg_ingest_path: str | None = None   # path to the Excel file to ingest
+    kg_result: str = ""                 # summary returned by kg_ingest_node
