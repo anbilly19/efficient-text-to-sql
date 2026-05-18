@@ -1,0 +1,103 @@
+# Concept vocabulary — human-authored, versioned in git.
+# Each entry defines an abstract business concept that one or more Metric
+# columns across files can MEASURES.
+#
+# Fields:
+#   id          : machine identifier (snake_case, unique)
+#   label       : display name
+#   description : plain-English definition
+#   aliases     : column name fragments that strongly indicate this concept
+#                 (used by the LLM mapper as hints; case-insensitive)
+
+concepts:
+
+  - id: revenue
+    label: Revenue
+    description: >-
+      Total monetary value of sales. In MAT files this is typically the column
+      starting with 'Umsatz'. In panel files the economic equivalent is
+      'Ausgaben' (total household spend).
+    aliases:
+      - umsatz
+      - revenue
+      - sales
+      - wert
+      - erloes
+      - ausgaben
+
+  - id: volume
+    label: Volume
+    description: >-
+      Physical quantity sold (units, kg, litres). Typically columns containing
+      'Menge', 'Absatz', 'Volumen', or 'Units'.
+    aliases:
+      - menge
+      - absatz
+      - volumen
+      - units
+      - volume
+      - liter
+      - kg
+
+  - id: buyer_reach
+    label: BuyerReach
+    description: >-
+      Percentage of households that purchased at least once in the period.
+      Panel metric. Columns: 'Penetration (%)', 'Käuferreichweite',
+      'Penetration'.
+    aliases:
+      - penetration
+      - kaeuferreichweite
+      - k\u00e4uferreichweite
+      - buyer reach
+      - reichweite
+
+  - id: buyer_households
+    label: BuyerHouseholds
+    description: >-
+      Absolute count of buying households in the panel. Column: 'Käuferhaushalte'.
+    aliases:
+      - k\u00e4uferhaushalte
+      - kaeuferh
+      - buyer households
+      - buying households
+
+  - id: spend_per_buyer
+    label: SpendPerBuyer
+    description: >-
+      Average spend per buying household. Column: 'Ausgaben pro Käuferhaushalt'.
+    aliases:
+      - ausgaben pro
+      - spend per buyer
+      - ausgaben je
+
+  - id: purchase_frequency
+    label: PurchaseFrequency
+    description: >-
+      Average number of purchase occasions per buying household.
+      Column: 'Einkaufsakte pro Käuferhaushalt'.
+    aliases:
+      - einkaufsakte
+      - purchase frequency
+      - einkaufsfrequenz
+      - trips per buyer
+
+  - id: market_share
+    label: MarketShare
+    description: >-
+      Share of total category revenue or volume held by a brand/manufacturer.
+      Column fragment: 'Marktanteil', 'Market Share'.
+    aliases:
+      - marktanteil
+      - market share
+      - anteil
+
+  - id: distribution
+    label: Distribution
+    description: >-
+      Numeric distribution or weighted distribution. Column fragments:
+      'Distribution', 'Vertrieb', 'Dist'.
+    aliases:
+      - distribution
+      - vertrieb
+      - dist.
