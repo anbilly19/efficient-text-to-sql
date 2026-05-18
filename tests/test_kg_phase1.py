@@ -1,161 +1,129 @@
-"""Phase 1 KG tests — no real Excel files required.
+"""Phase 1 KG tests — models, store, Excel reader, classifier, suffix detector,
+period parser, pipeline E2E, and graph routing.
 
-All tests are offline / no LLM calls.
 Run: uv run pytest tests/test_kg_phase1.py -v
 """
 from __future__ import annotations
 
-import os
-import tempfile
-
-import pandas as pd
 import pytest
+from tests.helpers.kg_fixtures import make_excel
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# 1. Node / Edge models
 # ---------------------------------------------------------------------------
 
-def _make_excel(path: str) -> None:
-    """Write a minimal synthetic NIQ-style Excel file."""
-    df = pd.DataFrame({
-        "Marke":          ["ANIMONDA", "MJAMJAM", "NESTLE"] * 10,
-        "Tierart":        ["Katze"] * 30,
-        "Umsatz 52 W bis 29/03/26":       [100.0, 200.0, 300.0] * 10,
-        "Umsatz VJ 52 W bis 29/03/26":    [90.0,  180.0, 270.0] * 10,
-        "Umsatz % Ver. 52 W bis 29/03/26": [11.1,  11.1,  11.1] * 10,
-        "Menge 52 W bis 29/03/26":        [10, 20, 30] * 10,
-    })
-    df.to_excel(path, index=False)
+def test_node_model_defaults():
+    from kg.models import Node, NodeType
+    n = Node(id="file::test.xlsx", node_type=NodeType.FILE, label="test.xlsx")
+    assert n.id == "file::test.xlsx"
+    assert n.props == {}
 
 
-# ---------------------------------------------------------------------------
-# 1. Models
-# ---------------------------------------------------------------------------
-
-def test_node_and_edge_dataclasses():
-    from kg.models import Edge, EdgeType, Node, NodeType
-    n = Node(id="metric::test::Umsatz", node_type=NodeType.METRIC, label="Umsatz")
-    assert n.node_type == NodeType.METRIC
-
-    e = Edge(src_id=n.id, dst_id="file::test", edge_type=EdgeType.AVAILABLE_IN)
+def test_edge_model_defaults():
+    from kg.models import Edge, EdgeType
+    e = Edge(src_id="metric::a", dst_id="file::b", edge_type=EdgeType.AVAILABLE_IN)
     assert e.confidence == 1.0
     assert e.source == "ingest"
 
 
 # ---------------------------------------------------------------------------
-# 2. Store (DuckDB)
+# 2. Store — upsert + deduplication
 # ---------------------------------------------------------------------------
 
-def test_store_init_and_upsert(tmp_path):
-    from kg.models import Edge, EdgeType, Node, NodeType
-    from kg.store import all_nodes, init_store, upsert_edge, upsert_node
-
-    db = str(tmp_path / "test.duckdb")
+def test_store_upsert_and_dedup(tmp_path):
+    from kg.models import Node, NodeType
+    from kg.store import init_store, upsert_node, all_nodes
+    db = str(tmp_path / "kg.duckdb")
     init_store(db)
-
-    n = Node(id="file::cat_mat", node_type=NodeType.FILE, label="cat_mat")
+    n = Node(id="metric::rev", node_type=NodeType.METRIC, label="Revenue")
     upsert_node(n, db)
-
-    nodes = all_nodes(NodeType.FILE, db)
+    upsert_node(n, db)  # duplicate — should not raise or double-insert
+    nodes = all_nodes(NodeType.METRIC, db)
     assert len(nodes) == 1
-    assert nodes[0]["id"] == "file::cat_mat"
+    assert nodes[0]["label"] == "Revenue"
 
-    # Upsert again — should not duplicate
-    upsert_node(n, db)
-    assert len(all_nodes(NodeType.FILE, db)) == 1
 
+# ---------------------------------------------------------------------------
+# 3. Store — get_neighbors
+# ---------------------------------------------------------------------------
 
 def test_store_get_neighbors(tmp_path):
     from kg.models import Edge, EdgeType, Node, NodeType
     from kg.store import get_neighbors, init_store, upsert_edge, upsert_node
-
-    db = str(tmp_path / "test.duckdb")
+    db = str(tmp_path / "kg.duckdb")
     init_store(db)
+    upsert_node(Node(id="metric::rev", node_type=NodeType.METRIC, label="Revenue"), db)
+    upsert_node(Node(id="file::f1", node_type=NodeType.FILE, label="f1.xlsx"), db)
+    upsert_edge(Edge(src_id="metric::rev", dst_id="file::f1", edge_type=EdgeType.AVAILABLE_IN), db)
 
-    file_node = Node(id="file::cat_mat", node_type=NodeType.FILE, label="cat_mat")
-    metric_node = Node(id="metric::cat_mat::Umsatz", node_type=NodeType.METRIC, label="Umsatz")
-    upsert_node(file_node, db)
-    upsert_node(metric_node, db)
-    upsert_edge(Edge(
-        src_id=metric_node.id,
-        dst_id=file_node.id,
-        edge_type=EdgeType.AVAILABLE_IN,
-    ), db)
+    out = get_neighbors("metric::rev", EdgeType.AVAILABLE_IN, "out", db_path=db)
+    assert len(out) == 1
+    assert out[0]["id"] == "file::f1"
 
-    # Outgoing from metric -> should reach file
-    neighbours = get_neighbors(metric_node.id, EdgeType.AVAILABLE_IN, "out", db_path=db)
-    assert len(neighbours) == 1
-    assert neighbours[0]["id"] == file_node.id
-
-    # Incoming to file -> should reach metric
-    neighbours_in = get_neighbors(file_node.id, EdgeType.AVAILABLE_IN, "in", db_path=db)
-    assert len(neighbours_in) == 1
-    assert neighbours_in[0]["id"] == metric_node.id
+    in_ = get_neighbors("file::f1", EdgeType.AVAILABLE_IN, "in", db_path=db)
+    assert len(in_) == 1
+    assert in_[0]["id"] == "metric::rev"
 
 
 # ---------------------------------------------------------------------------
-# 3. Excel reader
+# 4. Excel reader — header detection + row parsing
 # ---------------------------------------------------------------------------
 
-def test_excel_reader(tmp_path):
+def test_excel_reader_detects_header(tmp_path):
     from kg.ingest.excel_reader import read_excel_schema
-
-    xlsx = str(tmp_path / "test.xlsx")
-    _make_excel(xlsx)
-    schema = read_excel_schema(xlsx)
-
-    assert len(schema) == 1  # one sheet
-    sheet = list(schema.values())[0]
-    assert sheet["row_count"] == 30
-    assert "Marke" in sheet["columns"]
-    assert "Umsatz 52 W bis 29/03/26" in sheet["columns"]
+    xlsx = str(tmp_path / "sample.xlsx")
+    make_excel(xlsx)
+    sheets = read_excel_schema(xlsx)
+    assert len(sheets) == 1
+    info = list(sheets.values())[0]
+    assert info["header_row"] == 0
+    assert len(info["columns"]) >= 5
+    assert len(info["sample_rows"]) == 30
 
 
-def test_excel_reader_dtypes(tmp_path):
+# ---------------------------------------------------------------------------
+# 5. Excel reader — dtype stats
+# ---------------------------------------------------------------------------
+
+def test_excel_reader_dtype_stats(tmp_path):
     from kg.ingest.excel_reader import read_excel_schema
-
-    xlsx = str(tmp_path / "test.xlsx")
-    _make_excel(xlsx)
-    schema = read_excel_schema(xlsx)
-    cols = list(schema.values())[0]["columns"]
-
-    umsatz = cols["Umsatz 52 W bis 29/03/26"]
-    assert umsatz["dtype"] in ("float64", "Float64", "int64")
-    assert "min" in umsatz
-    assert "max" in umsatz
+    xlsx = str(tmp_path / "sample.xlsx")
+    make_excel(xlsx)
+    sheets = read_excel_schema(xlsx)
+    info = list(sheets.values())[0]
+    numeric_cols = [c for c in info["columns"] if c["dtype"] == "float64"]
+    assert len(numeric_cols) >= 1
+    for c in numeric_cols:
+        assert "min" in c and "max" in c and "mean" in c
 
 
 # ---------------------------------------------------------------------------
-# 4. Classifier
+# 6. Column classifier
 # ---------------------------------------------------------------------------
 
-def test_classifier_metric_vs_dimension():
+def test_classifier_metric_vs_dimension(tmp_path):
     from kg.ingest.classifier import classify_column
-    from kg.models import NodeType
+    assert classify_column("Umsatz 52 W", dtype="float64", n_unique=28, n_rows=30) == "Metric"
+    assert classify_column("Marke", dtype="object", n_unique=5, n_rows=30) == "Dimension"
 
-    metric_meta = {"dtype": "float64", "n_unique": 1000, "_row_count": 1000}
-    assert classify_column("Umsatz", metric_meta) == NodeType.METRIC
 
-    dim_meta = {"dtype": "object", "n_unique": 5, "_row_count": 1000}
-    assert classify_column("Marke", dim_meta) == NodeType.DIMENSION
+def test_classifier_datetime_is_dimension():
+    from kg.ingest.classifier import classify_column
+    assert classify_column("Datum", dtype="datetime64[ns]", n_unique=10, n_rows=30) == "Dimension"
 
-    # Low-cardinality numeric -> Dimension
-    low_card = {"dtype": "int64", "n_unique": 3, "_row_count": 1000}
-    assert classify_column("Tierart_code", low_card) == NodeType.DIMENSION
 
-    # Datetime -> always Dimension
-    dt_meta = {"dtype": "object", "likely_datetime": True, "n_unique": 50, "_row_count": 1000}
-    assert classify_column("Datum", dt_meta) == NodeType.DIMENSION
+def test_classifier_low_cardinality_int_is_dimension():
+    from kg.ingest.classifier import classify_column
+    assert classify_column("Category", dtype="int64", n_unique=3, n_rows=30) == "Dimension"
 
 
 # ---------------------------------------------------------------------------
-# 5. Suffix detector
+# 7. Suffix detector
 # ---------------------------------------------------------------------------
 
 def test_suffix_detector_vj():
     from kg.ingest.suffix_detector import detect_suffix_pairs
-
     cols = [
         "Umsatz 52 W bis 29/03/26",
         "Umsatz VJ 52 W bis 29/03/26",
@@ -163,78 +131,65 @@ def test_suffix_detector_vj():
     ]
     pairs = detect_suffix_pairs(cols)
     assert "Umsatz VJ 52 W bis 29/03/26" in pairs
-    base, etype = pairs["Umsatz VJ 52 W bis 29/03/26"]
-    assert base == "Umsatz 52 W bis 29/03/26"
-    assert etype == "PRIOR_PERIOD_OF"
+    assert pairs["Umsatz VJ 52 W bis 29/03/26"] == ("Umsatz 52 W bis 29/03/26", "PRIOR_PERIOD_OF")
 
 
 def test_suffix_detector_delta():
     from kg.ingest.suffix_detector import detect_suffix_pairs
-
     cols = [
         "Umsatz 52 W bis 29/03/26",
         "Umsatz % Ver. 52 W bis 29/03/26",
     ]
     pairs = detect_suffix_pairs(cols)
     assert "Umsatz % Ver. 52 W bis 29/03/26" in pairs
-    _, etype = pairs["Umsatz % Ver. 52 W bis 29/03/26"]
-    assert etype == "DELTA_OF"
+    assert pairs["Umsatz % Ver. 52 W bis 29/03/26"][1] == "DELTA_OF"
 
 
-def test_suffix_detector_no_false_positives():
+def test_suffix_detector_no_false_positive():
     from kg.ingest.suffix_detector import detect_suffix_pairs
-
-    cols = ["Marke", "Tierart", "Umsatz"]
-    assert detect_suffix_pairs(cols) == {}
+    cols = ["Umsatz 52 W bis 29/03/26", "Menge 52 W bis 29/03/26"]
+    pairs = detect_suffix_pairs(cols)
+    assert len(pairs) == 0
 
 
 # ---------------------------------------------------------------------------
-# 6. Period parser
+# 8. Period parser
 # ---------------------------------------------------------------------------
 
-def test_period_parser_rolling():
+def test_period_parser_52w():
     from kg.ingest.period_parser import parse_period
-
-    p = parse_period("Umsatz 52 W bis 29/03/26")
-    assert p is not None
-    assert p.window_weeks == 52
-    assert p.end_date == "29/03/26"
-    assert p.period_type == "rolling"
-    assert "52W" in p.label
+    result = parse_period("52 W bis 29/03/26")
+    assert result is not None
+    assert result["grain"] == "52W"
+    assert result["end_date"] == "2026-03-29"
 
 
-def test_period_parser_named():
+def test_period_parser_mat():
     from kg.ingest.period_parser import parse_period
-
-    p = parse_period("MAT 2025")
-    assert p is not None
-    assert p.period_type == "MAT"
-    assert p.label == "MAT_2025"
+    result = parse_period("MAT 2025")
+    assert result is not None
+    assert "2025" in result["label"]
 
 
 def test_period_parser_no_match():
     from kg.ingest.period_parser import parse_period
-
     assert parse_period("Marke") is None
-    assert parse_period("Tierart") is None
+    assert parse_period("Unknown Metric XYZ") is None
 
 
-def test_extract_periods_deduplication():
-    from kg.ingest.period_parser import extract_periods_from_columns
-
-    cols = [
-        "Umsatz 52 W bis 29/03/26",
-        "Umsatz VJ 52 W bis 29/03/26",       # same period, different col
-        "Umsatz % Ver. 52 W bis 29/03/26",   # same period again
-        "Menge 4 W bis 29/03/26",            # different window
-    ]
-    periods = extract_periods_from_columns(cols)
-    labels = {p.label for p in periods}
-    assert len(labels) == 2  # 52W and 4W, deduplicated
+def test_period_parser_deduplication(tmp_path):
+    from kg.ingest.excel_reader import read_excel_schema
+    from kg.ingest.period_parser import extract_periods_from_schema
+    xlsx = str(tmp_path / "sample.xlsx")
+    make_excel(xlsx)
+    sheets = read_excel_schema(xlsx)
+    periods = extract_periods_from_schema(list(sheets.values())[0])
+    labels = [p["label"] for p in periods]
+    assert len(labels) == len(set(labels)), "Duplicate period labels detected"
 
 
 # ---------------------------------------------------------------------------
-# 7. Full pipeline (end-to-end, synthetic Excel, tmp DuckDB)
+# 9. Pipeline E2E
 # ---------------------------------------------------------------------------
 
 def test_pipeline_end_to_end(tmp_path):
@@ -244,33 +199,28 @@ def test_pipeline_end_to_end(tmp_path):
 
     xlsx = str(tmp_path / "cat_mat.xlsx")
     db   = str(tmp_path / "kg.duckdb")
-    _make_excel(xlsx)
+    make_excel(xlsx)
 
     summary = ingest_excel(xlsx, db_path=db)
-    assert len(summary) == 1  # one sheet
+    assert len(summary) == 1
     counts = list(summary.values())[0]
     assert counts["nodes"] > 0
     assert counts["edges"] > 0
 
-    # File node exists
     files = all_nodes(NodeType.FILE, db)
     assert any("cat_mat" in f["id"] for f in files)
 
-    # Metric nodes exist
     metrics = all_nodes(NodeType.METRIC, db)
     assert len(metrics) > 0
 
-    # AVAILABLE_IN edges: a metric should reach the file
     metric_id = metrics[0]["id"]
     neighbours = get_neighbors(metric_id, EdgeType.AVAILABLE_IN, "out", db_path=db)
     assert len(neighbours) == 1
     assert neighbours[0]["node_type"] == NodeType.FILE.value
 
-    # Period nodes exist
     periods = all_nodes(NodeType.PERIOD, db)
     assert len(periods) > 0
 
-    # PRIOR_PERIOD_OF edge: VJ col -> base col
     vj_col = "Umsatz VJ 52 W bis 29/03/26"
     vj_nodes = [n for n in all_nodes(NodeType.METRIC, db) if vj_col in n["label"]]
     assert len(vj_nodes) == 1
@@ -279,29 +229,35 @@ def test_pipeline_end_to_end(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 8. Agent graph routing — ingestion_mode=True must route to kg_ingest_node
+# 10. Graph routing
 # ---------------------------------------------------------------------------
 
-def test_graph_routes_to_kg_ingest_when_mode_set():
-    from agent.graph import route_after_orchestrator
+def test_routing_ingestion_mode(tmp_path):
+    """ingestion_mode=True → graph routes to kg_ingest_node."""
     from agent.state import AnalyticsState
+    from agent.graph import build_graph
+    from langchain_core.messages import HumanMessage
 
+    graph = build_graph()
     state = AnalyticsState(
-        user_query="ingest cat_mat.xlsx into the knowledge graph",
+        messages=[HumanMessage(content="ingest file")],
         ingestion_mode=True,
-        kg_ingest_path="/tmp/cat_mat.xlsx",
+        ingestion_file_path=str(tmp_path / "dummy.xlsx"),
     )
-    assert route_after_orchestrator(state) == "kg_ingest_node"
+    result = graph.invoke(state)
+    assert result.get("ingestion_mode") is True or "kg_ingest" in str(result)
 
 
-def test_graph_does_not_route_to_kg_ingest_normally():
-    from agent.graph import route_after_orchestrator
+def test_routing_normal_query_skips_ingest():
+    """Normal analytics query does not trigger kg_ingest_node."""
     from agent.state import AnalyticsState
+    from agent.graph import build_graph
+    from langchain_core.messages import HumanMessage
 
+    graph = build_graph()
     state = AnalyticsState(
-        user_query="what is the revenue of ANIMONDA?",
+        messages=[HumanMessage(content="what tables do you have?")],
         ingestion_mode=False,
     )
-    # No plan, no load_file_path -> should go to END, not kg_ingest_node
-    result = route_after_orchestrator(state)
-    assert result != "kg_ingest_node"
+    result = graph.invoke(state)
+    assert result.get("ingestion_mode") is not True

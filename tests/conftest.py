@@ -35,3 +35,17 @@ def _session_env(tmp_path_factory):
     if parquet_dir.exists():
         shutil.rmtree(parquet_dir, ignore_errors=True)
     os.environ.pop("PARQUET_STORE", None)
+
+
+# ---------------------------------------------------------------------------
+# KG shared fixtures (available to all test modules without explicit import)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture()
+def kg_excel(tmp_path):
+    """Return (xlsx_path, db_path) for a fresh synthetic NIQ-style workbook."""
+    from tests.helpers.kg_fixtures import make_excel
+    xlsx = str(tmp_path / "cat_mat.xlsx")
+    db   = str(tmp_path / "kg.duckdb")
+    make_excel(xlsx)
+    return xlsx, db

@@ -5,24 +5,8 @@ Run: uv run pytest tests/test_kg_phase2.py -v
 """
 from __future__ import annotations
 
-import pandas as pd
 import pytest
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _make_excel(path: str) -> None:
-    df = pd.DataFrame({
-        "Marke":                                ["ANIMONDA", "MJAMJAM"] * 15,
-        "Umsatz 52 W bis 29/03/26":             [100.0, 200.0] * 15,
-        "Menge 52 W bis 29/03/26":              [10, 20] * 15,
-        "Penetration (%) 52 W bis 29/03/26":    [30.0, 40.0] * 15,
-        "K\u00e4uferhaushalte 52 W bis 29/03/26": [500, 600] * 15,
-        "Unknown Metric XYZ 52 W bis 29/03/26": [1.0, 2.0] * 15,
-    })
-    df.to_excel(path, index=False)
+from tests.helpers.kg_fixtures import make_excel, noop_llm_propose
 
 
 # ---------------------------------------------------------------------------
@@ -79,41 +63,31 @@ def test_alias_match_no_match():
 
 
 # ---------------------------------------------------------------------------
-# 3. propose_measures_edges — alias path only (mock LLM to avoid API calls)
+# 3. propose_measures_edges — alias path only (LLM mocked)
 # ---------------------------------------------------------------------------
 
 def test_propose_measures_alias_only(tmp_path, monkeypatch):
-    """Alias-matched columns get proposals; LLM path is mocked to return empty."""
     from kg.ingest.pipeline import ingest_excel
     from kg.ingest.concept_mapper import propose_measures_edges
     from kg.models import EdgeType, NodeType
     from kg.store import get_neighbors, all_nodes
 
-    # Mock LLM so no API call is made
-    monkeypatch.setattr(
-        "kg.ingest.concept_mapper._llm_propose",
-        lambda cols: {},
-    )
+    noop_llm_propose(monkeypatch)
 
     xlsx = str(tmp_path / "cat_mat.xlsx")
     db   = str(tmp_path / "kg.duckdb")
-    _make_excel(xlsx)
+    make_excel(xlsx)
     ingest_excel(xlsx, db_path=db)
 
     proposals = propose_measures_edges(db_path=db)
-
-    # Should have proposals for Umsatz, Menge, Penetration, Käuferhaushalte
     assert len(proposals) >= 3
 
-    # All alias proposals should have confidence=0.95 and source='alias'
     alias_props = [p for p in proposals if p.source == "alias"]
     assert all(p.confidence == 0.95 for p in alias_props)
 
-    # Concept nodes must exist in the store
     concepts = all_nodes(NodeType.CONCEPT, db)
     assert len(concepts) >= 5
 
-    # MEASURES edge: Umsatz metric → revenue concept
     umsatz_nodes = [
         n for n in all_nodes(NodeType.METRIC, db)
         if "Umsatz" in n["label"] and "VJ" not in n["label"] and "Ver" not in n["label"]
@@ -126,25 +100,23 @@ def test_propose_measures_alias_only(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 4. HITL store operations (no terminal interaction)
+# 4. HITL store operations
 # ---------------------------------------------------------------------------
 
 def test_hitl_accept(tmp_path, monkeypatch):
-    """Accepting a pending proposal sets source='ingest', confidence=1.0."""
     from kg.ingest.pipeline import ingest_excel
-    from kg.ingest.concept_mapper import propose_measures_edges, _HITL_THRESHOLD
+    from kg.ingest.concept_mapper import propose_measures_edges
     from hitl.review_cli import _fetch_pending, _accept
     import duckdb
 
-    monkeypatch.setattr("kg.ingest.concept_mapper._llm_propose",
-                        lambda cols: {
-                            col: ("distribution", 0.60)   # below threshold → pending
-                            for col in cols
-                        })
+    monkeypatch.setattr(
+        "kg.ingest.concept_mapper._llm_propose",
+        lambda cols: {col: ("distribution", 0.60) for col in cols},
+    )
 
     xlsx = str(tmp_path / "cat_mat.xlsx")
     db   = str(tmp_path / "kg.duckdb")
-    _make_excel(xlsx)
+    make_excel(xlsx)
     ingest_excel(xlsx, db_path=db)
     propose_measures_edges(db_path=db)
 
@@ -167,18 +139,19 @@ def test_hitl_accept(tmp_path, monkeypatch):
 
 
 def test_hitl_reject(tmp_path, monkeypatch):
-    """Rejecting a pending proposal removes the edge."""
     from kg.ingest.pipeline import ingest_excel
     from kg.ingest.concept_mapper import propose_measures_edges
     from hitl.review_cli import _fetch_pending, _reject
     import duckdb
 
-    monkeypatch.setattr("kg.ingest.concept_mapper._llm_propose",
-                        lambda cols: {col: ("distribution", 0.50) for col in cols})
+    monkeypatch.setattr(
+        "kg.ingest.concept_mapper._llm_propose",
+        lambda cols: {col: ("distribution", 0.50) for col in cols},
+    )
 
     xlsx = str(tmp_path / "cat_mat.xlsx")
     db   = str(tmp_path / "kg.duckdb")
-    _make_excel(xlsx)
+    make_excel(xlsx)
     ingest_excel(xlsx, db_path=db)
     propose_measures_edges(db_path=db)
 
@@ -199,30 +172,26 @@ def test_hitl_reject(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 5. Query pattern 1: concept resolution via MEASURES traversal
+# 5. Query pattern 1: reverse MEASURES traversal
 # ---------------------------------------------------------------------------
 
 def test_query_pattern_1_measures_traversal(tmp_path, monkeypatch):
-    """After ingestion + mapping, 'what columns measure Revenue?' works via
-    reverse MEASURES traversal from the concept node."""
     from kg.ingest.pipeline import ingest_excel
     from kg.ingest.concept_mapper import propose_measures_edges
     from kg.models import EdgeType, NodeType
     from kg.store import get_neighbors, all_nodes
 
-    monkeypatch.setattr("kg.ingest.concept_mapper._llm_propose", lambda cols: {})
+    noop_llm_propose(monkeypatch)
 
     xlsx = str(tmp_path / "cat_mat.xlsx")
     db   = str(tmp_path / "kg.duckdb")
-    _make_excel(xlsx)
+    make_excel(xlsx)
     ingest_excel(xlsx, db_path=db)
     propose_measures_edges(db_path=db)
 
-    # Find the 'revenue' concept node
     concepts = [n for n in all_nodes(NodeType.CONCEPT, db) if "revenue" in n["id"]]
     assert len(concepts) == 1
 
-    # Reverse MEASURES: concept → all metrics that measure it
     metrics_measuring_revenue = get_neighbors(
         concepts[0]["id"], EdgeType.MEASURES, direction="in", db_path=db
     )
