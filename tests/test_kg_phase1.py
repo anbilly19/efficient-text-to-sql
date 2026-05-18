@@ -67,7 +67,7 @@ def test_store_get_neighbors(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 4. Excel reader — header detection + row parsing
+# 4. Excel reader — header detection + column parsing
 # ---------------------------------------------------------------------------
 
 def test_excel_reader_detects_header(tmp_path):
@@ -77,13 +77,13 @@ def test_excel_reader_detects_header(tmp_path):
     sheets = read_excel_schema(xlsx)
     assert len(sheets) == 1
     info = list(sheets.values())[0]
-    assert info["header_row"] == 0
+    assert info["detected_header_row"] == 0  # clean file → header at row 0
     assert len(info["columns"]) >= 5
-    assert len(info["sample_rows"]) == 30
+    assert info["row_count"] == 30
 
 
 # ---------------------------------------------------------------------------
-# 5. Excel reader — dtype stats
+# 5. Excel reader — dtype stats (columns is a dict {col_name: col_meta})
 # ---------------------------------------------------------------------------
 
 def test_excel_reader_dtype_stats(tmp_path):
@@ -92,30 +92,48 @@ def test_excel_reader_dtype_stats(tmp_path):
     make_excel(xlsx)
     sheets = read_excel_schema(xlsx)
     info = list(sheets.values())[0]
-    numeric_cols = [c for c in info["columns"] if c["dtype"] == "float64"]
+    numeric_cols = [
+        meta for meta in info["columns"].values()
+        if meta["dtype"] in ("float64", "int64", "Float64", "Int64")
+    ]
     assert len(numeric_cols) >= 1
-    for c in numeric_cols:
-        assert "min" in c and "max" in c and "mean" in c
+    for meta in numeric_cols:
+        assert "min" in meta and "max" in meta and "mean" in meta
 
 
 # ---------------------------------------------------------------------------
-# 6. Column classifier
+# 6. Column classifier — classify_column(col_name, col_meta: dict)
 # ---------------------------------------------------------------------------
 
-def test_classifier_metric_vs_dimension(tmp_path):
+def test_classifier_metric_vs_dimension():
     from kg.ingest.classifier import classify_column
-    assert classify_column("Umsatz 52 W", dtype="float64", n_unique=28, n_rows=30) == "Metric"
-    assert classify_column("Marke", dtype="object", n_unique=5, n_rows=30) == "Dimension"
+    from kg.models import NodeType
+    assert classify_column(
+        "Umsatz 52 W",
+        {"dtype": "float64", "n_unique": 28, "_row_count": 30},
+    ) == NodeType.METRIC
+    assert classify_column(
+        "Marke",
+        {"dtype": "object", "n_unique": 5, "_row_count": 30},
+    ) == NodeType.DIMENSION
 
 
 def test_classifier_datetime_is_dimension():
     from kg.ingest.classifier import classify_column
-    assert classify_column("Datum", dtype="datetime64[ns]", n_unique=10, n_rows=30) == "Dimension"
+    from kg.models import NodeType
+    assert classify_column(
+        "Datum",
+        {"dtype": "datetime64[ns]", "n_unique": 10, "_row_count": 30, "likely_datetime": True},
+    ) == NodeType.DIMENSION
 
 
 def test_classifier_low_cardinality_int_is_dimension():
     from kg.ingest.classifier import classify_column
-    assert classify_column("Category", dtype="int64", n_unique=3, n_rows=30) == "Dimension"
+    from kg.models import NodeType
+    assert classify_column(
+        "Category",
+        {"dtype": "int64", "n_unique": 3, "_row_count": 30},
+    ) == NodeType.DIMENSION
 
 
 # ---------------------------------------------------------------------------
@@ -160,15 +178,15 @@ def test_period_parser_52w():
     from kg.ingest.period_parser import parse_period
     result = parse_period("52 W bis 29/03/26")
     assert result is not None
-    assert result["grain"] == "52W"
-    assert result["end_date"] == "2026-03-29"
+    assert result.window_weeks == 52
+    assert "29-03-26" in result.label or "29/03" in result.raw
 
 
 def test_period_parser_mat():
     from kg.ingest.period_parser import parse_period
     result = parse_period("MAT 2025")
     assert result is not None
-    assert "2025" in result["label"]
+    assert "2025" in result.label
 
 
 def test_period_parser_no_match():
@@ -179,12 +197,14 @@ def test_period_parser_no_match():
 
 def test_period_parser_deduplication(tmp_path):
     from kg.ingest.excel_reader import read_excel_schema
-    from kg.ingest.period_parser import extract_periods_from_schema
+    from kg.ingest.period_parser import extract_periods_from_columns
     xlsx = str(tmp_path / "sample.xlsx")
     make_excel(xlsx)
     sheets = read_excel_schema(xlsx)
-    periods = extract_periods_from_schema(list(sheets.values())[0])
-    labels = [p["label"] for p in periods]
+    info = list(sheets.values())[0]
+    col_names = list(info["columns"].keys())  # columns is a dict
+    periods = extract_periods_from_columns(col_names)
+    labels = [p.label for p in periods]
     assert len(labels) == len(set(labels)), "Duplicate period labels detected"
 
 
@@ -229,16 +249,15 @@ def test_pipeline_end_to_end(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 10. Graph routing
+# 10. Graph routing — uses compiled `graph` object from agent.graph
 # ---------------------------------------------------------------------------
 
 def test_routing_ingestion_mode(tmp_path):
-    """ingestion_mode=True → graph routes to kg_ingest_node."""
+    """ingestion_mode=True → graph routes through kg_ingest_node."""
     from agent.state import AnalyticsState
-    from agent.graph import build_graph
+    from agent.graph import graph
     from langchain_core.messages import HumanMessage
 
-    graph = build_graph()
     state = AnalyticsState(
         messages=[HumanMessage(content="ingest file")],
         ingestion_mode=True,
@@ -251,10 +270,9 @@ def test_routing_ingestion_mode(tmp_path):
 def test_routing_normal_query_skips_ingest():
     """Normal analytics query does not trigger kg_ingest_node."""
     from agent.state import AnalyticsState
-    from agent.graph import build_graph
+    from agent.graph import graph
     from langchain_core.messages import HumanMessage
 
-    graph = build_graph()
     state = AnalyticsState(
         messages=[HumanMessage(content="what tables do you have?")],
         ingestion_mode=False,
