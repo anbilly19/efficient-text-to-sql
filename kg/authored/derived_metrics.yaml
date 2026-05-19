@@ -1,0 +1,20 @@
+# Derived metric declarations.
+# Each entry describes a metric computed from other (component) metrics.
+# components: list of node IDs (e.g. metric::<dataset>::<col>) that feed
+#             into this derived metric via a DERIVED_FROM edge.
+#
+# Example (NIQ cat-mat panel):
+#   SpendPerBuyer = Ausgaben pro Käuferhaushalt / Käuferhaushalte
+
+derived_metrics:
+  - name: SpendPerBuyer
+    formula: "Ausgaben pro Käuferhaushalt / Käuferhaushalte"
+    components:
+      - "metric::cat_mat::Ausgaben pro Käuferhaushalt 52 W bis 29/03/26"
+      - "metric::cat_mat::Käuferhaushalte 52 W bis 29/03/26"
+
+  - name: FrequencyPerBuyer
+    formula: "Einkaufsakte pro Käuferhaushalt / Käuferhaushalte"
+    components:
+      - "metric::cat_mat::Einkaufsakte pro Käuferhaushalt 52 W bis 29/03/26"
+      - "metric::cat_mat::Käuferhaushalte 52 W bis 29/03/26"

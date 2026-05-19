@@ -1,0 +1,24 @@
+# Entity group declarations.
+#
+# groups:    MEMBER_OF edges  (entity → EntityGroup node)
+# scoped_to: SCOPED_TO edges  (metric → dimension node)
+#
+# Example manufacturer roll-up for the NIQ pet-food panel:
+
+groups:
+  - name: HERISTO
+    members:
+      - "entity::ANIMONDA"
+      - "entity::MJAMJAM"
+      - "entity::SCHMUSY"
+
+  - name: MARS_PET
+    members:
+      - "entity::WHISKAS"
+      - "entity::PEDIGREE"
+      - "entity::SHEBA"
+
+scoped_to:
+  - metric_id: "metric::cat_mat::Penetration (%)"
+    dimension_id: "dimension::Geographies"
+    label: "Penetration scoped to geography level"

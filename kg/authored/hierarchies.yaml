@@ -1,0 +1,22 @@
+# Hierarchy declarations.
+#
+# Each entry defines a named hierarchy with levels listed from
+# coarsest (index 0) to finest (last index).
+#
+# LEVEL_IN edges connect every level node to the hierarchy root.
+# CHILD_OF  edges connect each level to the next coarser level above it.
+#
+# Example NIQ product hierarchy:
+
+hierarchies:
+  - root: CategoryHierarchy
+    levels:
+      - Category
+      - AnimalType
+      - Subcategory
+
+  - root: GeoHierarchy
+    levels:
+      - Country
+      - Region
+      - Market
