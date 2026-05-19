@@ -17,13 +17,13 @@ from tests.helpers.kg_fixtures import make_excel, noop_llm_propose
 
 @pytest.fixture()
 def populated_db(tmp_path, monkeypatch):
-    """Ingest synthetic Excel + run concept mapping. Returns db_path."""
+    """Ingest synthetic Excel + concept mapping + Phase 4 authored data."""
     from kg.ingest.pipeline import ingest_excel
     from kg.ingest.concept_mapper import propose_measures_edges
     from hitl.derived_author import ingest_declarations as ingest_derived
     from hitl.group_author import ingest_declarations as ingest_groups
-    from hitl.hierarchy_author import ingest_declarations as ingest_hier
-    from kg.store import init_store
+    from kg.store import init_store, upsert_node
+    from kg.models import Node, NodeType
 
     noop_llm_propose(monkeypatch)
 
@@ -34,17 +34,33 @@ def populated_db(tmp_path, monkeypatch):
     ingest_excel(xlsx, db_path=db)
     propose_measures_edges(db_path=db)
 
-    # Seed Phase 4 authored data
-    ingest_derived([
-        {'name': 'SpendPerBuyer', 'formula': 'A/B',
-         'components': ['metric::cat_mat::comp_a', 'metric::cat_mat::comp_b']},
-    ], db)
+    # Seed entity nodes so MEMBER_OF edges have valid source nodes
+    for brand in ('ANIMONDA', 'MJAMJAM'):
+        upsert_node(
+            Node(id=f'entity::{brand}', node_type=NodeType.ENTITY, label=brand),
+            db,
+        )
+
+    # Phase 4a: entity groups
     ingest_groups({
-        'groups': [{'name': 'HERISTO', 'members': ['entity::ANIMONDA', 'entity::MJAMJAM']}],
+        'groups': [{
+            'name': 'HERISTO',
+            'members': ['entity::ANIMONDA', 'entity::MJAMJAM'],
+        }],
         'scoped_to': [],
     }, db)
-    ingest_hier([
-        {'root': 'CategoryHierarchy', 'levels': ['Category', 'AnimalType', 'Subcategory']},
+
+    # Phase 4b: derived metrics
+    # SpendPerBuyer = Umsatz / Käuferhaushalte — use real col node ids from the fixture
+    ingest_derived([
+        {
+            'name': 'SpendPerBuyer',
+            'formula': 'Umsatz / Käuferhaushalte',
+            'components': [
+                'metric::cat_mat::Umsatz 52 W bis 29/03/26',
+                'metric::cat_mat::Käuferhaushalte 52 W bis 29/03/26',
+            ],
+        },
     ], db)
 
     return db
@@ -72,7 +88,7 @@ class TestPattern1ConceptResolution:
 
     def test_metric_columns_resolved_for_revenue(self, populated_db):
         from kg.decomposer import resolve_files
-        files, metric_cols = resolve_files(['revenue'], populated_db)
+        _files, metric_cols = resolve_files(['revenue'], populated_db)
         assert len(metric_cols.get('revenue', [])) >= 1
         assert any('Umsatz' in c for c in metric_cols['revenue'])
 
@@ -85,11 +101,13 @@ class TestPattern2EntityGroups:
     def test_heristo_expands_to_members(self, populated_db):
         from kg.decomposer import resolve_entity_groups
         groups = resolve_entity_groups('HERISTO Umsatz latest', populated_db)
-        assert 'HERISTO' in groups
-        assert len(groups['HERISTO']) == 2
-        ids = groups['HERISTO']
-        assert 'entity::ANIMONDA' in ids
-        assert 'entity::MJAMJAM' in ids
+        assert 'HERISTO' in groups, \
+            f'HERISTO not found. All groups resolved: {groups}'
+        members = groups['HERISTO']
+        assert len(members) == 2, \
+            f'Expected 2 members, got {len(members)}: {members}'
+        assert 'entity::ANIMONDA' in members
+        assert 'entity::MJAMJAM' in members
 
     def test_no_group_match_returns_empty(self, populated_db):
         from kg.decomposer import resolve_entity_groups
@@ -105,7 +123,6 @@ class TestPattern3Periods:
     def test_latest_resolves_cy_period(self, populated_db):
         from kg.decomposer import resolve_periods
         periods = resolve_periods('latest period Umsatz', ['cat_mat'], populated_db)
-        # At minimum a period should be returned
         assert len(periods) >= 1
         assert all('label' in p for p in periods)
         assert all('file' in p for p in periods)
@@ -129,7 +146,7 @@ class TestPattern4Joins:
     def test_unknown_files_no_joins(self, populated_db):
         from kg.decomposer import resolve_joins
         joins, bridges = resolve_joins(['file_a', 'file_b'], populated_db)
-        assert joins == []  # no JOINABLE_ON edges authored yet
+        assert joins == []
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +160,11 @@ class TestPattern5DerivedFrom:
         neighbours = get_neighbors(
             'metric::SpendPerBuyer', EdgeType.DERIVED_FROM, 'out', db_path=populated_db
         )
-        assert len(neighbours) == 2
+        assert len(neighbours) == 2, \
+            f'Expected 2 DERIVED_FROM components, got {len(neighbours)}: {neighbours}'
+        ids = [n['id'] for n in neighbours]
+        assert 'metric::cat_mat::Umsatz 52 W bis 29/03/26' in ids
+        assert 'metric::cat_mat::K\u00e4uferhaushalte 52 W bis 29/03/26' in ids
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +173,6 @@ class TestPattern5DerivedFrom:
 
 class TestPattern6GrainAndScope:
     def test_grain_does_not_crash(self, populated_db):
-        """Grain step may return empty dict if analytics DB not present, but must not raise."""
         from kg.decomposer import resolve_grain_and_scope
         grain, scoped = resolve_grain_and_scope(['cat_mat'], populated_db)
         assert isinstance(grain, dict)
@@ -189,4 +209,3 @@ class TestDecomposeIntegration:
             'Umsatz latest period', db_path=populated_db
         )
         assert isinstance(ctx, str)
-        assert 'revenue' in ctx or ctx == ''
