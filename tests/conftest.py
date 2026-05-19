@@ -22,19 +22,28 @@ import os
 import shutil
 
 import pytest
+from _pytest.monkeypatch import MonkeyPatch
 
 
-@pytest.fixture(scope="session", autouse=True)
+@pytest.fixture(scope='session', autouse=True)
 def _session_env(tmp_path_factory):
     """Point PARQUET_STORE at a throwaway temp dir for the whole session."""
-    parquet_dir = tmp_path_factory.mktemp("parquet_store_session")
-    os.environ["PARQUET_STORE"] = str(parquet_dir)
+    parquet_dir = tmp_path_factory.mktemp('parquet_store_session')
+    os.environ['PARQUET_STORE'] = str(parquet_dir)
 
     yield parquet_dir
 
     if parquet_dir.exists():
         shutil.rmtree(parquet_dir, ignore_errors=True)
-    os.environ.pop("PARQUET_STORE", None)
+    os.environ.pop('PARQUET_STORE', None)
+
+
+@pytest.fixture(scope='module')
+def monkeypatch_module():
+    """Module-scoped monkeypatch (pytest built-in is function-scoped only)."""
+    mp = MonkeyPatch()
+    yield mp
+    mp.undo()
 
 
 # ---------------------------------------------------------------------------
@@ -45,7 +54,7 @@ def _session_env(tmp_path_factory):
 def kg_excel(tmp_path):
     """Return (xlsx_path, db_path) for a fresh synthetic NIQ-style workbook."""
     from tests.helpers.kg_fixtures import make_excel
-    xlsx = str(tmp_path / "cat_mat.xlsx")
-    db   = str(tmp_path / "kg.duckdb")
+    xlsx = str(tmp_path / 'cat_mat.xlsx')
+    db   = str(tmp_path / 'kg.duckdb')
     make_excel(xlsx)
     return xlsx, db
