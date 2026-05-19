@@ -1,43 +1,35 @@
-"""Reusable helpers for KG ingestion tests (Phase 1, 2, ...).
-
-Import pattern
---------------
-    from tests.helpers.kg_fixtures import make_excel, make_niq_style_excel
-
-All DataFrame shapes here mirror the synthetic NIQ-style petfood file used
-across Phase 1 and Phase 2 test suites.
-"""
+"""Reusable helpers for KG ingestion tests (Phase 1, 2, ...)."""
 from __future__ import annotations
 
+import random
 import pandas as pd
 
+_ROWS = 30
+_RNG  = random.Random(42)  # deterministic
 
-# ---------------------------------------------------------------------------
-# Minimal NIQ-style Excel (used in Phase 1 + Phase 2)
-# ---------------------------------------------------------------------------
+# Realistic varied values so metric columns have n_unique >> 10
+# (openpyxl round-trips floats faithfully; integers stay int64)
+_BRANDS = ['ANIMONDA', 'MJAMJAM'] * (_ROWS // 2)
 
-_ROWS = 30  # enough to trigger header detection and period parsing
+def _floats(lo: float, hi: float) -> list:
+    return [round(_RNG.uniform(lo, hi), 2) for _ in range(_ROWS)]
 
-#: Column set shared by both Phase 1 and Phase 2 tests.
+def _ints(lo: int, hi: int) -> list:
+    return [_RNG.randint(lo, hi) for _ in range(_ROWS)]
+
 BASE_COLUMNS: dict[str, list] = {
-    "Marke":                                        ["ANIMONDA", "MJAMJAM"] * (_ROWS // 2),
-    "Umsatz 52 W bis 29/03/26":                     [100.0, 200.0] * (_ROWS // 2),
-    "Umsatz VJ 52 W bis 29/03/26":                  [90.0, 180.0] * (_ROWS // 2),
-    "Umsatz % Ver. 52 W bis 29/03/26":              [11.1, 11.1] * (_ROWS // 2),
-    "Menge 52 W bis 29/03/26":                      [10, 20] * (_ROWS // 2),
-    "Penetration (%) 52 W bis 29/03/26":            [30.0, 40.0] * (_ROWS // 2),
-    "K\u00e4uferhaushalte 52 W bis 29/03/26":        [500, 600] * (_ROWS // 2),
-    "Unknown Metric XYZ 52 W bis 29/03/26":         [1.0, 2.0] * (_ROWS // 2),
+    'Marke':                                        _BRANDS,
+    'Umsatz 52 W bis 29/03/26':                     _floats(80.0, 300.0),
+    'Umsatz VJ 52 W bis 29/03/26':                  _floats(70.0, 280.0),
+    'Umsatz % Ver. 52 W bis 29/03/26':              _floats(-20.0, 30.0),
+    'Menge 52 W bis 29/03/26':                      _ints(5, 50),
+    'Penetration (%) 52 W bis 29/03/26':            _floats(10.0, 60.0),
+    'K\u00e4uferhaushalte 52 W bis 29/03/26':        _ints(300, 900),
+    'Unknown Metric XYZ 52 W bis 29/03/26':         _floats(0.5, 5.0),
 }
 
 
 def make_excel(path: str, extra_columns: dict | None = None) -> None:
-    """Write a synthetic NIQ-style .xlsx to *path*.
-
-    Args:
-        path:          Destination file path (must end in .xlsx).
-        extra_columns: Optional dict of {col_name: list_of_values} to append.
-    """
     data = dict(BASE_COLUMNS)
     if extra_columns:
         data.update(extra_columns)
@@ -50,31 +42,29 @@ def make_niq_style_excel(
     n_rows: int = _ROWS,
     brands: list[str] | None = None,
 ) -> None:
-    """Parameterised variant — useful for tests that need different brand lists
-    or row counts without overriding the whole column set."""
-    brands = brands or ["ANIMONDA", "MJAMJAM"]
-    repeats = (n_rows + len(brands) - 1) // len(brands)  # ceil div
+    brands = brands or ['ANIMONDA', 'MJAMJAM']
+    repeats = (n_rows + len(brands) - 1) // len(brands)
     brand_col = (brands * repeats)[:n_rows]
+    rng = random.Random(42)
+
+    def f(lo, hi): return [round(rng.uniform(lo, hi), 2) for _ in range(n_rows)]
+    def i(lo, hi): return [rng.randint(lo, hi) for _ in range(n_rows)]
 
     df = pd.DataFrame({
-        "Marke":                                 brand_col,
-        "Umsatz 52 W bis 29/03/26":              [100.0] * n_rows,
-        "Umsatz VJ 52 W bis 29/03/26":           [90.0] * n_rows,
-        "Umsatz % Ver. 52 W bis 29/03/26":       [11.1] * n_rows,
-        "Menge 52 W bis 29/03/26":               [10] * n_rows,
-        "Penetration (%) 52 W bis 29/03/26":     [30.0] * n_rows,
-        "K\u00e4uferhaushalte 52 W bis 29/03/26": [500] * n_rows,
+        'Marke':                                 brand_col,
+        'Umsatz 52 W bis 29/03/26':              f(80, 300),
+        'Umsatz VJ 52 W bis 29/03/26':           f(70, 280),
+        'Umsatz % Ver. 52 W bis 29/03/26':       f(-20, 30),
+        'Menge 52 W bis 29/03/26':               i(5, 50),
+        'Penetration (%) 52 W bis 29/03/26':     f(10, 60),
+        'K\u00e4uferhaushalte 52 W bis 29/03/26': i(300, 900),
     })
     df.to_excel(path, index=False)
 
 
-# ---------------------------------------------------------------------------
-# Shared monkeypatch helper (call inside a test, not a fixture)
-# ---------------------------------------------------------------------------
-
 def noop_llm_propose(monkeypatch) -> None:
     """Patch concept_mapper._llm_propose to return {} (no API call)."""
     monkeypatch.setattr(
-        "kg.ingest.concept_mapper._llm_propose",
+        'kg.ingest.concept_mapper._llm_propose',
         lambda cols: {},
     )
