@@ -24,7 +24,20 @@ class AnalyticsState(BaseModel):
     # ── Conversation ──────────────────────────────────────────────
     messages: Annotated[list[AnyMessage], add_messages] = Field(default_factory=list)
 
-    # ── User intent ──────────────────────────────────────────────
+    # ── User intent (set by intent_classifier) ───────────────────
+    # One of: "ingest_file" | "kg_group" | "kg_derived" | "kg_hierarchy"
+    #         | "kg_review" | "analytics" | "" (unclassified)
+    intent: str = ""
+
+    # Structured payload extracted by intent_classifier for KG author nodes.
+    # Shape varies by intent:
+    #   kg_group:    {"groups": [...], "scoped_to": [...]}
+    #   kg_derived:  [{"name": ..., "formula": ..., "components": [...]}]
+    #   kg_hierarchy:{"root": ..., "levels": [...]}
+    #   kg_review:   {"action": "accept"|"reject", "src_id": ..., "dst_id": ...}
+    kg_author_payload: dict[str, Any] = Field(default_factory=dict)
+
+    # ── User intent (legacy, kept for back-compat) ────────────────
     user_query: str = ""
 
     # ── File loading ─────────────────────────────────────────────
@@ -50,8 +63,6 @@ class AnalyticsState(BaseModel):
     error: str = ""
 
     # ── Table scoping (user-configured) ───────────────────────────
-    # None  -> all registered tables are visible (default)
-    # list  -> only these table names are visible in this thread
     allowed_tables: list[str] | None = None
 
     # ── KG ingestion mode ─────────────────────────────────────────
@@ -60,5 +71,4 @@ class AnalyticsState(BaseModel):
     kg_result: str = ""
 
     # ── KG resolved query spec (Phase 5) ──────────────────────────
-    # Serialised JSON of kg.decomposer.QuerySpec; empty string = not resolved.
     kg_resolved_spec: str = ""
