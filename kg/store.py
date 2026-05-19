@@ -1,6 +1,7 @@
 """DuckDB-backed adjacency store for the knowledge graph."""
 from __future__ import annotations
 
+import json
 import os
 from typing import Any
 
@@ -8,12 +9,24 @@ import duckdb
 
 from kg.models import Edge, EdgeType, Node, NodeType
 
-_DEFAULT_DB = os.environ.get("KG_DB_PATH", "kg/kg.duckdb")
+_DEFAULT_DB = os.environ.get('KG_DB_PATH', 'kg/kg.duckdb')
 
 
 def _conn(db_path: str = _DEFAULT_DB) -> duckdb.DuckDBPyConnection:
-    os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(db_path) or '.', exist_ok=True)
     return duckdb.connect(db_path)
+
+
+def _deserialize_props(raw: Any) -> dict:
+    """Return props as a dict regardless of whether DuckDB returned str or dict."""
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {}
+    return {}
 
 
 def init_store(db_path: str = _DEFAULT_DB) -> None:
@@ -42,7 +55,7 @@ def init_store(db_path: str = _DEFAULT_DB) -> None:
 
 
 def upsert_node(node: Node, db_path: str = _DEFAULT_DB) -> None:
-    import json
+    """Insert or update a node in the store."""
     con = _conn(db_path)
     con.execute("""
         INSERT INTO nodes (id, node_type, label, props)
@@ -56,7 +69,7 @@ def upsert_node(node: Node, db_path: str = _DEFAULT_DB) -> None:
 
 
 def upsert_edge(edge: Edge, db_path: str = _DEFAULT_DB) -> None:
-    import json
+    """Insert or update an edge in the store."""
     con = _conn(db_path)
     con.execute("""
         INSERT INTO edges (src_id, dst_id, edge_type, source, confidence, props)
@@ -73,28 +86,27 @@ def upsert_edge(edge: Edge, db_path: str = _DEFAULT_DB) -> None:
 def get_neighbors(
     node_id: str,
     edge_type: EdgeType | None = None,
-    direction: str = "out",          # "out" | "in" | "both"
+    direction: str = 'out',          # 'out' | 'in' | 'both'
     min_confidence: float = 0.0,
     db_path: str = _DEFAULT_DB,
 ) -> list[dict[str, Any]]:
     """Return neighbour node dicts reachable via edges of the given type."""
     con = _conn(db_path)
-    type_filter = "AND e.edge_type = ?" if edge_type else ""
+    type_filter = 'AND e.edge_type = ?' if edge_type else ''
     params_base = [node_id]
     if edge_type:
         params_base.append(edge_type.value)
     params_base.append(min_confidence)
 
-    if direction == "out":
-        where = f"e.src_id = ? {type_filter} AND e.confidence >= ?"
-        join_col = "e.dst_id"
-    elif direction == "in":
-        where = f"e.dst_id = ? {type_filter} AND e.confidence >= ?"
-        join_col = "e.src_id"
+    if direction == 'out':
+        where = f'e.src_id = ? {type_filter} AND e.confidence >= ?'
+        join_col = 'e.dst_id'
+    elif direction == 'in':
+        where = f'e.dst_id = ? {type_filter} AND e.confidence >= ?'
+        join_col = 'e.src_id'
     else:
-        # both — union
-        rows_out = get_neighbors(node_id, edge_type, "out", min_confidence, db_path)
-        rows_in  = get_neighbors(node_id, edge_type, "in",  min_confidence, db_path)
+        rows_out = get_neighbors(node_id, edge_type, 'out', min_confidence, db_path)
+        rows_in  = get_neighbors(node_id, edge_type, 'in',  min_confidence, db_path)
         return rows_out + rows_in
 
     rows = con.execute(f"""
@@ -104,19 +116,26 @@ def get_neighbors(
         WHERE {where}
     """, params_base).fetchall()
     con.close()
-    cols = ["id", "node_type", "label", "props", "edge_type", "confidence"]
-    return [dict(zip(cols, r)) for r in rows]
+    cols = ['id', 'node_type', 'label', 'props', 'edge_type', 'confidence']
+    return [
+        {**dict(zip(cols, r)), 'props': _deserialize_props(r[3])}
+        for r in rows
+    ]
 
 
 def all_nodes(node_type: NodeType | None = None, db_path: str = _DEFAULT_DB) -> list[dict]:
+    """Return all nodes of the given type, with props deserialized to dict."""
     con = _conn(db_path)
     if node_type:
         rows = con.execute(
-            "SELECT id, node_type, label, props FROM nodes WHERE node_type = ?",
-            [node_type.value]
+            'SELECT id, node_type, label, props FROM nodes WHERE node_type = ?',
+            [node_type.value],
         ).fetchall()
     else:
-        rows = con.execute("SELECT id, node_type, label, props FROM nodes").fetchall()
+        rows = con.execute('SELECT id, node_type, label, props FROM nodes').fetchall()
     con.close()
-    cols = ["id", "node_type", "label", "props"]
-    return [dict(zip(cols, r)) for r in rows]
+    cols = ['id', 'node_type', 'label', 'props']
+    return [
+        {**dict(zip(cols, r)), 'props': _deserialize_props(r[3])}
+        for r in rows
+    ]
